@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"ambigo-backend/api/response"
 	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
@@ -35,7 +36,7 @@ func (h *AdminHandler) HandleAdminLogin(w http.ResponseWriter, r *http.Request) 
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
@@ -55,18 +56,18 @@ func (h *AdminHandler) HandleAdminLogin(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+	response.Error(w, "Invalid credentials", http.StatusUnauthorized)
 }
 
 func (h *AdminHandler) HandleCreateAmbulanceType(w http.ResponseWriter, r *http.Request) {
 	var amb admin.AmbulanceType
 	if err := json.NewDecoder(r.Body).Decode(&amb); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
 	if err := h.Store.CreateAmbulanceType(r.Context(), &amb); err != nil {
-		http.Error(w, "Failed to create: "+err.Error(), http.StatusInternalServerError)
+		response.Error(w, "Failed to create: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -84,7 +85,7 @@ func (h *AdminHandler) HandleCreateAmbulanceType(w http.ResponseWriter, r *http.
 func (h *AdminHandler) HandleListAmbulanceTypes(w http.ResponseWriter, r *http.Request) {
 	list, err := h.Store.ListAmbulanceTypes(r.Context())
 	if err != nil {
-		http.Error(w, "Failed to fetch list: "+err.Error(), http.StatusInternalServerError)
+		response.Error(w, "Failed to fetch list: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -96,13 +97,13 @@ func (h *AdminHandler) HandleDeleteAmbulanceType(w http.ResponseWriter, r *http.
 	idStr := r.PathValue("id")
 	objID, err := primitive.ObjectIDFromHex(idStr)
 	if err != nil {
-		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
 	err = h.Store.DeleteAmbulanceType(r.Context(), objID)
 	if err != nil {
-		http.Error(w, "Failed to delete: "+err.Error(), http.StatusInternalServerError)
+		response.Error(w, "Failed to delete: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -117,13 +118,13 @@ func (h *AdminHandler) HandleDeleteAmbulanceType(w http.ResponseWriter, r *http.
 func (h *AdminHandler) HandleApproveDriver(w http.ResponseWriter, r *http.Request) {
 	var driver auth.Driver
 	if err := json.NewDecoder(r.Body).Decode(&driver); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 	
 	err := h.AuthStore.ApproveDriver(r.Context(), &driver)
 	if err != nil {
-		http.Error(w, "Failed to approve driver: "+err.Error(), http.StatusBadRequest)
+		response.Error(w, "Failed to approve driver: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -166,7 +167,7 @@ type HospitalRequest struct {
 func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request) {
 	var req HospitalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
@@ -189,7 +190,7 @@ func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
-		http.Error(w, "Hospital add failed", http.StatusBadRequest)
+		response.Error(w, "Hospital add failed", http.StatusBadRequest)
 		return
 	}
 
@@ -202,13 +203,13 @@ func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request)
 func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Request) {
 	var req HospitalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
-		http.Error(w, "Invalid payload or missing ID", http.StatusBadRequest)
+		response.Error(w, "Invalid payload or missing ID", http.StatusBadRequest)
 		return
 	}
 
 	objID, err := primitive.ObjectIDFromHex(req.ID)
 	if err != nil {
-		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
@@ -232,7 +233,7 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := h.HospitalStore.UpdateHospital(r.Context(), &hospital); err != nil {
-		http.Error(w, "Hospital updated failed", http.StatusBadRequest)
+		response.Error(w, "Hospital updated failed", http.StatusBadRequest)
 		return
 	}
 
@@ -247,18 +248,18 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 		HospitalID string `json:"hospital_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
 	objID, err := primitive.ObjectIDFromHex(req.HospitalID)
 	if err != nil {
-		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
 	if err := h.HospitalStore.DeleteHospital(r.Context(), objID); err != nil {
-		http.Error(w, "Hospital delete failed", http.StatusBadRequest)
+		response.Error(w, "Hospital delete failed", http.StatusBadRequest)
 		return
 	}
 

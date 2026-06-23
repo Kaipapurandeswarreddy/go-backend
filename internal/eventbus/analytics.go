@@ -2,7 +2,8 @@ package eventbus
 
 import (
 	"encoding/json"
-	"log"
+
+	"ambigo-backend/internal/logger"
 )
 
 // AnalyticsTracker listens to ride and auth events for business analytics.
@@ -22,27 +23,26 @@ func (a *AnalyticsTracker) SubscribeTo(bus *InMemoryBus) {
 func (a *AnalyticsTracker) handleRideRequested(payload []byte) {
 	var p RideRequestedPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[Analytics] Unmarshal error (ride:requested): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "ride:requested").Msg("Unmarshal error")
 		return
 	}
-	// TODO: Write to analytics pipeline
-	log.Printf("[Analytics] Ride requested: %s (SOS=%v, mode=%s)", p.RideID, p.IsSOS, p.PaymentMode)
+	logger.Log.Info().Str("ride_id", p.RideID).Bool("sos", p.IsSOS).Str("mode", p.PaymentMode).Msg("Ride requested")
 }
 
 func (a *AnalyticsTracker) handleRideCompleted(payload []byte) {
 	var p RideCompletedPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[Analytics] Unmarshal error (ride:completed): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "ride:completed").Msg("Unmarshal error")
 		return
 	}
-	log.Printf("[Analytics] Ride completed: %s amount=%.2f mode=%s", p.RideID, p.FinalAmount, p.PaymentMode)
+	logger.Log.Info().Str("ride_id", p.RideID).Float64("amount", p.FinalAmount).Str("mode", p.PaymentMode).Msg("Ride completed")
 }
 
 func (a *AnalyticsTracker) handleUserRegistered(payload []byte) {
 	var p AuthUserRegisteredPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[Analytics] Unmarshal error (auth:user_registered): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "auth:user_registered").Msg("Unmarshal error")
 		return
 	}
-	log.Printf("[Analytics] User registered: %s", p.UserID)
+	logger.Log.Info().Str("user_id", p.UserID).Msg("User registered")
 }

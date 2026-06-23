@@ -2,7 +2,6 @@ package logger
 
 import (
 	"os"
-	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -10,8 +9,7 @@ import (
 var Log zerolog.Logger
 
 func init() {
-	output := zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
-	Log = zerolog.New(output).With().Timestamp().Logger()
+	Log = zerolog.New(os.Stdout).With().Timestamp().Logger()
 }
 
 func NewRideLogger(rideID string) zerolog.Logger {

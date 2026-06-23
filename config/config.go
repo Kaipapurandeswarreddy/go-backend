@@ -1,8 +1,9 @@
 package config
 
 import (
-	"log"
 	"os"
+
+	"ambigo-backend/internal/logger"
 )
 
 // AppConfig holds all environment variables required by the application
@@ -57,10 +58,10 @@ func LoadConfig() *AppConfig {
 	}
 
 	if cfg.JWTSecret == "" {
-		log.Fatal("JWT_SECRET is required")
+		logger.Log.Fatal().Msg("JWT_SECRET is required")
 	}
 	if cfg.APIKey == "" {
-		log.Fatal("API_KEY is required")
+		logger.Log.Fatal().Msg("API_KEY is required")
 	}
 
 	return cfg

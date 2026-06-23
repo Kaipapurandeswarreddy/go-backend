@@ -2,11 +2,11 @@ package dispatch
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
 
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/metrics"
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/websocket"
@@ -16,7 +16,7 @@ type Dispatcher struct {
 	Matcher   *Matcher
 	RideStore *ride.Store
 	EventBus  *eventbus.InMemoryBus
-	WSManager *websocket.Manager // kept only for DeclineHandler callback
+	WSManager *websocket.Manager
 
 	acceptChannels  map[string]chan string
 	declineChannels map[string]chan string
@@ -46,9 +46,9 @@ func (d *Dispatcher) StartStaleRideCleanup() {
 			count, err := d.RideStore.CancelStaleSearchingRides(ctx, 5*time.Minute)
 			cancel()
 			if err != nil {
-				log.Printf("[Dispatcher] Stale ride cleanup error: %v", err)
+				logger.Log.Error().Err(err).Msg("Stale ride cleanup error")
 			} else if count > 0 {
-				log.Printf("[Dispatcher] Cancelled %d stale searching rides", count)
+				logger.Log.Info().Int64("count", count).Msg("Cancelled stale searching rides")
 			}
 		}
 	}()
@@ -64,13 +64,11 @@ func (d *Dispatcher) RequestRide(r *ride.Ride) error {
 
 	rideID := r.ID.Hex()
 
-	// Create channels for this ride
 	d.mu.Lock()
 	d.acceptChannels[rideID] = make(chan string)
 	d.declineChannels[rideID] = make(chan string)
 	d.mu.Unlock()
 
-	// Publish ride requested event (triggers metrics, analytics, etc.)
 	pickupLng, pickupLat := r.Pickup.Coordinates[0], r.Pickup.Coordinates[1]
 	dropoffLng, dropoffLat := r.Drop.Coordinates[0], r.Drop.Coordinates[1]
 	ambTypeID := ""
@@ -116,13 +114,11 @@ func (d *Dispatcher) RequestRide(r *ride.Ride) error {
 
 // HandleDriverAccept is called by the REST API when a driver clicks "Accept"
 func (d *Dispatcher) HandleDriverAccept(ctx context.Context, rideID string, driverID string) error {
-	// 1. Atomic Database Assignment
 	err := d.RideStore.AtomicAssignDriver(ctx, rideID, driverID)
 	if err != nil {
-		return err // Ride was already taken or cancelled
+		return err
 	}
 
-	// 2. Signal the waiting matching loop to stop
 	d.mu.RLock()
 	ch, exists := d.acceptChannels[rideID]
 	d.mu.RUnlock()
@@ -130,7 +126,6 @@ func (d *Dispatcher) HandleDriverAccept(ctx context.Context, rideID string, driv
 		ch <- driverID
 	}
 
-	// 3. Publish accepted event (subscribers handle WS, metrics, etc.)
 	rideData, _ := d.RideStore.GetRideByID(ctx, rideID)
 	if rideData != nil {
 		d.EventBus.PublishEvent(eventbus.ChannelRideAccepted, eventbus.RideAcceptedPayload{
@@ -154,7 +149,6 @@ func (d *Dispatcher) HandleDriverDecline(ctx context.Context, rideID, driverID s
 	}
 }
 
-// persistDispatchMetadata updates the ride's dispatch_metadata in MongoDB.
 func (d *Dispatcher) persistDispatchMetadata(rideID string, meta *ride.DispatchMetadata) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -163,7 +157,7 @@ func (d *Dispatcher) persistDispatchMetadata(rideID string, meta *ride.DispatchM
 
 func (d *Dispatcher) startMatchingLoop(r *ride.Ride) {
 	rideIDStr := r.ID.Hex()
-	log.Printf("[Dispatcher] Starting matching loop for Ride %s", rideIDStr)
+	logger.Log.Info().Str("ride_id", rideIDStr).Msg("Starting matching loop")
 
 	defer func() {
 		d.mu.Lock()
@@ -180,7 +174,7 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride) {
 	}
 	candidates, err := d.Matcher.FindBestDrivers(context.Background(), pickupLat, pickupLng, 5, ambTypeID)
 	if err != nil || len(candidates) == 0 {
-		log.Printf("[Dispatcher] No drivers found for Ride %s. Cancelling.", rideIDStr)
+		logger.Log.Warn().Str("ride_id", rideIDStr).Msg("No drivers found. Cancelling.")
 		d.RideStore.UpdateRideStatus(context.Background(), rideIDStr, ride.StatusSearching, ride.StatusCancelled)
 		d.EventBus.PublishEvent(eventbus.ChannelRideCancelled, eventbus.RideCancelledPayload{
 			RideID: rideIDStr,
@@ -194,8 +188,7 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride) {
 	r.DispatchMetadata.CandidatesSearched = len(candidates)
 
 	for i, candidate := range candidates {
-		log.Printf("[Dispatcher] Ride %s: Offering to Driver %s (ETA: %ds) [Candidate %d/%d]",
-			rideIDStr, candidate.DriverID, candidate.ETASeconds, i+1, len(candidates))
+		logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Int("eta", candidate.ETASeconds).Int("candidate", i+1).Int("total", len(candidates)).Msg("Offering to driver")
 
 		fareVal := 0.0
 		driverShareVal := 0.0
@@ -225,7 +218,7 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride) {
 		case acceptedDriverID := <-acceptCh:
 			if acceptedDriverID == candidate.DriverID {
 				r.DispatchMetadata.AssignmentLatencyMs = int(time.Since(startTime).Milliseconds())
-				log.Printf("[Dispatcher] Ride %s: Driver %s accepted the ride!", rideIDStr, candidate.DriverID)
+				logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Msg("Driver accepted the ride")
 				metrics.ObserveDispatchLatency(time.Since(startTime))
 				d.persistDispatchMetadata(rideIDStr, &r.DispatchMetadata)
 				return
@@ -233,18 +226,18 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride) {
 		case declinedDriverID := <-declineCh:
 			if declinedDriverID == candidate.DriverID {
 				r.DispatchMetadata.OffersDeclined++
-				log.Printf("[Dispatcher] Ride %s: Driver %s declined. Moving to next.", rideIDStr, candidate.DriverID)
+				logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Msg("Driver declined. Moving to next.")
 			}
 		case <-time.After(30 * time.Second):
 			r.DispatchMetadata.OffersTimedOut++
-			log.Printf("[Dispatcher] Ride %s: Driver %s timed out. Moving to next.", rideIDStr, candidate.DriverID)
+			logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Msg("Driver timed out. Moving to next.")
 		}
 	}
 
 	r.DispatchMetadata.AssignmentLatencyMs = int(time.Since(startTime).Milliseconds())
 	d.persistDispatchMetadata(rideIDStr, &r.DispatchMetadata)
 
-	log.Printf("[Dispatcher] Ride %s: All candidates exhausted. Cancelling.", rideIDStr)
+	logger.Log.Warn().Str("ride_id", rideIDStr).Msg("All candidates exhausted. Cancelling.")
 	d.RideStore.UpdateRideStatus(context.Background(), rideIDStr, ride.StatusSearching, ride.StatusCancelled)
 
 	d.EventBus.PublishEvent(eventbus.ChannelRideCancelled, eventbus.RideCancelledPayload{

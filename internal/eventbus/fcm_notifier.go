@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	"ambigo-backend/internal/auth"
+	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/notification"
 )
 
@@ -29,7 +29,7 @@ func (n *FCMNotifier) SubscribeTo(bus *InMemoryBus) {
 func (n *FCMNotifier) handleRideOffered(payload []byte) {
 	var p RideDriverOfferedPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[FCMNotifier] Unmarshal error (ride:driver_offered): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "ride:driver_offered").Msg("Unmarshal error")
 		return
 	}
 
@@ -38,7 +38,7 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 
 	token, err := n.authStore.GetDriverFCMToken(ctx, p.DriverID)
 	if err != nil {
-		log.Printf("[FCMNotifier] Failed to get FCM token for driver %s: %v", p.DriverID, err)
+		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Failed to get FCM token for driver")
 		return
 	}
 	if token == nil || *token == "" {
@@ -46,8 +46,8 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 	}
 
 	data := map[string]string{
-		"ride_id":    p.RideID,
-		"body":       fmt.Sprintf("Estimated fare: ₹%.2f", p.Fare),
+		"ride_id": p.RideID,
+		"body":    fmt.Sprintf("Estimated fare: ₹%.2f", p.Fare),
 	}
 	if p.IsSOS {
 		data["title"] = "EMERGENCY ALERT"
@@ -58,14 +58,14 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 	}
 
 	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
-		log.Printf("[FCMNotifier] FCM push failed for driver %s: %v", p.DriverID, err)
+		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("FCM push failed for driver")
 	}
 }
 
 func (n *FCMNotifier) handleDriverApproved(payload []byte) {
 	var p AuthDriverApprovedPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[FCMNotifier] Unmarshal error (auth:driver_approved): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "auth:driver_approved").Msg("Unmarshal error")
 		return
 	}
 
@@ -83,6 +83,6 @@ func (n *FCMNotifier) handleDriverApproved(payload []byte) {
 	}
 
 	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
-		log.Printf("[FCMNotifier] Welcome FCM push failed for driver %s: %v", p.DriverID, err)
+		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Welcome FCM push failed for driver")
 	}
 }

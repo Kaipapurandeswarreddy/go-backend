@@ -2,9 +2,9 @@ package config
 
 import (
 	"context"
-	"log"
 	"time"
 
+	"ambigo-backend/internal/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -21,7 +21,7 @@ type Database struct {
 
 // InitMongoDB connects to MongoDB and initializes the consolidated 'ambigo' database
 func InitMongoDB(uri string) (*Database, error) {
-	log.Println("Connecting to MongoDB...")
+	logger.Log.Info().Msg("Connecting to MongoDB...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -37,7 +37,7 @@ func InitMongoDB(uri string) (*Database, error) {
 		return nil, err
 	}
 
-	log.Println("Successfully connected to MongoDB!")
+	logger.Log.Info().Msg("Successfully connected to MongoDB!")
 
 	db := client.Database("ambigo")
 
@@ -101,6 +101,6 @@ func EnsureIndexes(client *mongo.Client) error {
 		return err
 	}
 
-	log.Println("MongoDB indexes ensured on rides, payments, auth_otp")
+	logger.Log.Info().Msg("MongoDB indexes ensured on rides, payments, auth_otp")
 	return nil
 }

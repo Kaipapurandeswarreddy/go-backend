@@ -1,8 +1,7 @@
 package eventbus
 
 import (
-	"log"
-	"time"
+	"ambigo-backend/internal/logger"
 )
 
 // AuditLogger listens to all events and writes them to the audit log.
@@ -30,5 +29,5 @@ func (l *AuditLogger) SubscribeTo(bus *InMemoryBus) {
 }
 
 func (l *AuditLogger) handleEvent(payload []byte) {
-	log.Printf("[Audit] [%s] %s", time.Now().Format(time.RFC3339), string(payload))
+	logger.Log.Info().Str("channel", "audit").Str("payload", string(payload)).Msg("audit event")
 }

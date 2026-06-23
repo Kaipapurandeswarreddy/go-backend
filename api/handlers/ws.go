@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"net/http"
+
+	"ambigo-backend/api/response"
 	"ambigo-backend/config"
 	"ambigo-backend/internal/auth"
+	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/websocket"
-	"log"
-	"net/http"
 
 	gorilla "github.com/gorilla/websocket"
 )
@@ -24,29 +26,29 @@ func ServeWS(manager *websocket.Manager, cfg *config.AppConfig, w http.ResponseW
 	// 0. Validate API Key
 	apiKey := r.URL.Query().Get("api_key")
 	if apiKey == "" || apiKey != cfg.APIKey {
-		http.Error(w, "Unauthorized: invalid API key", http.StatusUnauthorized)
+		response.Error(w, "Unauthorized: invalid API key", http.StatusUnauthorized)
 		return
 	}
 
 	// 1. Extract Token from Query Parameter (e.g. ws://domain/ws?token=XYZ)
 	tokenStr := r.URL.Query().Get("token")
 	if tokenStr == "" {
-		http.Error(w, "Unauthorized: missing token", http.StatusUnauthorized)
+		response.Error(w, "Unauthorized: missing token", http.StatusUnauthorized)
 		return
 	}
 
 	// 2. Validate JWT Token
 	claims, err := auth.ValidateToken(tokenStr, cfg.JWTSecret)
 	if err != nil {
-		log.Printf("[WebSocket] Auth failed: %v", err)
-		http.Error(w, "Unauthorized: invalid token", http.StatusUnauthorized)
+		logger.Log.Error().Err(err).Msg("WebSocket auth failed")
+		response.Error(w, "Unauthorized: invalid token", http.StatusUnauthorized)
 		return
 	}
 
 	// 3. Upgrade HTTP connection to WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[WebSocket] Upgrade failed: %v", err)
+		logger.Log.Error().Err(err).Msg("WebSocket upgrade failed")
 		return
 	}
 

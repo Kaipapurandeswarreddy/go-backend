@@ -2,8 +2,8 @@ package eventbus
 
 import (
 	"encoding/json"
-	"log"
 
+	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/metrics"
 )
 
@@ -41,7 +41,7 @@ func (c *MetricsCollector) handleRideCompleted(payload []byte) {
 func (c *MetricsCollector) handleRideCancelled(payload []byte) {
 	var p RideCancelledPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[MetricsCollector] Unmarshal error (ride:cancelled): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "ride:cancelled").Msg("Unmarshal error")
 		return
 	}
 	metrics.RidesCancelledTotal.Inc()

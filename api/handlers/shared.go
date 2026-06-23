@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"ambigo-backend/api/middleware"
+	"ambigo-backend/api/response"
 	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/telephony"
 )
@@ -29,7 +30,7 @@ func NewSharedHandler(cs *telephony.CloudshopeService, cStore *admin.CounterStor
 func (h *SharedHandler) HandleCallMask(w http.ResponseWriter, r *http.Request) {
 	_, ok := r.Context().Value(middleware.UserIDKey).(string)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -38,13 +39,13 @@ func (h *SharedHandler) HandleCallMask(w http.ResponseWriter, r *http.Request) {
 		ToNumber   string `json:"to_number"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
 	maskedNumber, err := h.Cloudshope.InitiateCallMasking(req.FromNumber, req.ToNumber)
 	if err != nil {
-		http.Error(w, "Error placing the call, please try again!", http.StatusBadRequest)
+		response.Error(w, "Error placing the call, please try again!", http.StatusBadRequest)
 		return
 	}
 
@@ -58,7 +59,7 @@ func (h *SharedHandler) HandleCallMask(w http.ResponseWriter, r *http.Request) {
 func (h *SharedHandler) HandleCheckAmbulanceUpdates(w http.ResponseWriter, r *http.Request) {
 	count, err := h.CounterStore.GetCounter(r.Context(), "ambulance_type")
 	if err != nil {
-		http.Error(w, "Error fetching counter", http.StatusInternalServerError)
+		response.Error(w, "Error fetching counter", http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(fmt.Sprintf("%d", count))
@@ -68,7 +69,7 @@ func (h *SharedHandler) HandleCheckAmbulanceUpdates(w http.ResponseWriter, r *ht
 func (h *SharedHandler) HandleListAmbulanceTypes(w http.ResponseWriter, r *http.Request) {
 	list, err := h.AdminStore.ListAmbulanceTypes(r.Context())
 	if err != nil {
-		http.Error(w, "Failed to fetch list", http.StatusInternalServerError)
+		response.Error(w, "Failed to fetch list", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -79,7 +80,7 @@ func (h *SharedHandler) HandleListAmbulanceTypes(w http.ResponseWriter, r *http.
 func (h *SharedHandler) HandleCheckHospitalUpdates(w http.ResponseWriter, r *http.Request) {
 	count, err := h.CounterStore.GetCounter(r.Context(), "hospitals")
 	if err != nil {
-		http.Error(w, "Error fetching counter", http.StatusInternalServerError)
+		response.Error(w, "Error fetching counter", http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(fmt.Sprintf("%d", count))
@@ -89,7 +90,7 @@ func (h *SharedHandler) HandleCheckHospitalUpdates(w http.ResponseWriter, r *htt
 func (h *SharedHandler) HandleListHospitals(w http.ResponseWriter, r *http.Request) {
 	list, err := h.HospitalStore.ListHospitals(r.Context())
 	if err != nil {
-		http.Error(w, "Failed to fetch list", http.StatusInternalServerError)
+		response.Error(w, "Failed to fetch list", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

@@ -6,11 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
 
 	"ambigo-backend/api/middleware"
+	"ambigo-backend/api/response"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/payment"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -36,12 +37,12 @@ func NewPaymentHandler(store *payment.Store, eventBus *eventbus.InMemoryBus, rzp
 func (h *PaymentHandler) HandleGetPending(w http.ResponseWriter, r *http.Request) {
 	uidStr, ok := r.Context().Value(middleware.UserIDKey).(string)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	role, ok := r.Context().Value(middleware.UserRoleKey).(string)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -55,7 +56,7 @@ func (h *PaymentHandler) HandleGetPending(w http.ResponseWriter, r *http.Request
 	}
 
 	if err != nil {
-		http.Error(w, "Failed to fetch pending payments", http.StatusInternalServerError)
+		response.Error(w, "Failed to fetch pending payments", http.StatusInternalServerError)
 		return
 	}
 
@@ -71,7 +72,7 @@ func (h *PaymentHandler) HandleGetPending(w http.ResponseWriter, r *http.Request
 func (h *PaymentHandler) HandleProcessUserPayment(w http.ResponseWriter, r *http.Request) {
 	_, ok := r.Context().Value(middleware.UserIDKey).(string)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -81,19 +82,19 @@ func (h *PaymentHandler) HandleProcessUserPayment(w http.ResponseWriter, r *http
 		RzpSignature string `json:"rzp_signature"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
 	objID, err := primitive.ObjectIDFromHex(req.PaymentID)
 	if err != nil {
-		http.Error(w, "Invalid payment ID", http.StatusBadRequest)
+		response.Error(w, "Invalid payment ID", http.StatusBadRequest)
 		return
 	}
 
 	pmt, err := h.Store.FindPaymentByID(r.Context(), objID)
 	if err != nil || pmt == nil {
-		http.Error(w, "Payment not found", http.StatusNotFound)
+		response.Error(w, "Payment not found", http.StatusNotFound)
 		return
 	}
 
@@ -104,19 +105,19 @@ func (h *PaymentHandler) HandleProcessUserPayment(w http.ResponseWriter, r *http
 
 	// Verify cryptographic signature
 	if pmt.RazorpayOrderID == nil {
-		http.Error(w, "Payment does not have a Razorpay Order ID", http.StatusBadRequest)
+		response.Error(w, "Payment does not have a Razorpay Order ID", http.StatusBadRequest)
 		return
 	}
 
 	isValid := h.RazorpayService.VerifySignature(*pmt.RazorpayOrderID, req.RzpPaymentID, req.RzpSignature)
 	if !isValid {
-		http.Error(w, "Invalid payment signature, processing failed!", http.StatusBadRequest)
+		response.Error(w, "Invalid payment signature, processing failed!", http.StatusBadRequest)
 		return
 	}
 
 	err = h.Store.MarkPaymentPaid(r.Context(), objID, req.RzpPaymentID, payment.ModeOnline)
 	if err != nil {
-		http.Error(w, "Failed to mark payment as paid", http.StatusInternalServerError)
+		response.Error(w, "Failed to mark payment as paid", http.StatusInternalServerError)
 		return
 	}
 
@@ -133,7 +134,7 @@ func (h *PaymentHandler) HandleProcessUserPayment(w http.ResponseWriter, r *http
 func (h *PaymentHandler) HandleProcessDriverPayment(w http.ResponseWriter, r *http.Request) {
 	_, ok := r.Context().Value(middleware.UserIDKey).(string)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -142,7 +143,7 @@ func (h *PaymentHandler) HandleProcessDriverPayment(w http.ResponseWriter, r *ht
 		LegacyID string `json:"id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
@@ -152,24 +153,24 @@ func (h *PaymentHandler) HandleProcessDriverPayment(w http.ResponseWriter, r *ht
 	}
 	objID, err := primitive.ObjectIDFromHex(paymentID)
 	if err != nil {
-		http.Error(w, "Invalid payment ID", http.StatusBadRequest)
+		response.Error(w, "Invalid payment ID", http.StatusBadRequest)
 		return
 	}
 
 	pmt, err := h.Store.FindPaymentByID(r.Context(), objID)
 	if err != nil || pmt == nil {
-		http.Error(w, "Payment not found", http.StatusNotFound)
+		response.Error(w, "Payment not found", http.StatusNotFound)
 		return
 	}
 
 	if pmt.Paid {
-		http.Error(w, "Payment has already been completed", http.StatusBadRequest)
+		response.Error(w, "Payment has already been completed", http.StatusBadRequest)
 		return
 	}
 
 	err = h.Store.MarkPaymentPaid(r.Context(), objID, "", payment.ModeCash)
 	if err != nil {
-		http.Error(w, "Failed to mark payment as paid", http.StatusInternalServerError)
+		response.Error(w, "Failed to mark payment as paid", http.StatusInternalServerError)
 		return
 	}
 
@@ -188,13 +189,13 @@ func (h *PaymentHandler) HandleGetByRide(w http.ResponseWriter, r *http.Request)
 		RideID string `json:"ride_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
 	pmt, err := h.Store.FindPaymentByRideID(r.Context(), req.RideID)
 	if err != nil || pmt == nil {
-		http.Error(w, "Payment not found", http.StatusNotFound)
+		response.Error(w, "Payment not found", http.StatusNotFound)
 		return
 	}
 
@@ -206,19 +207,19 @@ func (h *PaymentHandler) HandleGetByRide(w http.ResponseWriter, r *http.Request)
 // It verifies the webhook signature using the Razorpay webhook secret, then marks the payment as paid.
 func (h *PaymentHandler) HandleRazorpayWebhook(w http.ResponseWriter, r *http.Request) {
 	if h.RazorpayWebhookSec == "" {
-		http.Error(w, "Webhook secret not configured", http.StatusInternalServerError)
+		response.Error(w, "Webhook secret not configured", http.StatusInternalServerError)
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		response.Error(w, "Failed to read body", http.StatusBadRequest)
 		return
 	}
 
 	sig := r.Header.Get("x-razorpay-signature")
 	if sig == "" {
-		http.Error(w, "Missing signature", http.StatusBadRequest)
+		response.Error(w, "Missing signature", http.StatusBadRequest)
 		return
 	}
 
@@ -226,7 +227,7 @@ func (h *PaymentHandler) HandleRazorpayWebhook(w http.ResponseWriter, r *http.Re
 	mac.Write(body)
 	expected := hex.EncodeToString(mac.Sum(nil))
 	if !hmac.Equal([]byte(expected), []byte(sig)) {
-		http.Error(w, "Invalid signature", http.StatusUnauthorized)
+		response.Error(w, "Invalid signature", http.StatusUnauthorized)
 		return
 	}
 
@@ -243,7 +244,7 @@ func (h *PaymentHandler) HandleRazorpayWebhook(w http.ResponseWriter, r *http.Re
 		} `json:"payload"`
 	}
 	if err := json.Unmarshal(body, &event); err != nil {
-		http.Error(w, "Invalid webhook payload", http.StatusBadRequest)
+		response.Error(w, "Invalid webhook payload", http.StatusBadRequest)
 		return
 	}
 
@@ -255,12 +256,12 @@ func (h *PaymentHandler) HandleRazorpayWebhook(w http.ResponseWriter, r *http.Re
 
 	pmt, err := h.Store.FindPaymentByRazorpayOrderID(r.Context(), event.Payload.Payment.Entity.OrderID)
 	if err != nil {
-		log.Printf("[PaymentWebhook] DB error: %v", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
+		logger.Log.Error().Err(err).Msg("PaymentWebhook DB error")
+		response.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 	if pmt == nil {
-		log.Printf("[PaymentWebhook] No payment found for order %s", event.Payload.Payment.Entity.OrderID)
+		logger.Log.Warn().Str("order_id", event.Payload.Payment.Entity.OrderID).Msg("PaymentWebhook no payment found for order")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "not_found"})
 		return
@@ -273,8 +274,8 @@ func (h *PaymentHandler) HandleRazorpayWebhook(w http.ResponseWriter, r *http.Re
 	}
 
 	if err := h.Store.MarkPaymentPaid(r.Context(), pmt.ID, event.Payload.Payment.Entity.ID, payment.ModeOnline); err != nil {
-		log.Printf("[PaymentWebhook] Failed to mark payment %s as paid: %v", pmt.ID.Hex(), err)
-		http.Error(w, "Failed to update payment", http.StatusInternalServerError)
+		logger.Log.Error().Err(err).Str("payment_id", pmt.ID.Hex()).Msg("PaymentWebhook failed to mark payment as paid")
+		response.Error(w, "Failed to update payment", http.StatusInternalServerError)
 		return
 	}
 
@@ -284,7 +285,7 @@ func (h *PaymentHandler) HandleRazorpayWebhook(w http.ResponseWriter, r *http.Re
 		Amount: pmt.ChargedAmount, Mode: "online",
 	})
 
-	log.Printf("[PaymentWebhook] Payment %s marked paid via Razorpay webhook (order: %s)", pmt.ID.Hex(), event.Payload.Payment.Entity.OrderID)
+	logger.Log.Info().Str("payment_id", pmt.ID.Hex()).Str("order_id", event.Payload.Payment.Entity.OrderID).Msg("PaymentWebhook payment marked paid")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "processed"})
 }

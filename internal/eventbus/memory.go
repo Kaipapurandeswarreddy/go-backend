@@ -1,10 +1,11 @@
 package eventbus
 
 import (
-	"ambigo-backend/interfaces"
 	"encoding/json"
-	"log"
 	"sync"
+
+	"ambigo-backend/interfaces"
+	"ambigo-backend/internal/logger"
 )
 
 type InMemoryBus struct {
@@ -30,7 +31,7 @@ func (b *InMemoryBus) Publish(channel string, payload []byte) error {
 		select {
 		case ch <- payloadCopy:
 		default:
-			log.Printf("[EventBus] Dropping message on channel %s: subscriber too slow", channel)
+			logger.Log.Warn().Str("channel", channel).Msg("Dropping message: subscriber too slow")
 		}
 	}
 	return nil
@@ -55,14 +56,14 @@ func (b *InMemoryBus) Subscribe(channel string, handler func(payload []byte)) er
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[EventBus] Panic in subscriber for channel %s: %v", channel, r)
+				logger.Log.Error().Interface("panic", r).Str("channel", channel).Msg("Panic in subscriber")
 			}
 		}()
 		for msg := range ch {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						log.Printf("[EventBus] Panic in subscriber handler for channel %s: %v", channel, r)
+						logger.Log.Error().Interface("panic", r).Str("channel", channel).Msg("Panic in subscriber handler")
 					}
 				}()
 				handler(msg)

@@ -2,9 +2,9 @@ package websocket
 
 import (
 	"encoding/json"
-	"log"
 
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/logger"
 )
 
 // WSNotifier listens to ride events and sends WebSocket notifications.
@@ -28,7 +28,7 @@ func (n *WSNotifier) SubscribeTo(bus *eventbus.InMemoryBus) {
 func (n *WSNotifier) handleRideAccepted(payload []byte) {
 	var p eventbus.RideAcceptedPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[WSNotifier] Unmarshal error (ride:accepted): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "ride:accepted").Msg("Unmarshal error")
 		return
 	}
 	n.wsManager.SetActiveRide(p.DriverID, p.RideID)
@@ -40,7 +40,7 @@ func (n *WSNotifier) handleRideAccepted(payload []byte) {
 func (n *WSNotifier) handleRideStatusChanged(payload []byte) {
 	var p eventbus.RideStatusChangedPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[WSNotifier] Unmarshal error (ride:status): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "ride:status").Msg("Unmarshal error")
 		return
 	}
 	msg := map[string]string{"ride_id": p.RideID, "status": p.Status}
@@ -50,7 +50,7 @@ func (n *WSNotifier) handleRideStatusChanged(payload []byte) {
 func (n *WSNotifier) handleRideCompleted(payload []byte) {
 	var p eventbus.RideCompletedPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[WSNotifier] Unmarshal error (ride:completed): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "ride:completed").Msg("Unmarshal error")
 		return
 	}
 	n.wsManager.ClearActiveRide(p.DriverID)
@@ -61,7 +61,7 @@ func (n *WSNotifier) handleRideCompleted(payload []byte) {
 func (n *WSNotifier) handleRideCancelled(payload []byte) {
 	var p eventbus.RideCancelledPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[WSNotifier] Unmarshal error (ride:cancelled): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "ride:cancelled").Msg("Unmarshal error")
 		return
 	}
 	if p.DriverID != "" {
@@ -79,7 +79,7 @@ func (n *WSNotifier) handleRideCancelled(payload []byte) {
 func (n *WSNotifier) handleDriverLocationUpdate(payload []byte) {
 	var p eventbus.DriverLocationUpdatePayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		log.Printf("[WSNotifier] Unmarshal error (driver:location): %v", err)
+		logger.Log.Error().Err(err).Str("channel", "driver:location").Msg("Unmarshal error")
 		return
 	}
 	if p.RideID == "" {

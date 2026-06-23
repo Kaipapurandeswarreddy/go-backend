@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"sync"
 
+	"ambigo-backend/api/response"
 	"golang.org/x/time/rate"
 )
 
@@ -38,7 +39,7 @@ func RateLimit(next http.HandlerFunc, limiter *ipLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := r.RemoteAddr
 		if !limiter.getLimiter(ip).Allow() {
-			http.Error(w, "Too many requests. Please try again later.", http.StatusTooManyRequests)
+			response.Error(w, "Too many requests. Please try again later.", http.StatusTooManyRequests)
 			return
 		}
 		next(w, r)
