@@ -19,6 +19,14 @@ var languages = map[string]string{
 	"kn_IN": "kn",
 }
 
+var translateClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:    5,
+		IdleConnTimeout: 90 * time.Second,
+	},
+}
+
 // TranslateField concurrently translates the input text into the target languages.
 func TranslateField(text string) Map {
 	translations := make(Map)
@@ -29,7 +37,6 @@ func TranslateField(text string) Map {
 		return translations
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -37,7 +44,7 @@ func TranslateField(text string) Map {
 		wg.Add(1)
 		go func(k, c string) {
 			defer wg.Done()
-			translated := fetchTranslation(client, text, c)
+			translated := fetchTranslation(translateClient, text, c)
 			mu.Lock()
 			translations[k] = translated
 			mu.Unlock()

@@ -203,12 +203,18 @@ func (m *Manager) SetActiveRide(driverID, rideID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.activeDriverRide[driverID] = rideID
+	if m.LocStore != nil {
+		m.LocStore.SetDriverStatus(driverID, "BUSY")
+	}
 }
 
 func (m *Manager) ClearActiveRide(driverID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.activeDriverRide, driverID)
+	if m.LocStore != nil {
+		m.LocStore.SetDriverStatus(driverID, "AVAILABLE")
+	}
 }
 
 // HandleIncomingMessage parses messages sent from a client to the server

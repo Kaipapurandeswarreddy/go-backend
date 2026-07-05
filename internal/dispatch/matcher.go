@@ -93,7 +93,8 @@ func (m *Matcher) FindBestDrivers(ctx context.Context, pickupLat, pickupLng floa
 
 			route, err := m.RouteCli.CalculateETA(ctx, d.lat, d.lng, pickupLat, pickupLng)
 			if err != nil {
-				logger.Log.Error().Err(err).Str("driver_id", d.id).Msg("Error getting ETA for driver")
+				l := logger.Ctx(ctx)
+			l.Error().Err(err).Str("driver_id", d.id).Msg("Error getting ETA for driver")
 				return
 			}
 

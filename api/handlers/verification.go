@@ -71,6 +71,9 @@ func (h *VerificationHandler) HandleUpdateVerification(w http.ResponseWriter, r 
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
+	if !response.Validate(w, &payload) {
+		return
+	}
 
 	// We must ensure we apply this to the current user
 	payload.ID = objID

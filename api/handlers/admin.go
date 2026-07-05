@@ -8,7 +8,9 @@ import (
 	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/requestid"
 	"ambigo-backend/internal/translation"
+	"golang.org/x/crypto/bcrypt"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
@@ -18,51 +20,75 @@ type AdminHandler struct {
 	AuthStore     *auth.Store
 	EventBus      *eventbus.InMemoryBus
 	HospitalStore *admin.HospitalStore
+	JWTSecret     string
 }
 
-func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore) *AdminHandler {
+func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, jwtSecret string) *AdminHandler {
 	return &AdminHandler{
 		Store:         store,
 		AuthStore:     authStore,
 		EventBus:      eventBus,
 		HospitalStore: hStore,
+		JWTSecret:     jwtSecret,
 	}
 }
 
-// HandleAdminLogin validates admin credentials (simplistic implementation for prototype)
 func (h *AdminHandler) HandleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username string `json:"username" validate:"required"`
+		Password string `json:"password" validate:"required"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-
-	// Hardcoded prototype admin credentials
-	if req.Username == "admin" && req.Password == "ambigo2024" {
-		// Generate JWT token
-		// Normally we'd use the secret from the config, but we'll mock it or use middleware
-		// Since we don't have the secret here easily, we'll assume the front-end will just
-		// receive a success response and we'll trust a static token for the prototype.
-		// For a real app, inject the JWT config.
-		
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"detail": "Admin Login Successful",
-			"token": "admin_mock_jwt_token", // Placeholder
-		})
+	if !response.Validate(w, &req) {
 		return
 	}
 
-	response.Error(w, "Invalid credentials", http.StatusUnauthorized)
+	adminUser, err := h.Store.FindAdminByUsername(r.Context(), req.Username)
+	if err != nil {
+		response.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if adminUser == nil {
+		response.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	if !adminUser.Active {
+		response.Error(w, "Account deactivated", http.StatusForbidden)
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(adminUser.HashedPassword), []byte(req.Password)); err != nil {
+		response.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	token, err := auth.GenerateJWT(adminUser.ID.Hex(), "admin", h.JWTSecret)
+	if err != nil {
+		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"detail": "Admin Login Successful",
+		"token":  token,
+		"name":   adminUser.Name,
+		"role":   adminUser.Role,
+	})
 }
 
 func (h *AdminHandler) HandleCreateAmbulanceType(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var amb admin.AmbulanceType
 	if err := json.NewDecoder(r.Body).Decode(&amb); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &amb) {
 		return
 	}
 
@@ -72,7 +98,7 @@ func (h *AdminHandler) HandleCreateAmbulanceType(w http.ResponseWriter, r *http.
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminAmbTypeCreated, eventbus.AdminAmbTypePayload{
-		AmbTypeID: amb.ID.Hex(), Name: amb.Name,
+		AmbTypeID: amb.ID.Hex(), Name: amb.Name, RequestID: reqID,
 	})
 
 	w.WriteHeader(http.StatusCreated)
@@ -94,6 +120,7 @@ func (h *AdminHandler) HandleListAmbulanceTypes(w http.ResponseWriter, r *http.R
 }
 
 func (h *AdminHandler) HandleDeleteAmbulanceType(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
 	idStr := r.PathValue("id")
 	objID, err := primitive.ObjectIDFromHex(idStr)
 	if err != nil {
@@ -108,7 +135,7 @@ func (h *AdminHandler) HandleDeleteAmbulanceType(w http.ResponseWriter, r *http.
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminAmbTypeDeleted, eventbus.AdminAmbTypePayload{
-		AmbTypeID: idStr,
+		AmbTypeID: idStr, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Deleted"})
@@ -116,6 +143,8 @@ func (h *AdminHandler) HandleDeleteAmbulanceType(w http.ResponseWriter, r *http.
 
 // HandleApproveDriver flips an unverified driver to a verified driver
 func (h *AdminHandler) HandleApproveDriver(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var driver auth.Driver
 	if err := json.NewDecoder(r.Body).Decode(&driver); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
@@ -129,7 +158,7 @@ func (h *AdminHandler) HandleApproveDriver(w http.ResponseWriter, r *http.Reques
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthDriverApproved, eventbus.AuthDriverApprovedPayload{
-		DriverID: driver.ID.Hex(), Name: driver.Name, Mobile: driver.Mobile,
+		DriverID: driver.ID.Hex(), Name: driver.Name, Mobile: driver.Mobile, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Driver Approved"})
@@ -149,13 +178,13 @@ func (h *AdminHandler) HandleGetUnverifiedDrivers(w http.ResponseWriter, r *http
 
 type HospitalRequest struct {
 	ID          string `json:"_id"`
-	Name        string `json:"name"`
-	Address     string `json:"address"`
-	City        string `json:"city"`
+	Name        string `json:"name" validate:"required"`
+	Address     string `json:"address" validate:"required"`
+	City        string `json:"city" validate:"required"`
 	Coordinates struct {
-		Lat float64 `json:"lat"`
-		Lng float64 `json:"lng"`
-	} `json:"coordinates"`
+		Lat float64 `json:"lat" validate:"required,min=-90,max=90"`
+		Lng float64 `json:"lng" validate:"required,min=-180,max=180"`
+	} `json:"coordinates" validate:"required"`
 	AlwaysOpen bool     `json:"always_open"`
 	Services   []string `json:"services"`
 	Timing     *struct {
@@ -165,9 +194,14 @@ type HospitalRequest struct {
 }
 
 func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var req HospitalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
 		return
 	}
 
@@ -195,15 +229,24 @@ func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminHospitalAdded, eventbus.AdminHospitalPayload{
-		HospitalID: hospital.ID.Hex(), Name: hospital.Name["en_US"],
+		HospitalID: hospital.ID.Hex(), Name: hospital.Name["en_US"], RequestID: reqID,
 	})
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital added successfully"})
 }
 
 func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var req HospitalRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
-		response.Error(w, "Invalid payload or missing ID", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if req.ID == "" {
+		response.Error(w, "ID is required", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
 		return
 	}
 
@@ -238,17 +281,22 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminHospitalUpdated, eventbus.AdminHospitalPayload{
-		HospitalID: req.ID,
+		HospitalID: req.ID, RequestID: reqID,
 	})
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital updated successfully"})
 }
 
 func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var req struct {
-		HospitalID string `json:"hospital_id"`
+		HospitalID string `json:"hospital_id" validate:"required"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
 		return
 	}
 
@@ -264,7 +312,7 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminHospitalDeleted, eventbus.AdminHospitalPayload{
-		HospitalID: req.HospitalID,
+		HospitalID: req.HospitalID, RequestID: reqID,
 	})
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital deleted successfully"})
 }

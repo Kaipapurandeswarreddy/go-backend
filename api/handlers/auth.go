@@ -7,6 +7,7 @@ import (
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/requestid"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -29,15 +30,20 @@ func NewAuthHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, jwtSe
 // -----------------------------------------------------
 
 type UserRequestOTPPayload struct {
-	Mobile       string `json:"mobile"`
+	Mobile       string `json:"mobile" validate:"required"`
 	AppSignature string `json:"app_signature,omitempty"`
 }
 
 // HandleUserRequestOTP sends a 6-digit OTP to the user
 func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var payload UserRequestOTPPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &payload) {
 		return
 	}
 
@@ -47,7 +53,7 @@ func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	h.EventBus.PublishEvent(eventbus.ChannelAuthOTPRequested, eventbus.AuthOTPRequestedPayload{
-		Mobile: payload.Mobile, Role: "user",
+		Mobile: payload.Mobile, Role: "user", RequestID: reqID,
 	})
 
 	// Send the SMS
@@ -79,17 +85,22 @@ func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Reques
 }
 
 type UserVerifyOTPPayload struct {
-	Name         string `json:"name,omitempty"` // Required if new user
-	Mobile       string `json:"mobile"`
-	OTP          string `json:"otp"`
+	Name         string `json:"name,omitempty"`
+	Mobile       string `json:"mobile" validate:"required"`
+	OTP          string `json:"otp" validate:"required"`
 	ReferralCode string `json:"referral_code,omitempty"`
 }
 
 // HandleUserVerifyOTP checks the OTP and issues a JWT token
 func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var payload UserVerifyOTPPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &payload) {
 		return
 	}
 
@@ -123,7 +134,7 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		h.EventBus.PublishEvent(eventbus.ChannelAuthUserRegistered, eventbus.AuthUserRegisteredPayload{
-			UserID: user.ID.Hex(), Mobile: payload.Mobile, Name: payload.Name,
+			UserID: user.ID.Hex(), Mobile: payload.Mobile, Name: payload.Name, RequestID: reqID,
 		})
 	}
 
@@ -138,7 +149,7 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 	h.AuthStore.UpdateUserJWT(r.Context(), user.ID, token)
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthUserLoggedIn, eventbus.AuthUserLoggedInPayload{
-		UserID: user.ID.Hex(), Mobile: payload.Mobile,
+		UserID: user.ID.Hex(), Mobile: payload.Mobile, RequestID: reqID,
 	})
 
 	// 5. Return Token
@@ -154,9 +165,14 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 
 // HandleDriverRequestOTP sends a 6-digit OTP to the driver
 func (h *AuthHandler) HandleDriverRequestOTP(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var payload UserRequestOTPPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &payload) {
 		return
 	}
 
@@ -166,7 +182,7 @@ func (h *AuthHandler) HandleDriverRequestOTP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	h.EventBus.PublishEvent(eventbus.ChannelAuthOTPRequested, eventbus.AuthOTPRequestedPayload{
-		Mobile: payload.Mobile, Role: "driver",
+		Mobile: payload.Mobile, Role: "driver", RequestID: reqID,
 	})
 
 	err = auth.SendSMS(payload.Mobile, otp, payload.AppSignature)
@@ -204,9 +220,14 @@ func (h *AuthHandler) HandleDriverRequestOTP(w http.ResponseWriter, r *http.Requ
 
 // HandleDriverVerifyOTP checks the OTP and issues a JWT token for the driver
 func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
 	var payload UserVerifyOTPPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &payload) {
 		return
 	}
 
@@ -244,7 +265,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 				return
 			}
 			h.EventBus.PublishEvent(eventbus.ChannelAuthDriverCreated, eventbus.AuthDriverCreatedPayload{
-				DriverID: unverifiedDriver.ID.Hex(), Mobile: payload.Mobile, Name: payload.Name,
+				DriverID: unverifiedDriver.ID.Hex(), Mobile: payload.Mobile, Name: payload.Name, RequestID: reqID,
 			})
 		}
 		driverID = unverifiedDriver.ID
@@ -262,7 +283,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthDriverLoggedIn, eventbus.AuthDriverLoggedInPayload{
-		DriverID: driverID.Hex(), Mobile: payload.Mobile, Role: role,
+		DriverID: driverID.Hex(), Mobile: payload.Mobile, Role: role, RequestID: reqID,
 	})
 
 	w.Header().Set("Content-Type", "application/json")

@@ -1,6 +1,8 @@
 package eventbus
 
 import (
+	"encoding/json"
+
 	"ambigo-backend/internal/logger"
 )
 
@@ -22,6 +24,7 @@ func (l *AuditLogger) SubscribeTo(bus *InMemoryBus) {
 		ChannelDriverLocationUpdate,
 		ChannelAdminAmbTypeCreated, ChannelAdminAmbTypeDeleted,
 		ChannelAdminHospitalAdded, ChannelAdminHospitalUpdated, ChannelAdminHospitalDeleted,
+		ChannelAdminOfferCreated, ChannelAdminOfferDeleted,
 	}
 	for _, ch := range channels {
 		bus.Subscribe(ch, l.handleEvent)
@@ -29,5 +32,12 @@ func (l *AuditLogger) SubscribeTo(bus *InMemoryBus) {
 }
 
 func (l *AuditLogger) handleEvent(payload []byte) {
-	logger.Log.Info().Str("channel", "audit").Str("payload", string(payload)).Msg("audit event")
+	evt := logger.Log.Info().Str("channel", "audit").Str("payload", string(payload))
+	var raw map[string]interface{}
+	if json.Unmarshal(payload, &raw) == nil {
+		if reqID, ok := raw["request_id"].(string); ok && reqID != "" {
+			evt = evt.Str("request_id", reqID)
+		}
+	}
+	evt.Msg("audit event")
 }

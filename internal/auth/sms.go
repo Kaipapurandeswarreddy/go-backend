@@ -12,6 +12,14 @@ import (
 
 const SMSHeader = "AMBHPL"
 
+var smsClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:    5,
+		IdleConnTimeout: 90 * time.Second,
+	},
+}
+
 // SendSMS calls the SMSCountry API to send an OTP
 func SendSMS(number string, otp string, appSignature string) error {
 	authKey := os.Getenv("SMS_COUNTRY_KEY")
@@ -50,8 +58,7 @@ func SendSMS(number string, otp string, appSignature string) error {
 	req.Header.Set("Authorization", "Basic "+encodedCredentials)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := smsClient.Do(req)
 	if err != nil {
 		return err
 	}

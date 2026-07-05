@@ -20,6 +20,7 @@ import (
 	"ambigo-backend/internal/location"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/notification"
+	"ambigo-backend/internal/offer"
 	"ambigo-backend/internal/payment"
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/telephony"
@@ -47,13 +48,13 @@ func main() {
 	appConfig := config.LoadConfig()
 
 	// 2. Initialize MongoDB (Business Truth)
-	db, err := config.InitMongoDB(appConfig.MongoURI)
+	client, err := config.InitMongoDB(appConfig.MongoURI)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to connect to MongoDB")
 	}
-	defer db.Client.Disconnect(nil)
+	defer client.Disconnect(nil)
 
-	if err := config.EnsureIndexes(db.Client); err != nil {
+	if err := config.EnsureIndexes(client); err != nil {
 		log.Fatal().Err(err).Msg("Failed to ensure MongoDB indexes")
 	}
 
@@ -69,17 +70,18 @@ func main() {
 	// V1: Rides DB → searching_rides, accepted_rides, ongoing_rides, completed_rides (V2 uses single "rides" collection with status field)
 	// V1: Records DB → payments, wallet_transactions, feedback, referrals, offers
 	// V1: Data DB → ambulance_types, hospitals, counters
-	usersDB := db.Client.Database("Users")
-	ridesDB := db.Client.Database("Rides")
-	recordsDB := db.Client.Database("Records")
-	dataDB := db.Client.Database("Data")
+	usersDB := client.Database("Users")
+	ridesDB := client.Database("Rides")
+	recordsDB := client.Database("Records")
+	dataDB := client.Database("Data")
 
-	authStore := auth.NewStore(usersDB)
+	authStore := auth.NewStore(usersDB, recordsDB)
 	rideStore := ride.NewStore(ridesDB.Collection("rides"))
 	paymentStore := payment.NewStore(recordsDB)
-	adminStore := admin.NewStore(dataDB)
+	adminStore := admin.NewStore(dataDB, usersDB)
 	counterStore := admin.NewCounterStore(dataDB)
 	hospitalStore := admin.NewHospitalStore(dataDB)
+	offerStore := offer.NewStore(recordsDB)
 	walletStore := payment.NewWalletStore(recordsDB, usersDB)
 	feedbackStore := ride.NewFeedbackStore(recordsDB)
 
@@ -103,7 +105,8 @@ func main() {
 	profileHandler := handlers.NewProfileHandler(authStore)
 	verificationHandler := handlers.NewVerificationHandler(authStore)
 	paymentHandler := handlers.NewPaymentHandler(paymentStore, eventBus, rzpService, appConfig.RazorpayWebhookSecret)
-	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore)
+	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, appConfig.JWTSecret)
+	offerHandler := handlers.NewOfferHandler(offerStore, eventBus)
 	sharedHandler := handlers.NewSharedHandler(cloudshopeService, counterStore, adminStore, hospitalStore)
 	walletHandler := handlers.NewWalletHandler(authStore, eventBus, walletStore, zwitchService)
 	feedbackHandler := handlers.NewFeedbackHandler(feedbackStore)
@@ -136,7 +139,7 @@ func main() {
 		defer cancel()
 
 		mongoOK := "ok"
-		if err := db.Client.Ping(ctx, readpref.Primary()); err != nil {
+		if err := client.Ping(ctx, readpref.Primary()); err != nil {
 			mongoOK = "unreachable"
 		}
 
@@ -233,6 +236,9 @@ func main() {
 	mux.Handle("POST /api/v2/admin/hospitals/add", requireAdmin(http.HandlerFunc(adminHandler.HandleAddHospital)))
 	mux.Handle("POST /api/v2/admin/hospitals/update", requireAdmin(http.HandlerFunc(adminHandler.HandleUpdateHospital)))
 	mux.Handle("POST /api/v2/admin/hospitals/delete", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteHospital)))
+	mux.Handle("POST /api/v2/admin/offers", requireAdmin(http.HandlerFunc(offerHandler.HandleCreate)))
+	mux.Handle("GET /api/v2/admin/offers", requireAdmin(http.HandlerFunc(offerHandler.HandleList)))
+	mux.Handle("DELETE /api/v2/admin/offers/{id}", requireAdmin(http.HandlerFunc(offerHandler.HandleDelete)))
 
 	// Apply API key auth to all routes except /metrics, /health, and /ws (WebSocket validates api_key via query param)
 	protected := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -244,8 +250,12 @@ func main() {
 		apiKeyAuth(mux).ServeHTTP(w, r)
 	})
 	server := &http.Server{
-		Addr:    ":" + appConfig.Port,
-		Handler: middleware.Metrics(protected),
+		Addr:              ":" + appConfig.Port,
+		Handler:           middleware.CORS(middleware.RequestID(middleware.Metrics(middleware.BodyLimit(protected)))),
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
 	// Graceful shutdown
@@ -269,7 +279,7 @@ func main() {
 		log.Error().Err(err).Msg("HTTP server forced shutdown")
 	}
 
-	if err := db.Client.Disconnect(ctx); err != nil {
+		if err := client.Disconnect(ctx); err != nil {
 		log.Error().Err(err).Msg("MongoDB disconnect error")
 	}
 

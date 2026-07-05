@@ -45,6 +45,14 @@ func (m *Manager) handleLocationUpdate(client *Client, payload json.RawMessage) 
 	rideID := m.activeDriverRide[client.ID]
 	m.mu.RUnlock()
 
+	// If driver has an active ride but was recreated as AVAILABLE (e.g. after cleanup), fix the status
+	if rideID != "" {
+		currentStatus, _ := m.LocStore.GetDriverStatus(client.ID)
+		if currentStatus != "BUSY" {
+			m.LocStore.SetDriverStatus(client.ID, "BUSY")
+		}
+	}
+
 	// Publish driver location event (subscriber handles onward relay to ride watchers)
 	if m.EventBus != nil {
 		m.EventBus.PublishEvent(eventbus.ChannelDriverLocationUpdate, eventbus.DriverLocationUpdatePayload{

@@ -33,12 +33,18 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 		return
 	}
 
+	log := logger.Log.With()
+	if p.RequestID != "" {
+		log = log.Str("request_id", p.RequestID)
+	}
+	ll := log.Logger()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	token, err := n.authStore.GetDriverFCMToken(ctx, p.DriverID)
 	if err != nil {
-		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Failed to get FCM token for driver")
+		ll.Error().Err(err).Str("driver_id", p.DriverID).Msg("Failed to get FCM token for driver")
 		return
 	}
 	if token == nil || *token == "" {
@@ -70,7 +76,7 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 	}
 
 	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
-		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("FCM push failed for driver")
+		ll.Error().Err(err).Str("driver_id", p.DriverID).Msg("FCM push failed for driver")
 	}
 }
 
@@ -80,6 +86,12 @@ func (n *FCMNotifier) handleDriverApproved(payload []byte) {
 		logger.Log.Error().Err(err).Str("channel", "auth:driver_approved").Msg("Unmarshal error")
 		return
 	}
+
+	log := logger.Log.With()
+	if p.RequestID != "" {
+		log = log.Str("request_id", p.RequestID)
+	}
+	ll := log.Logger()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -95,6 +107,6 @@ func (n *FCMNotifier) handleDriverApproved(payload []byte) {
 	}
 
 	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
-		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Welcome FCM push failed for driver")
+		ll.Error().Err(err).Str("driver_id", p.DriverID).Msg("Welcome FCM push failed for driver")
 	}
 }

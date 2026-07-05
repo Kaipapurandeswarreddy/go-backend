@@ -23,6 +23,8 @@ var upgrader = gorilla.Upgrader{
 
 // ServeWS handles WebSocket requests from the peer.
 func ServeWS(manager *websocket.Manager, cfg *config.AppConfig, w http.ResponseWriter, r *http.Request) {
+	log := logger.Ctx(r.Context())
+
 	// 0. Validate API Key
 	apiKey := r.URL.Query().Get("api_key")
 	if apiKey == "" || apiKey != cfg.APIKey {
@@ -40,7 +42,7 @@ func ServeWS(manager *websocket.Manager, cfg *config.AppConfig, w http.ResponseW
 	// 2. Validate JWT Token
 	claims, err := auth.ValidateToken(tokenStr, cfg.JWTSecret)
 	if err != nil {
-		logger.Log.Error().Err(err).Msg("WebSocket auth failed")
+		log.Error().Err(err).Msg("WebSocket auth failed")
 		response.Error(w, "Unauthorized: invalid token", http.StatusUnauthorized)
 		return
 	}
@@ -48,7 +50,7 @@ func ServeWS(manager *websocket.Manager, cfg *config.AppConfig, w http.ResponseW
 	// 3. Upgrade HTTP connection to WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		logger.Log.Error().Err(err).Msg("WebSocket upgrade failed")
+		log.Error().Err(err).Msg("WebSocket upgrade failed")
 		return
 	}
 

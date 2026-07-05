@@ -33,6 +33,9 @@ func (h *FeedbackHandler) HandleSubmitFeedback(w http.ResponseWriter, r *http.Re
 	}
 
 	req.UserID = uidStr // Enforce user ID from JWT
+	if !response.Validate(w, &req) {
+		return
+	}
 
 	if err := h.FeedbackStore.InsertFeedback(r.Context(), &req); err != nil {
 		response.Error(w, "Error submitting the feedback", http.StatusBadRequest)

@@ -44,5 +44,11 @@ func (c *MetricsCollector) handleRideCancelled(payload []byte) {
 		logger.Log.Error().Err(err).Str("channel", "ride:cancelled").Msg("Unmarshal error")
 		return
 	}
+	log := logger.Log.With()
+	if p.RequestID != "" {
+		log = log.Str("request_id", p.RequestID)
+	}
+	ll := log.Logger()
+	ll.Debug().Str("ride_id", p.RideID).Msg("Ride cancelled metric recorded")
 	metrics.RidesCancelledTotal.Inc()
 }

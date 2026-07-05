@@ -11,6 +11,7 @@ import (
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/payment"
+	"ambigo-backend/internal/requestid"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
@@ -61,9 +62,7 @@ func (h *WalletHandler) HandleUpdateWallet(w http.ResponseWriter, r *http.Reques
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-
-	if req.AccountNo == "" || req.BenfName == "" || req.IFSCCode == "" {
-		response.Error(w, "Invalid Account Details", http.StatusBadRequest)
+	if !response.Validate(w, &req) {
 		return
 	}
 
@@ -114,12 +113,16 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	reqID := requestid.FromContext(r.Context())
 
 	var req struct {
-		Amount float64 `json:"amount"`
+		Amount float64 `json:"amount" validate:"required,gt=0"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
 		return
 	}
 
@@ -184,7 +187,7 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 	h.WalletStore.InsertTransaction(r.Context(), tx)
 
 	h.EventBus.PublishEvent(eventbus.ChannelWalletWithdrawal, eventbus.WalletWithdrawalPayload{
-		DriverID: uidStr, Amount: req.Amount, Status: status,
+		DriverID: uidStr, Amount: req.Amount, Status: status, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Withdrawal initiated, amount will be transferred shortly!!"})

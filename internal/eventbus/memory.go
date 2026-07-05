@@ -6,6 +6,7 @@ import (
 
 	"ambigo-backend/interfaces"
 	"ambigo-backend/internal/logger"
+	"ambigo-backend/internal/metrics"
 )
 
 type InMemoryBus struct {
@@ -31,6 +32,7 @@ func (b *InMemoryBus) Publish(channel string, payload []byte) error {
 		select {
 		case ch <- payloadCopy:
 		default:
+			metrics.EventBusMessagesDropped.WithLabelValues(channel).Inc()
 			logger.Log.Warn().Str("channel", channel).Msg("Dropping message: subscriber too slow")
 		}
 	}

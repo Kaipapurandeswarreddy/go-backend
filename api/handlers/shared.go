@@ -35,11 +35,14 @@ func (h *SharedHandler) HandleCallMask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		FromNumber string `json:"from_number"`
-		ToNumber   string `json:"to_number"`
+		FromNumber string `json:"from_number" validate:"required"`
+		ToNumber   string `json:"to_number" validate:"required"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
 		return
 	}
 

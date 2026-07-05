@@ -17,10 +17,20 @@ import (
 // RouteClient handles communication with Google Routes API
 type RouteClient struct {
 	APIKey string
+	Client *http.Client
 }
 
 func NewRouteClient(apiKey string) *RouteClient {
-	return &RouteClient{APIKey: apiKey}
+	return &RouteClient{
+		APIKey: apiKey,
+		Client: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:    20,
+				IdleConnTimeout: 90 * time.Second,
+			},
+		},
+	}
 }
 
 type computeRoutesRequest struct {
@@ -94,10 +104,8 @@ func (rc *RouteClient) CalculateETA(ctx context.Context, originLat, originLng, d
 		req.Header.Set("X-Goog-Api-Key", rc.APIKey)
 		req.Header.Set("X-Goog-FieldMask", "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline")
 
-		client := &http.Client{Timeout: 5 * time.Second}
-
 		start := time.Now()
-		resp, err := client.Do(req)
+		resp, err := rc.Client.Do(req)
 		metrics.ObserveGoogleAPI(time.Since(start))
 		if err != nil {
 			return err
