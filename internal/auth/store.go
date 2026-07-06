@@ -286,14 +286,14 @@ func (s *Store) ApproveDriver(ctx context.Context, driver *Driver) error {
 }
 
 // ListDrivers returns a paginated list of verified drivers sorted by newest first.
-// Excludes heavy image fields (photo, details) — fetched separately on detail screen.
+// Excludes heavy details subdoc — photo (profile pic) is included for inline display.
 func (s *Store) ListDrivers(ctx context.Context, skip int64) ([]Driver, int64, error) {
 	total, err := s.drivers.CountDocuments(ctx, bson.M{})
 	if err != nil {
 		return nil, 0, err
 	}
 
-	projection := bson.D{{Key: "photo", Value: 0}, {Key: "details", Value: 0}}
+	projection := bson.D{{Key: "details", Value: 0}}
 	opts := options.Find().SetSkip(skip).SetLimit(20).SetSort(bson.M{"_id": -1}).SetProjection(projection)
 	cursor, err := s.drivers.Find(ctx, bson.M{}, opts)
 	if err != nil {
