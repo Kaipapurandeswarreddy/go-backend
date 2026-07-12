@@ -233,11 +233,18 @@ func (h *RideHandler) HandleDriverAccept(w http.ResponseWriter, r *http.Request)
 
 func (h *RideHandler) HandleArrive(w http.ResponseWriter, r *http.Request) {
 	rideID := r.PathValue("id")
+	callerID, _ := r.Context().Value(middleware.UserIDKey).(string)
 	reqID := requestid.FromContext(r.Context())
 
 	rideData, err := h.Dispatcher.RideStore.GetRideByID(r.Context(), rideID)
 	if err != nil || rideData == nil {
 		response.Error(w, "Ride not found", http.StatusNotFound)
+		return
+	}
+
+	// A3: Only the assigned driver can advance the ride
+	if rideData.DriverID == nil || callerID != *rideData.DriverID {
+		response.Error(w, "Forbidden: you are not the assigned driver for this ride", http.StatusForbidden)
 		return
 	}
 
@@ -259,6 +266,7 @@ func (h *RideHandler) HandleArrive(w http.ResponseWriter, r *http.Request) {
 
 func (h *RideHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 	rideID := r.PathValue("id")
+	callerID, _ := r.Context().Value(middleware.UserIDKey).(string)
 	reqID := requestid.FromContext(r.Context())
 
 	var req struct {
@@ -273,6 +281,12 @@ func (h *RideHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 	rideData, err := h.Dispatcher.RideStore.GetRideByID(r.Context(), rideID)
 	if err != nil || rideData == nil {
 		response.Error(w, "Ride not found", http.StatusNotFound)
+		return
+	}
+
+	// A3/A8: Only the assigned driver can start the ride (even when OTP is disabled)
+	if rideData.DriverID == nil || callerID != *rideData.DriverID {
+		response.Error(w, "Forbidden: you are not the assigned driver for this ride", http.StatusForbidden)
 		return
 	}
 
@@ -340,6 +354,12 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 	rideData, err := h.Dispatcher.RideStore.GetRideByID(r.Context(), rideID)
 	if err != nil || rideData == nil {
 		response.Error(w, "Ride not found", http.StatusNotFound)
+		return
+	}
+
+	// A3: Only the assigned driver can complete the ride
+	if rideData.DriverID == nil || driverID != *rideData.DriverID {
+		response.Error(w, "Forbidden: you are not the assigned driver for this ride", http.StatusForbidden)
 		return
 	}
 
@@ -585,9 +605,18 @@ func (h *RideHandler) HandleGetDriverDetails(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	callerID, _ := r.Context().Value(middleware.UserIDKey).(string)
+	callerRole, _ := r.Context().Value(middleware.UserRoleKey).(string)
+
 	rideData, err := h.Dispatcher.RideStore.GetRideByID(r.Context(), req.RideID)
 	if err != nil || rideData == nil {
 		response.Error(w, "Ride not found", http.StatusNotFound)
+		return
+	}
+
+	// A2: Only the ride's user, driver, or admin can view driver PII
+	if callerRole != "admin" && callerID != rideData.UserID && (rideData.DriverID == nil || callerID != *rideData.DriverID) {
+		response.Error(w, "Forbidden: you do not own this ride", http.StatusForbidden)
 		return
 	}
 
@@ -625,9 +654,18 @@ func (h *RideHandler) HandleGetUserDetails(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	callerID, _ := r.Context().Value(middleware.UserIDKey).(string)
+	callerRole, _ := r.Context().Value(middleware.UserRoleKey).(string)
+
 	rideData, err := h.Dispatcher.RideStore.GetRideByID(r.Context(), req.RideID)
 	if err != nil || rideData == nil {
 		response.Error(w, "Ride not found", http.StatusNotFound)
+		return
+	}
+
+	// A2: Only the ride's user, driver, or admin can view user PII
+	if callerRole != "admin" && callerID != rideData.UserID && (rideData.DriverID == nil || callerID != *rideData.DriverID) {
+		response.Error(w, "Forbidden: you do not own this ride", http.StatusForbidden)
 		return
 	}
 
