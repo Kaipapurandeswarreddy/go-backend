@@ -1,6 +1,6 @@
 # Multi-stage build for optimized image size
 # Stage 1: Builder
-FROM golang:1.26-bullseye AS builder
+FROM golang:1.26.4 AS builder
 
 # Install build dependencies (gcc, make, cmake) and git
 RUN apt-get update && \
