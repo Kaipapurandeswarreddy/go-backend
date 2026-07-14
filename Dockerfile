@@ -1,43 +1,56 @@
 # Multi-stage build for optimized image size
 # Stage 1: Builder
-FROM golang:1.26.4-alpine AS builder
+FROM golang:1.26.4-bullseye AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
+# Install build dependencies (gcc, make, cmake) and git
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential ca-certificates git cmake pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build and install the H3 C library (native dependency for github.com/uber/h3-go)
+RUN git clone --depth 1 https://github.com/uber/h3.git /tmp/h3 && \
+    mkdir -p /tmp/h3/build && \
+    cd /tmp/h3/build && \
+    cmake .. && \
+    make -j"$(nproc)" && \
+    make install && \
+    rm -rf /tmp/h3
 
 # Set working directory
 WORKDIR /app
 
-# Copy go mod files
+# Copy go mod files and download modules early for caching
 COPY go.mod go.sum ./
-
-# Download dependencies
 RUN go mod download
 
 # Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o server ./cmd/server
+# Build the application with CGO enabled so h3 C bindings link correctly
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o server ./cmd/server
 
 # Stage 2: Runtime
-FROM alpine:latest
+FROM debian:bullseye-slim
 
 # Install runtime dependencies
-RUN apk --no-cache add ca-certificates tzdata
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates tzdata && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the H3 native library from builder and the built binary
+COPY --from=builder /usr/local/lib/libh3.so* /usr/local/lib/
+COPY --from=builder /app/server /home/appuser/server
+
+# Ensure dynamic linker cache is updated so libh3 is found
+RUN ldconfig || true
 
 # Create non-root user for security
-RUN addgroup -g 1000 appuser && \
-    adduser -D -u 1000 -G appuser appuser
+RUN groupadd -g 1000 appuser && \
+    useradd -m -u 1000 -g appuser appuser && \
+    chown appuser:appuser /home/appuser/server
 
 # Set working directory
 WORKDIR /home/appuser
-
-# Copy binary from builder
-COPY --from=builder --chown=appuser:appuser /app/server .
-
-# Copy .env.example (optional, for reference)
-COPY --chown=appuser:appuser .env.example .
 
 # Switch to non-root user
 USER appuser
