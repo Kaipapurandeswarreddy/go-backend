@@ -30,7 +30,7 @@ COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o server ./cmd/server
 
 # Stage 2: Runtime
-FROM debian:bullseye-slim
+FROM debian:trixie-slim
 
 # Install runtime dependencies
 RUN apt-get update && \
@@ -56,7 +56,7 @@ WORKDIR /home/appuser
 USER appuser
 
 # Expose port (Cloud Run uses PORT env variable, default 8080)
-EXPOSE 8000
+EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
