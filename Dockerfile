@@ -11,7 +11,7 @@ RUN apt-get update && \
 RUN git clone --depth 1 https://github.com/uber/h3.git /tmp/h3 && \
     mkdir -p /tmp/h3/build && \
     cd /tmp/h3/build && \
-    cmake .. && \
+    cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_TESTS=OFF .. && \
     make -j"$(nproc)" && \
     make install && \
     rm -rf /tmp/h3
