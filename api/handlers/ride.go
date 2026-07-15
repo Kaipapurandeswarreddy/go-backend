@@ -101,7 +101,15 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 	if req.AmbTypeID == "" {
 		candidates, err := h.Dispatcher.Matcher.FindBestDrivers(r.Context(), req.PickupLat, req.PickupLng, 5, "")
 		if err != nil || len(candidates) == 0 {
-			response.Error(w, "No ambulances available nearby", http.StatusNotFound)
+			availableTypes := h.Dispatcher.Matcher.FindAvailableOtherTypes(req.PickupLat, req.PickupLng, "")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":          http.StatusText(http.StatusNotFound),
+				"detail":         "No ambulances available nearby",
+				"code":           http.StatusNotFound,
+				"available_types": availableTypes,
+			})
 			return
 		}
 		for _, candidate := range candidates {
@@ -116,7 +124,15 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 			break
 		}
 		if req.AmbTypeID == "" {
-			response.Error(w, "No eligible ambulances available nearby", http.StatusNotFound)
+			availableTypes := h.Dispatcher.Matcher.FindAvailableOtherTypes(req.PickupLat, req.PickupLng, "")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":          http.StatusText(http.StatusNotFound),
+				"detail":         "No eligible ambulances available nearby",
+				"code":           http.StatusNotFound,
+				"available_types": availableTypes,
+			})
 			return
 		}
 	}
