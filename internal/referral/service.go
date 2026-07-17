@@ -474,6 +474,35 @@ func (s *Service) GetRewards(ctx context.Context, entityID, role string) (*Rewar
 	}, nil
 }
 
+func (s *Service) ConsumeUserReferralCredit(ctx context.Context, userID string) (float64, error) {
+	offers, err := s.offerStore.FindByUserID(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+
+	// Find the highest OfferAmount
+	var maxAmount float64
+	var maxOffer *offer.Offer
+	for _, o := range offers {
+		if o.OfferAmount != nil && *o.OfferAmount > maxAmount {
+			maxAmount = *o.OfferAmount
+			maxOffer = &o
+		}
+	}
+
+	if maxOffer == nil || maxAmount <= 0 {
+		return 0, nil
+	}
+
+	if err := s.offerStore.Delete(ctx, maxOffer.ID); err != nil {
+		logger.Log.Error().Err(err).Str("user_id", userID).Float64("amount", maxAmount).Msg("Failed to delete consumed referral offer")
+		return 0, err
+	}
+
+	logger.Log.Info().Str("user_id", userID).Float64("amount", maxAmount).Msg("Referral credit consumed")
+	return maxAmount, nil
+}
+
 // randomCode generates a random string of the given length from the code alphabet.
 func randomCode(length int) (string, error) {
 	max := big.NewInt(int64(len(codeAlphabet)))
