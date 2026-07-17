@@ -422,19 +422,15 @@ func (s *Service) GetRewards(ctx context.Context, entityID, role string) (*Rewar
 		}
 	}
 
-	// For users, calculate available credit from offers
+	// For users, calculate available credit from actual offers in DB
 	if role == "user" {
-		// The available credit comes from user-specific offers created by the referral system
-		// This is a simplified calculation — the actual credit is applied at booking time
 		availableCredit = 0
-		for _, rec := range refereeRecords {
-			if rec.RefereeCredited && rec.RefereeAmount > 0 {
-				availableCredit += rec.RefereeAmount
-			}
-		}
-		for _, rec := range referrerRecords {
-			if rec.ReferrerCredited && rec.ReferrerAmount > 0 {
-				availableCredit += rec.ReferrerAmount
+		userOffers, err := s.offerStore.FindByUserID(ctx, entityID)
+		if err == nil {
+			for _, o := range userOffers {
+				if o.OfferAmount != nil && *o.OfferAmount > 0 {
+					availableCredit += *o.OfferAmount
+				}
 			}
 		}
 	}
