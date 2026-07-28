@@ -18,18 +18,18 @@ import (
 )
 
 type WalletHandler struct {
-	AuthStore     *auth.Store
-	EventBus      *eventbus.InMemoryBus
-	WalletStore   *payment.WalletStore
-	ZwitchService *payment.ZwitchService
+	AuthStore    *auth.Store
+	EventBus     *eventbus.InMemoryBus
+	WalletStore  *payment.WalletStore
+	PayuService  *payment.PayuService
 }
 
-func NewWalletHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, wStore *payment.WalletStore, zService *payment.ZwitchService) *WalletHandler {
+func NewWalletHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, wStore *payment.WalletStore, pService *payment.PayuService) *WalletHandler {
 	return &WalletHandler{
-		AuthStore:     authStore,
-		EventBus:      eventBus,
-		WalletStore:   wStore,
-		ZwitchService: zService,
+		AuthStore:    authStore,
+		EventBus:     eventBus,
+		WalletStore:  wStore,
+		PayuService: pService,
 	}
 }
 
@@ -77,9 +77,9 @@ func (h *WalletHandler) HandleUpdateWallet(w http.ResponseWriter, r *http.Reques
 	dbAcc := driver.WalletDetails
 	if dbAcc.AccountNo == "" {
 		// New beneficiary
-		benfID, err := h.ZwitchService.CreateBeneficiary(&req, uidStr)
+		benfID, err := h.PayuService.CreateBeneficiary(&req, uidStr)
 		if err != nil || benfID == "" {
-			response.Error(w, "Zwitch Beneficiary Account Creation error", http.StatusBadRequest)
+			response.Error(w, "PayU Beneficiary Account Creation error", http.StatusBadRequest)
 			return
 		}
 		req.BenfID = benfID
@@ -87,16 +87,16 @@ func (h *WalletHandler) HandleUpdateWallet(w http.ResponseWriter, r *http.Reques
 		// Update existing
 		if dbAcc.AccountNo == req.AccountNo {
 			req.BenfID = dbAcc.BenfID
-			h.ZwitchService.UpdateBeneficiaryName(&req)
+			h.PayuService.UpdateBeneficiaryName(&req)
 		} else {
 			// Account changed entirely, recreate
-			benfID, err := h.ZwitchService.CreateBeneficiary(&req, uidStr)
+			benfID, err := h.PayuService.CreateBeneficiary(&req, uidStr)
 			if err != nil || benfID == "" {
-				response.Error(w, "Zwitch Beneficiary Account Creation error", http.StatusBadRequest)
+				response.Error(w, "PayU Beneficiary Account Creation error", http.StatusBadRequest)
 				return
 			}
 			req.BenfID = benfID
-			h.ZwitchService.DeleteBeneficiary(dbAcc.BenfID)
+			h.PayuService.DeleteBeneficiary(dbAcc.BenfID)
 		}
 	}
 
@@ -149,16 +149,16 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Deduct balance atomically before calling Zwitch
+	// Deduct balance atomically before calling PayU
 	if err := h.WalletStore.DeductBalance(r.Context(), objID, req.Amount); err != nil {
 		response.Error(w, "Insufficient wallet balance", http.StatusBadRequest)
 		return
 	}
 
-	resp, err := h.ZwitchService.CreateTransfer(&driver.WalletDetails, amountToTransfer, merchantRefID)
+	resp, err := h.PayuService.CreateTransfer(&driver.WalletDetails, amountToTransfer, merchantRefID)
 	if err != nil || resp == nil {
 		log := logger.Ctx(r.Context())
-		log.Error().Err(err).Msg("Zwitch transfer failed, refunding wallet")
+		log.Error().Err(err).Msg("PayU transfer failed, refunding wallet")
 		if refundErr := h.WalletStore.UpdateWalletBalance(r.Context(), objID, req.Amount); refundErr != nil {
 			log.Error().Err(refundErr).Msg("Refund also failed — manual intervention required")
 		}
@@ -195,6 +195,73 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Withdrawal initiated, amount will be transferred shortly!!"})
+}
+
+type payuWebhookPayload struct {
+	Event               string `json:"event"`
+	Msg                 string `json:"msg"`
+	PayuRefID           string `json:"payuRefId"`
+	MerchantReferenceID string `json:"merchantReferenceId"`
+	BankReferenceID     string `json:"bankReferenceId"`
+	Authorization       string `json:"authorization"`
+	PayoutMerchantID    string `json:"payoutMerchantId"`
+}
+
+func (h *WalletHandler) HandlePayuWebhook(w http.ResponseWriter, r *http.Request) {
+	var payload payuWebhookPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		logger.Log.Error().Err(err).Msg("PayU webhook: failed to parse body")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if payload.MerchantReferenceID == "" {
+		logger.Log.Warn().Msg("PayU webhook: empty merchantReferenceId")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	updates := map[string]interface{}{}
+
+	switch payload.Event {
+	case "TRANSFER_SUCCESS":
+		updates["status"] = "success"
+		updates["bank_reference_no"] = payload.BankReferenceID
+		updates["zwitch_transfer_id"] = payload.PayuRefID
+		logger.Log.Info().Str("ref", payload.MerchantReferenceID).Str("payuRef", payload.PayuRefID).Msg("PayU transfer succeeded")
+
+	case "TRANSFER_FAILED":
+		updates["status"] = "failed"
+		updates["zwitch_transfer_id"] = payload.PayuRefID
+		if payload.Msg != "" {
+			updates["error_message"] = payload.Msg
+		}
+		logger.Log.Warn().Str("ref", payload.MerchantReferenceID).Str("msg", payload.Msg).Msg("PayU transfer failed")
+
+	case "TRANSFER_REVERSED":
+		updates["status"] = "reversed"
+		updates["bank_reference_no"] = payload.BankReferenceID
+		updates["zwitch_transfer_id"] = payload.PayuRefID
+		logger.Log.Warn().Str("ref", payload.MerchantReferenceID).Msg("PayU transfer reversed")
+
+	case "REQUEST_PROCESSING_FAILED":
+		updates["status"] = "failed"
+		if payload.Msg != "" {
+			updates["error_message"] = payload.Msg
+		}
+		logger.Log.Warn().Str("ref", payload.MerchantReferenceID).Str("msg", payload.Msg).Msg("PayU request processing failed")
+
+	default:
+		logger.Log.Debug().Str("event", payload.Event).Msg("PayU webhook: unhandled event")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if err := h.WalletStore.UpdateTransactionByRefID(r.Context(), payload.MerchantReferenceID, updates); err != nil {
+		logger.Log.Error().Err(err).Str("ref", payload.MerchantReferenceID).Msg("PayU webhook: failed to update transaction")
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *WalletHandler) HandleListTransactions(w http.ResponseWriter, r *http.Request) {

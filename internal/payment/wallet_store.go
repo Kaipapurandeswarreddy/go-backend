@@ -89,7 +89,19 @@ func (s *WalletStore) DeductBalance(ctx context.Context, driverID primitive.Obje
 	return nil
 }
 
-// UpdateWalletDetails saves the driver's Zwitch bank details.
+// UpdateTransactionByRefID updates a transaction identified by merchant_reference_id.
+func (s *WalletStore) UpdateTransactionByRefID(ctx context.Context, refID string, updates map[string]interface{}) error {
+	now := time.Now()
+	updates["updated_at"] = &now
+	_, err := s.transactions.UpdateOne(
+		ctx,
+		bson.M{"merchant_reference_id": refID},
+		bson.M{"$set": updates},
+	)
+	return err
+}
+
+// UpdateWalletDetails saves the driver's payout bank details.
 func (s *WalletStore) UpdateWalletDetails(ctx context.Context, driverID primitive.ObjectID, details interface{}) error {
 	filter := bson.M{"_id": driverID}
 	update := bson.M{"$set": bson.M{"wallet_details": details}}

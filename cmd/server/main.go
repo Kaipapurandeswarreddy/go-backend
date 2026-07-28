@@ -109,7 +109,7 @@ func main() {
 
 	rzpService := payment.NewRazorpayService(appConfig.RazorpayKeyID, appConfig.RazorpayKeySecret)
 	cloudshopeService := telephony.NewCloudshopeService(appConfig.CloudshopeToken, appConfig.CloudshopeNumber, appConfig.CloudshopeAPIBaseURL, appConfig.SMSCC)
-	zwitchService := payment.NewZwitchService(appConfig.ZwitchKey, appConfig.ZwitchSecret, appConfig.ZwitchAccountID, appConfig.ZwitchAPIBaseURL, appConfig.ZwitchProxyURL)
+	payuService := payment.NewPayuService(appConfig.PayuClientID, appConfig.PayuClientSecret, appConfig.PayuPayoutMerchantID, appConfig.PayuAuthBaseURL, appConfig.PayuAPIBaseURL)
 
 	// Initialize Handlers
 	rideHandler := handlers.NewRideHandler(dispatcher, eventBus, paymentStore, rzpService, authStore, adminStore, routeClient, walletStore, referralService)
@@ -127,7 +127,7 @@ func main() {
 	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg)
 	offerHandler := handlers.NewOfferHandler(offerStore, eventBus)
 	sharedHandler := handlers.NewSharedHandler(cloudshopeService, counterStore, adminStore, hospitalStore)
-	walletHandler := handlers.NewWalletHandler(authStore, eventBus, walletStore, zwitchService)
+	walletHandler := handlers.NewWalletHandler(authStore, eventBus, walletStore, payuService)
 	feedbackHandler := handlers.NewFeedbackHandler(feedbackStore)
 	referralHandler := handlers.NewReferralHandler(referralStore, referralService)
 
@@ -229,6 +229,7 @@ func main() {
 	mux.Handle("POST /api/v2/payment/user/process-cash", requireUser(http.HandlerFunc(paymentHandler.HandleProcessUserCashPayment)))
 	mux.Handle("POST /api/v2/payment/driver/process", requireDriver(http.HandlerFunc(paymentHandler.HandleProcessDriverPayment)))
 	mux.HandleFunc("POST /api/v2/payment/webhook/razorpay", paymentHandler.HandleRazorpayWebhook)
+	mux.HandleFunc("POST /api/v2/payment/webhook/payu", walletHandler.HandlePayuWebhook)
 
 	// Wallet Endpoints (Protected)
 	mux.Handle("POST /api/v2/driver/wallet/get", requireDriver(http.HandlerFunc(walletHandler.HandleGetWallet)))
@@ -330,7 +331,7 @@ func main() {
 	// Apply API key auth + global rate limiter to all routes except /metrics, /health, and /ws
 	protected := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if path == "/metrics" || path == "/api/v1/health" || path == "/ws" || path == "/api/v2/payment/webhook/razorpay" {
+		if path == "/metrics" || path == "/api/v1/health" || path == "/ws" || path == "/api/v2/payment/webhook/razorpay" || path == "/api/v2/payment/webhook/payu" {
 			mux.ServeHTTP(w, r)
 			return
 		}
