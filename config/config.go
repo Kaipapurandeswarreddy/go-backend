@@ -27,12 +27,12 @@ type AppConfig struct {
 	RazorpayKeySecret      string
 	RazorpayWebhookSecret string
 
-	// Zwitch (Bank Payouts)
-	ZwitchKey       string
-	ZwitchSecret    string
-	ZwitchAccountID string
-	ZwitchAPIBaseURL string
-	ZwitchProxyURL  string
+	// PayU Payouts (replaces Zwitch)
+	PayuClientID         string
+	PayuClientSecret     string
+	PayuPayoutMerchantID string
+	PayuAuthBaseURL      string
+	PayuAPIBaseURL       string
 
 	// Cloudshope (Call Masking)
 	CloudshopeToken      string
@@ -78,11 +78,11 @@ func LoadConfig() *AppConfig {
 		RazorpayKeySecret:      os.Getenv("RAZORPAY_KEY_SECRET"),
 		RazorpayWebhookSecret: os.Getenv("RAZORPAY_WEBHOOK_SECRET"),
 
-		ZwitchKey:         os.Getenv("ZWITCH_KEY"),
-		ZwitchSecret:      os.Getenv("ZWITCH_SECRET"),
-		ZwitchAccountID:   os.Getenv("ZWITCH_ACCOUNT_ID"),
-		ZwitchAPIBaseURL:  envOrDefault("ZWITCH_API_BASE_URL", "https://api.zwitch.io/v1"),
-		ZwitchProxyURL:    os.Getenv("ZWITCH_PROXY_URL"),
+		PayuClientID:         os.Getenv("PAYU_CLIENT_ID"),
+		PayuClientSecret:     os.Getenv("PAYU_CLIENT_SECRET"),
+		PayuPayoutMerchantID: os.Getenv("PAYU_PAYOUT_MERCHANT_ID"),
+		PayuAuthBaseURL:      envOrDefault("PAYU_AUTH_BASE_URL", "https://accounts.payu.in/oauth/token"),
+		PayuAPIBaseURL:       envOrDefault("PAYU_API_BASE_URL", "https://payout.payumoney.com/payout"),
 
 		CloudshopeToken:      os.Getenv("CLOUDSHOPE_TOKEN"),
 		CloudshopeNumber:     os.Getenv("CLOUDSHOPE_NUMBER"),
