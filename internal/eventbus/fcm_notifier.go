@@ -23,6 +23,11 @@ func NewFCMNotifier(fcmClient *notification.FCMClient, authStore *auth.Store) *F
 
 func (n *FCMNotifier) SubscribeTo(bus *InMemoryBus) {
 	bus.Subscribe(ChannelRideDriverOffered, n.handleRideOffered)
+	bus.Subscribe(ChannelRideAccepted, n.handleRideAccepted)
+	bus.Subscribe(ChannelRideArrived, n.handleRideArrived)
+	bus.Subscribe(ChannelRideStarted, n.handleRideStarted)
+	bus.Subscribe(ChannelRideCompleted, n.handleRideCompleted)
+	bus.Subscribe(ChannelRideCancelled, n.handleRideCancelled)
 	bus.Subscribe(ChannelAuthDriverApproved, n.handleDriverApproved)
 	bus.Subscribe(ChannelReferralCredited, n.handleReferralCredited)
 }
@@ -53,6 +58,7 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 	}
 
 	data := map[string]string{
+		"type":            "RIDE_OFFERED",
 		"ride_id":         p.RideID,
 		"distance":        fmt.Sprintf("%.1f", p.TripDistanceKm),
 		"distance_km":     fmt.Sprintf("%.2f", p.TripDistanceKm),
@@ -78,6 +84,203 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 
 	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
 		ll.Error().Err(err).Str("driver_id", p.DriverID).Msg("FCM push failed for driver")
+	}
+}
+
+// handleRideAccepted sends a push to the user when a driver accepts the ride.
+func (n *FCMNotifier) handleRideAccepted(payload []byte) {
+	var p RideAcceptedPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "ride:accepted").Msg("Unmarshal error")
+		return
+	}
+
+	if p.UserID == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	token, err := n.authStore.GetUserFCMToken(ctx, p.UserID)
+	if err != nil || token == nil || *token == "" {
+		return
+	}
+
+	data := map[string]string{
+		"type":      "RIDE_ACCEPTED",
+		"ride_id":   p.RideID,
+		"driver_id": p.DriverID,
+		"title":     "Driver found",
+		"body":      "Your driver is on the way to your pickup point.",
+	}
+
+	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+		logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("Ride accepted FCM push failed for user")
+	}
+}
+
+// handleRideArrived sends a push to the user when the driver reaches the pickup.
+func (n *FCMNotifier) handleRideArrived(payload []byte) {
+	var p RideStatusChangedPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "ride:arrived").Msg("Unmarshal error")
+		return
+	}
+
+	if p.UserID == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	token, err := n.authStore.GetUserFCMToken(ctx, p.UserID)
+	if err != nil || token == nil || *token == "" {
+		return
+	}
+
+	data := map[string]string{
+		"type":    "RIDE_ARRIVED",
+		"ride_id": p.RideID,
+		"title":   "Driver has arrived",
+		"body":    "Your driver has reached the pickup point.",
+	}
+
+	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+		logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("Ride arrived FCM push failed for user")
+	}
+}
+
+// handleRideStarted sends a push to the user when the ride begins.
+func (n *FCMNotifier) handleRideStarted(payload []byte) {
+	var p RideStatusChangedPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "ride:started").Msg("Unmarshal error")
+		return
+	}
+
+	if p.UserID == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	token, err := n.authStore.GetUserFCMToken(ctx, p.UserID)
+	if err != nil || token == nil || *token == "" {
+		return
+	}
+
+	data := map[string]string{
+		"type":    "RIDE_STARTED",
+		"ride_id": p.RideID,
+		"title":   "Ride started",
+		"body":    "Your ride has started. Have a safe ride!",
+	}
+
+	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+		logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("Ride started FCM push failed for user")
+	}
+}
+
+// handleRideCompleted sends a push to the user with the final fare.
+func (n *FCMNotifier) handleRideCompleted(payload []byte) {
+	var p RideCompletedPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "ride:completed").Msg("Unmarshal error")
+		return
+	}
+
+	if p.UserID == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	token, err := n.authStore.GetUserFCMToken(ctx, p.UserID)
+	if err != nil || token == nil || *token == "" {
+		return
+	}
+
+	data := map[string]string{
+		"type":         "RIDE_COMPLETED",
+		"ride_id":      p.RideID,
+		"amount":       fmt.Sprintf("%.2f", p.FinalAmount),
+		"payment_mode": p.PaymentMode,
+		"title":        "Ride completed",
+		"body":         fmt.Sprintf("Ride completed. Total fare ₹%.2f.", p.FinalAmount),
+	}
+
+	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+		logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("Ride completed FCM push failed for user")
+	}
+}
+
+// handleRideCancelled notifies the user or driver, depending on who cancelled.
+func (n *FCMNotifier) handleRideCancelled(payload []byte) {
+	var p RideCancelledPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "ride:cancelled").Msg("Unmarshal error")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	switch p.Reason {
+	case "driver_cancelled":
+		if p.UserID == "" {
+			return
+		}
+		token, err := n.authStore.GetUserFCMToken(ctx, p.UserID)
+		if err != nil || token == nil || *token == "" {
+			return
+		}
+		data := map[string]string{
+			"type":    "RIDE_CANCELLED",
+			"ride_id": p.RideID,
+			"title":   "Driver cancelled the ride",
+			"body":    "We are finding you another ride, please wait.",
+		}
+		if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+			logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("Ride cancelled FCM push failed for user")
+		}
+	case "user_cancelled":
+		if p.DriverID == "" {
+			return
+		}
+		token, err := n.authStore.GetDriverFCMToken(ctx, p.DriverID)
+		if err != nil || token == nil || *token == "" {
+			return
+		}
+		data := map[string]string{
+			"type":    "RIDE_CANCELLED",
+			"ride_id": p.RideID,
+			"title":   "Ride cancelled by user",
+			"body":    "The rider has cancelled the ride.",
+		}
+		if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+			logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Ride cancelled FCM push failed for driver")
+		}
+	case "no_drivers", "all_drivers_exhausted":
+		if p.UserID == "" {
+			return
+		}
+		token, err := n.authStore.GetUserFCMToken(ctx, p.UserID)
+		if err != nil || token == nil || *token == "" {
+			return
+		}
+		data := map[string]string{
+			"type":    "RIDE_CANCELLED",
+			"ride_id": p.RideID,
+			"title":   "No drivers found",
+			"body":    "No drivers available right now. Please try again in a few minutes.",
+		}
+		if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+			logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("No drivers FCM push failed for user")
+		}
 	}
 }
 
