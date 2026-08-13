@@ -150,7 +150,18 @@ func (s *Store) IsOTPLocked(ctx context.Context, mobile string) (bool, error) {
 
 // ---- Refresh Tokens (V5, V8, V18) ----
 
-func (s *Store) CreateRefreshToken(ctx context.Context, userID, role, deviceID, deviceName string) (string, *RefreshToken, error) {
+// NewSessionID generates a unique identifier for a single login session.
+// It is minted once at login and inherited by every refresh rotation so the
+// whole chain belongs to the same session.
+func NewSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return hex.EncodeToString([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+	}
+	return hex.EncodeToString(b)
+}
+
+func (s *Store) CreateRefreshToken(ctx context.Context, userID, role, sessionID, deviceID, deviceName string) (string, *RefreshToken, error) {
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return "", nil, err
@@ -165,6 +176,7 @@ func (s *Store) CreateRefreshToken(ctx context.Context, userID, role, deviceID, 
 		UserID:     userID,
 		Role:       role,
 		TokenHash:  tokenHash,
+		SessionID:  sessionID,
 		DeviceID:   deviceID,
 		DeviceName: deviceName,
 		CreatedAt:  now,
@@ -235,8 +247,9 @@ func (s *Store) RotateById(ctx context.Context, oldToken *RefreshToken, deviceID
 		return nil, "", ErrTokenAlreadyRevoked
 	}
 
-	// Create new token first
-	newTokenStr, newToken, err := s.CreateRefreshToken(ctx, oldToken.UserID, oldToken.Role, deviceID, deviceName)
+	// Create new token first — the session must be inherited from the old
+	// token so a refresh never mints a brand-new session.
+	newTokenStr, newToken, err := s.CreateRefreshToken(ctx, oldToken.UserID, oldToken.Role, oldToken.SessionID, deviceID, deviceName)
 	if err != nil {
 		return nil, "", err
 	}
@@ -336,6 +349,38 @@ func (s *Store) ListUserSessions(ctx context.Context, userID string) ([]RefreshT
 		tokens = []RefreshToken{}
 	}
 	return tokens, nil
+}
+
+// CurrentSessions returns the latest live session_id per (role, user) so the
+// WebSocket manager can re-arm its session gate after a backend restart.
+// Without this, a backend restart would let a stale-session device reconnect
+// and ride out its JWT's remaining life.
+func (s *Store) CurrentSessions(ctx context.Context) (map[string]string, error) {
+	cursor, err := s.refreshTokens.Find(
+		ctx,
+		bson.M{"revoked": false, "user_id": bson.M{"$ne": ""}},
+		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	result := make(map[string]string)
+	for cursor.Next(ctx) {
+		var rt RefreshToken
+		if err := cursor.Decode(&rt); err != nil {
+			continue
+		}
+		if rt.SessionID == "" {
+			continue
+		}
+		key := rt.Role + ":" + rt.UserID
+		if _, seen := result[key]; !seen {
+			result[key] = rt.SessionID
+		}
+	}
+	return result, cursor.Err()
 }
 
 func (s *Store) RevokeSessionByDeviceID(ctx context.Context, userID, deviceID, reason string) error {

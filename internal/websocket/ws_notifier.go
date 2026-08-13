@@ -27,14 +27,17 @@ func (n *WSNotifier) SubscribeTo(bus *eventbus.InMemoryBus) {
 	bus.Subscribe(eventbus.ChannelAuthSessionReplaced, n.handleSessionReplaced)
 }
 
-// handleSessionReplaced kicks every live connection of the replaced session,
-// so a new login on another device logs the old device out immediately.
+// handleSessionReplaced records the replacing session and kicks every live
+// connection of the replaced session, so a new login on another device logs
+// the old device out immediately. Recording first means any reconnect from
+// the old session is rejected at registration, not just at kick time.
 func (n *WSNotifier) handleSessionReplaced(payload []byte) {
 	var p eventbus.AuthSessionReplacedPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		logger.Log.Error().Err(err).Str("channel", "auth:session_replaced").Msg("Unmarshal error")
 		return
 	}
+	n.wsManager.SetCurrentSession(p.Role, p.UserID, p.SessionID)
 	n.wsManager.KickSessions(p.Role, p.UserID)
 }
 

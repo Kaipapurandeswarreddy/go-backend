@@ -65,11 +65,12 @@ func ServeWS(manager *websocket.Manager, cfg *config.AppConfig, w http.ResponseW
 
 	// 4. Create and Register Client
 	client := &websocket.Client{
-		Manager: manager,
-		Conn:    conn,
-		Send:    make(chan []byte, 256),
-		ID:      claims.ID,
-		Role:    claims.Role,
+		Manager:   manager,
+		Conn:      conn,
+		Send:      make(chan []byte, 256),
+		ID:        claims.ID,
+		Role:      claims.Role,
+		SessionID: r.URL.Query().Get("session_id"),
 	}
 
 	// Wait for the manager to register the client

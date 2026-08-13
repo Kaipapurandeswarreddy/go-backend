@@ -91,6 +91,15 @@ func main() {
 	referralService := referral.NewService(referralStore, authStore, offerStore, walletStore, eventBus)
 	wsManager := websocket.NewManager(locationStore, authStore, eventBus)
 	go wsManager.Run() // Start WebSocket Hub
+
+	// Re-arm the session gate from persistent state so a backend restart does
+	// not let stale-session connections slip back in for their JWT's lifetime.
+	if seed, err := authStore.CurrentSessions(context.Background()); err != nil {
+		log.Warn().Err(err).Msg("Failed to seed current sessions")
+	} else if len(seed) > 0 {
+		wsManager.SeedCurrentSessions(seed)
+		log.Info().Int("sessions", len(seed)).Msg("Seeded current sessions from database")
+	}
 	
 	routeClient := dispatch.NewRouteClient(appConfig.GoogleMapsAPIKey, appConfig.GoogleRoutesAPIURL)
 	fcmClient := notification.NewFCMClient(context.Background(), appConfig.FirebaseCredentialsPath)

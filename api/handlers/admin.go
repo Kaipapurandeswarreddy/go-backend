@@ -173,7 +173,7 @@ func (h *AdminHandler) HandleAdminMobileVerifyOTP(w http.ResponseWriter, r *http
 		return
 	}
 
-	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), adminUser.ID.Hex(), "admin", "", "")
+	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), adminUser.ID.Hex(), "admin", auth.NewSessionID(), "", "")
 	if err != nil {
 		logger.Log.Error().Err(err).Msg("Admin refresh token creation failed")
 	}

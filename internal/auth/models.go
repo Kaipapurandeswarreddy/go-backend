@@ -106,6 +106,7 @@ type RefreshToken struct {
 	UserID       string             `bson:"user_id" json:"user_id"`
 	Role         string             `bson:"role" json:"role"`
 	TokenHash    string             `bson:"token_hash" json:"-"`
+	SessionID    string             `bson:"session_id,omitempty" json:"session_id,omitempty"`
 	DeviceID     string             `bson:"device_id,omitempty" json:"device_id,omitempty"`
 	DeviceName   string             `bson:"device_name,omitempty" json:"device_name,omitempty"`
 	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`

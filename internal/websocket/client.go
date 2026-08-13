@@ -29,6 +29,11 @@ type Client struct {
 	ID string
 
 	Role string
+
+	// SessionID identifies the login session this connection belongs to.
+	// Set from the ?session_id= handshake query param. Empty for legacy
+	// clients that predate session identity.
+	SessionID string
 }
 
 // ReadPump pumps messages from the websocket connection to the hub.

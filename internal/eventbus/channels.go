@@ -162,6 +162,7 @@ type AuthDriverApprovedPayload struct {
 type AuthSessionReplacedPayload struct {
 	UserID    string `json:"user_id"`
 	Role      string `json:"role"`
+	SessionID string `json:"session_id,omitempty"`
 	Mobile    string `json:"mobile,omitempty"`
 	RequestID string `json:"request_id,omitempty"`
 }

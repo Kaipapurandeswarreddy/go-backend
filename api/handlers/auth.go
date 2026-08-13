@@ -198,7 +198,8 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), user.ID.Hex(), "user", payload.DeviceID, payload.DeviceName)
+	sessionID := auth.NewSessionID()
+	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), user.ID.Hex(), "user", sessionID, payload.DeviceID, payload.DeviceName)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
@@ -213,6 +214,7 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 	response.Success(w, http.StatusOK, map[string]string{
 		"access_token":  accessToken,
 		"refresh_token": refreshToken,
+		"session_id":    sessionID,
 	})
 }
 
@@ -365,7 +367,8 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), driverID.Hex(), role, payload.DeviceID, payload.DeviceName)
+	sessionID := auth.NewSessionID()
+	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), driverID.Hex(), role, sessionID, payload.DeviceID, payload.DeviceName)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
@@ -385,13 +388,14 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	// instantly so the old device is kicked without waiting for token expiry.
 	if revokedCount > 0 {
 		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
-			UserID: driverID.Hex(), Role: role, Mobile: payload.Mobile, RequestID: reqID,
+			UserID: driverID.Hex(), Role: role, SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
 		})
 	}
 
 	response.Success(w, http.StatusOK, map[string]string{
 		"access_token":  accessToken,
 		"refresh_token": refreshToken,
+		"session_id":    sessionID,
 	})
 }
 
@@ -430,6 +434,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 			response.Success(w, http.StatusOK, map[string]string{
 				"access_token":  newAccessToken,
 				"refresh_token": newTokenStr,
+				"session_id":    newRT.SessionID,
 			})
 			return
 		}
@@ -469,6 +474,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 				response.Success(w, http.StatusOK, map[string]string{
 					"access_token":  newAccessToken,
 					"refresh_token": newTokenStr,
+					"session_id":    newRT.SessionID,
 				})
 				return
 			}

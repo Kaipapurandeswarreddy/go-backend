@@ -3,13 +3,17 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
+	"time"
 
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/location"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/metrics"
+
+	"github.com/gorilla/websocket"
 )
 
 // DeclineHandler is implemented by the dispatcher to handle driver ride declines.
@@ -21,6 +25,13 @@ type DeclineHandler interface {
 type KickRequest struct {
 	Role string
 	ID   string
+}
+
+// SessionUpdate records the authoritative (latest) session for a (role, id).
+type SessionUpdate struct {
+	Role      string
+	ID        string
+	SessionID string
 }
 
 // Manager maintains the set of active clients and broadcasts messages to the
@@ -48,6 +59,13 @@ type Manager struct {
 	// Session replacement requests (e.g. new login kicked old sessions).
 	kick chan KickRequest
 
+	// Authoritative session updates published by logins (auth:session_replaced).
+	sessionUpdates chan SessionUpdate
+
+	// currentSessions maps "role:id" -> the session_id of the latest login.
+	// Used to proactively reject stale-session reconnects at registration.
+	currentSessions map[string]string
+
 	mu sync.RWMutex
 
 	// Location Store for updating driver GPS
@@ -69,9 +87,11 @@ func NewManager(locStore *location.MemoryStore, authStore *auth.Store, eventBus 
 		register:         make(chan *Client),
 		unregister:       make(chan *Client),
 		kick:             make(chan KickRequest),
+		sessionUpdates:   make(chan SessionUpdate),
 		clients:          make(map[string]map[string]map[*Client]bool),
 		rideWatchers:     make(map[string]map[*Client]bool),
 		activeDriverRide: make(map[string]string),
+		currentSessions:  make(map[string]string),
 		LocStore:         locStore,
 		AuthStore:        authStore,
 		EventBus:         eventBus,
@@ -81,11 +101,23 @@ func NewManager(locStore *location.MemoryStore, authStore *auth.Store, eventBus 
 func (m *Manager) Run() {
 	m.clients["driver"] = make(map[string]map[*Client]bool)
 	m.clients["user"] = make(map[string]map[*Client]bool)
+	m.clients["unvrf_driver"] = make(map[string]map[*Client]bool)
 
 	for {
 		select {
 		case client := <-m.register:
 			m.mu.Lock()
+			// Session gate: reject stale-session connections for single-session
+			// roles before they can be registered. Only applies when the client
+			// actually sent a session_id (legacy clients are not gated).
+			if (client.Role == "driver" || client.Role == "unvrf_driver") && client.SessionID != "" {
+				if cur, ok := m.currentSessions[client.Role+":"+client.ID]; ok && cur != "" && cur != client.SessionID {
+					m.mu.Unlock()
+					m.rejectClient(client)
+					logger.Log.Info().Str("role", client.Role).Str("id", client.ID).Msg("Rejected stale-session WebSocket registration")
+					continue
+				}
+			}
 			if m.clients[client.Role] == nil {
 				m.clients[client.Role] = make(map[string]map[*Client]bool)
 			}
@@ -114,6 +146,17 @@ func (m *Manager) Run() {
 			m.clients[target.Role][target.ID] = make(map[*Client]bool)
 			m.mu.Unlock()
 			logger.Log.Info().Str("role", target.Role).Str("id", target.ID).Msg("Sessions replaced: kicked live connections")
+
+		case su := <-m.sessionUpdates:
+			m.mu.Lock()
+			key := su.Role + ":" + su.ID
+			if su.SessionID == "" {
+				delete(m.currentSessions, key)
+			} else {
+				m.currentSessions[key] = su.SessionID
+			}
+			m.mu.Unlock()
+			logger.Log.Info().Str("role", su.Role).Str("id", su.ID).Msg("Current session recorded")
 
 		case client := <-m.unregister:
 			m.mu.Lock()
@@ -158,6 +201,40 @@ func (m *Manager) Run() {
 // RegisterClient adds a new client to the hub
 func (m *Manager) RegisterClient(client *Client) {
 	m.register <- client
+}
+
+// SetCurrentSession records the authoritative session for a (role, id).
+// Called from the auth:session_replaced subscriber BEFORE kicking so that any
+// reconnect attempt from the replaced session is rejected at registration.
+func (m *Manager) SetCurrentSession(role, id, sessionID string) {
+	if role == "" || id == "" {
+		return
+	}
+	m.sessionUpdates <- SessionUpdate{Role: role, ID: id, SessionID: sessionID}
+}
+
+// SeedCurrentSessions re-arms the session gate from persistent state after a
+// backend restart. Keys are "role:id", values are the latest live session_id.
+func (m *Manager) SeedCurrentSessions(sessions map[string]string) {
+	for key, sessionID := range sessions {
+		sep := strings.Index(key, ":")
+		if sep <= 0 || sep == len(key)-1 {
+			continue
+		}
+		m.sessionUpdates <- SessionUpdate{Role: key[:sep], ID: key[sep+1:], SessionID: sessionID}
+	}
+}
+
+// rejectClient terminates a connection that attempted to register with a
+// stale session. The SESSION_REPLACED frame is written directly on the conn
+// (bypassing the Send channel — the client is not registered) followed by a
+// close with a dedicated code so the app can distinguish rejection from a
+// network failure. Only called from the Run loop.
+func (m *Manager) rejectClient(client *Client) {
+	_ = client.Conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = client.Conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"SESSION_REPLACED"}`))
+	_ = client.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(4003, "session_replaced"))
+	_ = client.Conn.Close()
 }
 
 // KickSessions terminates all live connections for the given (role, id)
