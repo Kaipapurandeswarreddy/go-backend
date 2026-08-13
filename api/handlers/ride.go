@@ -726,6 +726,13 @@ func (h *RideHandler) HandleGetDriverDetails(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Resolve vehicle_type ObjectId to the actual type name
+	if driver.VehicleType != "" {
+		if ambType, err := h.AdminStore.GetAmbulanceTypeByID(r.Context(), driver.VehicleType); err == nil && ambType != nil {
+			driver.VehicleType = ambType.Name
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(driver)
 }

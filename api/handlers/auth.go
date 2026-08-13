@@ -354,7 +354,8 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Revoke all previous sessions so only this device stays logged in
-	if err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID.Hex()); err != nil {
+	revokedCount, err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID.Hex(), "session_replaced")
+	if err != nil {
 		logger.Log.Error().Err(err).Str("driver_id", driverID.Hex()).Msg("Failed to revoke old driver sessions")
 	}
 
@@ -379,6 +380,14 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	h.EventBus.PublishEvent(eventbus.ChannelAuthDriverLoggedIn, eventbus.AuthDriverLoggedInPayload{
 		DriverID: driverID.Hex(), Mobile: payload.Mobile, Role: role, RequestID: reqID,
 	})
+
+	// A prior session was replaced by this login — notify all live connections
+	// instantly so the old device is kicked without waiting for token expiry.
+	if revokedCount > 0 {
+		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
+			UserID: driverID.Hex(), Role: role, Mobile: payload.Mobile, RequestID: reqID,
+		})
+	}
 
 	response.Success(w, http.StatusOK, map[string]string{
 		"access_token":  accessToken,
@@ -472,6 +481,12 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// 401 with a machine-readable reason so clients can tell "logged in
+	// elsewhere" apart from a generic expired session.
+	if tokenDoc != nil && tokenDoc.Revoked && tokenDoc.RevokedReason == "session_replaced" {
+		response.ErrorWithReason(w, "You have been logged in on another device", "session_replaced", http.StatusUnauthorized)
+		return
+	}
 	response.Error(w, "Invalid or expired refresh token", http.StatusUnauthorized)
 }
 
@@ -481,7 +496,7 @@ func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	role, _ := r.Context().Value(middleware.UserRoleKey).(string)
 
 	// Revoke all refresh tokens for this user
-	if err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), userID); err != nil {
+	if _, err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), userID, "logout"); err != nil {
 		logger.Log.Error().Err(err).Str("user_id", userID).Msg("Failed to revoke all refresh tokens on logout")
 	}
 
@@ -497,6 +512,12 @@ func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 			_ = h.AuthStore.ClearUnverifiedDriverJWT(r.Context(), objID)
 		}
 	}
+
+	// Publish for audit trail (logout was previously invisible in audit_log)
+	reqID := requestid.FromContext(r.Context())
+	h.EventBus.PublishEvent(eventbus.ChannelAuthLoggedOut, eventbus.AuthLoggedOutPayload{
+		UserID: userID, Role: role, RequestID: reqID,
+	})
 
 	response.Success(w, http.StatusOK, map[string]string{"detail": "Logged out"})
 }
@@ -522,6 +543,6 @@ func (h *AuthHandler) HandleRevokeSession(w http.ResponseWriter, r *http.Request
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	_ = h.AuthStore.RevokeSessionByDeviceID(r.Context(), userID, payload.DeviceID)
+	_ = h.AuthStore.RevokeSessionByDeviceID(r.Context(), userID, payload.DeviceID, "manual_revoke")
 	response.Success(w, http.StatusOK, map[string]string{"detail": "Session revoked"})
 }

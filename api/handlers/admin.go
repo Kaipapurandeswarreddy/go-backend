@@ -501,7 +501,7 @@ func (h *AdminHandler) HandleAcceptDriver(w http.ResponseWriter, r *http.Request
 	}
 
 	// Revoke old refresh tokens so the driver must re-login with role "driver"
-	if revokeErr := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driver.ID.Hex()); revokeErr != nil {
+	if _, revokeErr := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driver.ID.Hex(), "driver_approved"); revokeErr != nil {
 		logger.Log.Error().Err(revokeErr).Str("driver_id", driver.ID.Hex()).Msg("Failed to revoke driver refresh tokens after approval")
 	}
 

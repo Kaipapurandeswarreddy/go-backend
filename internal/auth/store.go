@@ -242,10 +242,11 @@ func (s *Store) RotateById(ctx context.Context, oldToken *RefreshToken, deviceID
 	}
 
 	// Atomically revoke old token and link to new one
+	now := time.Now()
 	result, err := s.refreshTokens.UpdateOne(
 		ctx,
 		bson.M{"_id": oldToken.ID, "revoked": false},
-		bson.M{"$set": bson.M{"revoked": true, "superseded_by": newToken.ID}},
+		bson.M{"$set": bson.M{"revoked": true, "revoked_at": now, "revoked_reason": "rotated", "superseded_by": newToken.ID}},
 	)
 	if err != nil {
 		// Clean up orphaned new token
@@ -295,7 +296,7 @@ func (s *Store) FindLiveInChain(ctx context.Context, startingFrom *RefreshToken)
 	return nil, ErrNoLiveToken
 }
 
-func (s *Store) RevokeRefreshToken(ctx context.Context, tokenStr string) error {
+func (s *Store) RevokeRefreshToken(ctx context.Context, tokenStr, reason string) error {
 	raw, err := hex.DecodeString(tokenStr)
 	if err != nil {
 		return fmt.Errorf("invalid token format")
@@ -304,16 +305,21 @@ func (s *Store) RevokeRefreshToken(ctx context.Context, tokenStr string) error {
 	tokenHash := hex.EncodeToString(hash[:])
 
 	_, err = s.refreshTokens.UpdateOne(ctx, bson.M{"token_hash": tokenHash}, bson.M{
-		"$set": bson.M{"revoked": true},
+		"$set": bson.M{"revoked": true, "revoked_at": time.Now(), "revoked_reason": reason},
 	})
 	return err
 }
 
-func (s *Store) RevokeAllUserRefreshTokens(ctx context.Context, userID string) error {
-	_, err := s.refreshTokens.UpdateMany(ctx, bson.M{"user_id": userID, "revoked": false}, bson.M{
-		"$set": bson.M{"revoked": true},
+// RevokeAllUserRefreshTokens revokes every live refresh token for a user and
+// returns the number of tokens that were actually revoked.
+func (s *Store) RevokeAllUserRefreshTokens(ctx context.Context, userID, reason string) (int64, error) {
+	res, err := s.refreshTokens.UpdateMany(ctx, bson.M{"user_id": userID, "revoked": false}, bson.M{
+		"$set": bson.M{"revoked": true, "revoked_at": time.Now(), "revoked_reason": reason},
 	})
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.ModifiedCount, nil
 }
 
 func (s *Store) ListUserSessions(ctx context.Context, userID string) ([]RefreshToken, error) {
@@ -332,9 +338,9 @@ func (s *Store) ListUserSessions(ctx context.Context, userID string) ([]RefreshT
 	return tokens, nil
 }
 
-func (s *Store) RevokeSessionByDeviceID(ctx context.Context, userID, deviceID string) error {
+func (s *Store) RevokeSessionByDeviceID(ctx context.Context, userID, deviceID, reason string) error {
 	_, err := s.refreshTokens.UpdateMany(ctx, bson.M{"user_id": userID, "device_id": deviceID, "revoked": false}, bson.M{
-		"$set": bson.M{"revoked": true},
+		"$set": bson.M{"revoked": true, "revoked_at": time.Now(), "revoked_reason": reason},
 	})
 	return err
 }

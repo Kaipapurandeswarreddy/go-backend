@@ -15,6 +15,8 @@ const (
 	ChannelAuthDriverCreated    = "auth:driver_created"
 	ChannelAuthDriverLoggedIn   = "auth:driver_logged_in"
 	ChannelAuthDriverApproved   = "auth:driver_approved"
+	ChannelAuthSessionReplaced  = "auth:session_replaced"
+	ChannelAuthLoggedOut        = "auth:logged_out"
 	ChannelPaymentCompleted     = "payment:completed"
 	ChannelWalletWithdrawal     = "wallet:withdrawal"
 	ChannelDriverLocationUpdate = "driver:location_updated"
@@ -153,6 +155,22 @@ type AuthDriverApprovedPayload struct {
 	DriverID  string `json:"driver_id"`
 	Name      string `json:"name"`
 	Mobile    string `json:"mobile"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
+// AuthSessionReplacedPayload is published when a new login revokes an existing session
+type AuthSessionReplacedPayload struct {
+	UserID    string `json:"user_id"`
+	Role      string `json:"role"`
+	Mobile    string `json:"mobile,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
+// AuthLoggedOutPayload is published when a user or driver logs out
+type AuthLoggedOutPayload struct {
+	UserID    string `json:"user_id"`
+	Role      string `json:"role"`
+	Mobile    string `json:"mobile,omitempty"`
 	RequestID string `json:"request_id,omitempty"`
 }
 

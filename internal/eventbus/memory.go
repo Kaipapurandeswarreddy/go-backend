@@ -45,6 +45,15 @@ func (b *InMemoryBus) PublishEvent(channel string, v interface{}) error {
 	if err != nil {
 		return err
 	}
+	// Inject the channel name into the payload so subscribers (e.g. AuditLogger)
+	// can record which channel an event came from.
+	var obj map[string]interface{}
+	if err := json.Unmarshal(data, &obj); err == nil && obj != nil {
+		obj["_channel"] = channel
+		if data, err = json.Marshal(obj); err != nil {
+			return err
+		}
+	}
 	return b.Publish(channel, data)
 }
 

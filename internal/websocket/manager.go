@@ -17,6 +17,12 @@ type DeclineHandler interface {
 	HandleDriverDecline(ctx context.Context, rideID, driverID string)
 }
 
+// KickRequest asks the manager to terminate all live connections for a (role, id).
+type KickRequest struct {
+	Role string
+	ID   string
+}
+
 // Manager maintains the set of active clients and broadcasts messages to the
 // clients.
 type Manager struct {
@@ -39,6 +45,9 @@ type Manager struct {
 	// Unregister requests from clients.
 	unregister chan *Client
 
+	// Session replacement requests (e.g. new login kicked old sessions).
+	kick chan KickRequest
+
 	mu sync.RWMutex
 
 	// Location Store for updating driver GPS
@@ -59,6 +68,7 @@ func NewManager(locStore *location.MemoryStore, authStore *auth.Store, eventBus 
 		broadcast:        make(chan []byte),
 		register:         make(chan *Client),
 		unregister:       make(chan *Client),
+		kick:             make(chan KickRequest),
 		clients:          make(map[string]map[string]map[*Client]bool),
 		rideWatchers:     make(map[string]map[*Client]bool),
 		activeDriverRide: make(map[string]string),
@@ -81,24 +91,29 @@ func (m *Manager) Run() {
 			}
 			if m.clients[client.Role][client.ID] == nil {
 				m.clients[client.Role][client.ID] = make(map[*Client]bool)
-			} else {
-				// Kick existing connections for the same (role, id) — only the latest stays
-				for oldClient := range m.clients[client.Role][client.ID] {
-					select {
-					case oldClient.Send <- []byte(`{"type":"SESSION_REPLACED"}`):
-					default:
-					}
-					close(oldClient.Send)
-					oldClient.Conn.Close()
-					metrics.ActiveConnections.Dec()
-				}
-				// Replace with empty map — unregister won't find old clients, so no double-close
-				m.clients[client.Role][client.ID] = make(map[*Client]bool)
 			}
 			m.clients[client.Role][client.ID][client] = true
 			m.mu.Unlock()
 			metrics.ActiveConnections.Inc()
 			logger.Log.Info().Str("role", client.Role).Str("id", client.ID).Msg("WebSocket registered")
+
+		case target := <-m.kick:
+			// Terminate every live connection for (role, id). Used when a new
+			// login replaces the previous session. A client that merely
+			// reconnects is NOT kicked — only an authoritative login event is.
+			m.mu.Lock()
+			for oldClient := range m.clients[target.Role][target.ID] {
+				select {
+				case oldClient.Send <- []byte(`{"type":"SESSION_REPLACED"}`):
+				default:
+				}
+				close(oldClient.Send)
+				oldClient.Conn.Close()
+				metrics.ActiveConnections.Dec()
+			}
+			m.clients[target.Role][target.ID] = make(map[*Client]bool)
+			m.mu.Unlock()
+			logger.Log.Info().Str("role", target.Role).Str("id", target.ID).Msg("Sessions replaced: kicked live connections")
 
 		case client := <-m.unregister:
 			m.mu.Lock()
@@ -143,6 +158,15 @@ func (m *Manager) Run() {
 // RegisterClient adds a new client to the hub
 func (m *Manager) RegisterClient(client *Client) {
 	m.register <- client
+}
+
+// KickSessions terminates all live connections for the given (role, id)
+// with a SESSION_REPLACED message.
+func (m *Manager) KickSessions(role, id string) {
+	if role == "" || id == "" {
+		return
+	}
+	m.kick <- KickRequest{Role: role, ID: id}
 }
 
 // UnregisterClient removes a client from the hub

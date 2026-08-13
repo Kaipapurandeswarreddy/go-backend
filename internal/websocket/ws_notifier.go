@@ -24,6 +24,18 @@ func (n *WSNotifier) SubscribeTo(bus *eventbus.InMemoryBus) {
 	bus.Subscribe(eventbus.ChannelRideCompleted, n.handleRideCompleted)
 	bus.Subscribe(eventbus.ChannelRideCancelled, n.handleRideCancelled)
 	bus.Subscribe(eventbus.ChannelDriverLocationUpdate, n.handleDriverLocationUpdate)
+	bus.Subscribe(eventbus.ChannelAuthSessionReplaced, n.handleSessionReplaced)
+}
+
+// handleSessionReplaced kicks every live connection of the replaced session,
+// so a new login on another device logs the old device out immediately.
+func (n *WSNotifier) handleSessionReplaced(payload []byte) {
+	var p eventbus.AuthSessionReplacedPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "auth:session_replaced").Msg("Unmarshal error")
+		return
+	}
+	n.wsManager.KickSessions(p.Role, p.UserID)
 }
 
 func (n *WSNotifier) handleRideDriverOffered(payload []byte) {

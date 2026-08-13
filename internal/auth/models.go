@@ -102,15 +102,17 @@ type Referral struct {
 }
 
 type RefreshToken struct {
-	ID         primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	UserID     string             `bson:"user_id" json:"user_id"`
-	Role       string             `bson:"role" json:"role"`
-	TokenHash  string             `bson:"token_hash" json:"-"`
-	DeviceID   string             `bson:"device_id,omitempty" json:"device_id,omitempty"`
-	DeviceName string             `bson:"device_name,omitempty" json:"device_name,omitempty"`
-	CreatedAt  time.Time          `bson:"created_at" json:"created_at"`
-	ExpiresAt  time.Time          `bson:"expires_at" json:"expires_at"`
-	Revoked     bool               `bson:"revoked" json:"revoked"`
+	ID           primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
+	UserID       string             `bson:"user_id" json:"user_id"`
+	Role         string             `bson:"role" json:"role"`
+	TokenHash    string             `bson:"token_hash" json:"-"`
+	DeviceID     string             `bson:"device_id,omitempty" json:"device_id,omitempty"`
+	DeviceName   string             `bson:"device_name,omitempty" json:"device_name,omitempty"`
+	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`
+	ExpiresAt    time.Time          `bson:"expires_at" json:"expires_at"`
+	Revoked      bool               `bson:"revoked" json:"revoked"`
+	RevokedAt    *time.Time         `bson:"revoked_at,omitempty" json:"revoked_at,omitempty"`
+	RevokedReason string            `bson:"revoked_reason,omitempty" json:"revoked_reason,omitempty"`
 	SupersededBy primitive.ObjectID `bson:"superseded_by,omitempty" json:"superseded_by,omitempty"`
 }
 
