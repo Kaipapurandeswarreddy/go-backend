@@ -17,11 +17,13 @@ import (
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/dispatch"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/hospital"
 	"ambigo-backend/internal/location"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/notification"
 	"ambigo-backend/internal/offer"
 	"ambigo-backend/internal/payment"
+	"ambigo-backend/internal/places"
 	"ambigo-backend/internal/referral"
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/telephony"
@@ -82,6 +84,7 @@ func main() {
 	adminStore := admin.NewStore(dataDB, usersDB)
 	counterStore := admin.NewCounterStore(dataDB)
 	hospitalStore := admin.NewHospitalStore(dataDB)
+	hospitalCityStore := admin.NewHospitalCityStore(dataDB)
 	offerStore := offer.NewStore(recordsDB)
 	walletStore := payment.NewWalletStore(recordsDB, usersDB)
 	feedbackStore := ride.NewFeedbackStore(recordsDB)
@@ -103,6 +106,12 @@ func main() {
 	
 	routeClient := dispatch.NewRouteClient(appConfig.GoogleMapsAPIKey, appConfig.GoogleRoutesAPIURL)
 	fcmClient := notification.NewFCMClient(context.Background(), appConfig.FirebaseCredentialsPath)
+
+	// Hospital seeding: Google Places -> H3-bucketed hospitals, refreshed on a
+	// 30-day cadence. Falls back gracefully when no Google key is set.
+	placesClient := places.NewPlacesClient(appConfig.GoogleMapsAPIKey, appConfig.GooglePlacesAPIURL)
+	hospitalSeeder := hospital.NewSeeder(placesClient, hospitalStore, hospitalCityStore, counterStore)
+	hospitalSeeder.StartRefresh()
 
 	ambTypes, _ := adminStore.ListAmbulanceTypes(context.Background())
 	ambTypeNames := make(map[string]string, len(ambTypes))
@@ -133,9 +142,9 @@ func main() {
 	profileHandler := handlers.NewProfileHandler(authStore)
 	verificationHandler := handlers.NewVerificationHandler(authStore)
 	paymentHandler := handlers.NewPaymentHandler(paymentStore, eventBus, rzpService, walletStore, appConfig.RazorpayWebhookSecret)
-	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg)
+	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, hospitalCityStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg)
 	offerHandler := handlers.NewOfferHandler(offerStore, eventBus)
-	sharedHandler := handlers.NewSharedHandler(cloudshopeService, counterStore, adminStore, hospitalStore)
+	sharedHandler := handlers.NewSharedHandler(cloudshopeService, counterStore, adminStore, hospitalStore, hospitalSeeder)
 	walletHandler := handlers.NewWalletHandler(authStore, eventBus, walletStore, zwitchService)
 	feedbackHandler := handlers.NewFeedbackHandler(feedbackStore)
 	referralHandler := handlers.NewReferralHandler(referralStore, referralService)
@@ -329,6 +338,13 @@ func main() {
 	mux.Handle("POST /api/v2/admin/hospitals/add", requireAdmin(http.HandlerFunc(adminHandler.HandleAddHospital)))
 	mux.Handle("POST /api/v2/admin/hospitals/update", requireAdmin(http.HandlerFunc(adminHandler.HandleUpdateHospital)))
 	mux.Handle("POST /api/v2/admin/hospitals/delete", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteHospital)))
+	mux.Handle("POST /api/v2/admin/hospitals/sync", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitals)))
+	// Admin: Hospital service areas (cities)
+	mux.Handle("POST /api/v2/admin/hospital/cities/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListHospitalCities)))
+	mux.Handle("POST /api/v2/admin/hospital/cities/add", requireAdmin(http.HandlerFunc(adminHandler.HandleAddHospitalCity)))
+	mux.Handle("POST /api/v2/admin/hospital/cities/update", requireAdmin(http.HandlerFunc(adminHandler.HandleUpdateHospitalCity)))
+	mux.Handle("POST /api/v2/admin/hospital/cities/delete", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteHospitalCity)))
+	mux.Handle("POST /api/v2/admin/hospital/cities/sync", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitals)))
 	mux.Handle("POST /api/v2/admin/offers", requireAdmin(http.HandlerFunc(offerHandler.HandleCreate)))
 	mux.Handle("GET /api/v2/admin/offers", requireAdmin(http.HandlerFunc(offerHandler.HandleList)))
 	mux.Handle("DELETE /api/v2/admin/offers/{id}", requireAdmin(http.HandlerFunc(offerHandler.HandleDelete)))

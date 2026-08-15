@@ -125,6 +125,25 @@ func EnsureIndexes(client *mongo.Client) error {
 		return err
 	}
 
+	// Hospitals — unique place_id (Google dedup) + multikey h3_cells (H3 ring lookup)
+	dataDB := client.Database("Data")
+	if _, err := dataDB.Collection("hospitals").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{"place_id", 1}},
+		Options: options.Index().SetUnique(true).SetSparse(true),
+	}); err != nil {
+		return err
+	}
+	if _, err := dataDB.Collection("hospitals").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{"h3_cells", 1}},
+	}); err != nil {
+		return err
+	}
+	if _, err := dataDB.Collection("hospital_cities").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{"enabled", 1}},
+	}); err != nil {
+		return err
+	}
+
 	logger.Log.Info().Msg("MongoDB indexes ensured on all collections")
 	return nil
 }

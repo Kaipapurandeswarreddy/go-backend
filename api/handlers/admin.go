@@ -20,26 +20,28 @@ import (
 )
 
 type AdminHandler struct {
-	Store         *admin.Store
-	AuthStore     *auth.Store
-	EventBus      *eventbus.InMemoryBus
-	HospitalStore *admin.HospitalStore
-	CounterStore  *admin.CounterStore
-	RideStore     *ride.Store
-	JWTSecret     string
-	SMSCfg        auth.SMSCountryConfig
+	Store             *admin.Store
+	AuthStore         *auth.Store
+	EventBus          *eventbus.InMemoryBus
+	HospitalStore     *admin.HospitalStore
+	HospitalCityStore *admin.HospitalCityStore
+	CounterStore      *admin.CounterStore
+	RideStore         *ride.Store
+	JWTSecret         string
+	SMSCfg            auth.SMSCountryConfig
 }
 
-func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, cStore *admin.CounterStore, rStore *ride.Store, jwtSecret string, smsCfg auth.SMSCountryConfig) *AdminHandler {
+func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, hcStore *admin.HospitalCityStore, cStore *admin.CounterStore, rStore *ride.Store, jwtSecret string, smsCfg auth.SMSCountryConfig) *AdminHandler {
 	return &AdminHandler{
-		Store:         store,
-		AuthStore:     authStore,
-		EventBus:      eventBus,
-		HospitalStore: hStore,
-		CounterStore:  cStore,
-		RideStore:     rStore,
-		JWTSecret:     jwtSecret,
-		SMSCfg:        smsCfg,
+		Store:             store,
+		AuthStore:         authStore,
+		EventBus:          eventBus,
+		HospitalStore:     hStore,
+		HospitalCityStore: hcStore,
+		CounterStore:      cStore,
+		RideStore:         rStore,
+		JWTSecret:         jwtSecret,
+		SMSCfg:            smsCfg,
 	}
 }
 
@@ -769,21 +771,28 @@ func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request)
 	}
 
 	hospital := admin.Hospital{
-		Name:    translation.TranslateField(req.Name),
-		Address: translation.TranslateField(req.Address),
-		City:    translation.TranslateField(req.City),
+		Name:    translation.Map{"en_US": req.Name},
+		Address: translation.Map{"en_US": req.Address},
+		City:    translation.Map{"en_US": req.City},
 		Location: admin.GeoJSON{
 			Type:        "Point",
 			Coordinates: []float64{req.Coordinates.Lng, req.Coordinates.Lat},
 		},
 		AlwaysOpen: req.AlwaysOpen,
 		Services:   req.Services,
+		Source:     admin.HospitalSourceAdmin,
+		H3Cells:    admin.BuildH3Cells(req.Coordinates.Lng, req.Coordinates.Lat),
+	}
+	if req.Services == nil {
+		hospital.Services = []string{}
 	}
 	if req.Timing != nil {
 		hospital.Timing = &admin.Timing{
 			Start: req.Timing.Start,
 			End:   req.Timing.End,
 		}
+	} else {
+		hospital.Timing = &admin.Timing{Start: "12:00 AM", End: "11:59 PM"}
 	}
 
 	if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
@@ -821,21 +830,28 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 
 	hospital := admin.Hospital{
 		ID:      objID,
-		Name:    translation.TranslateField(req.Name),
-		Address: translation.TranslateField(req.Address),
-		City:    translation.TranslateField(req.City),
+		Name:    translation.Map{"en_US": req.Name},
+		Address: translation.Map{"en_US": req.Address},
+		City:    translation.Map{"en_US": req.City},
 		Location: admin.GeoJSON{
 			Type:        "Point",
 			Coordinates: []float64{req.Coordinates.Lng, req.Coordinates.Lat},
 		},
 		AlwaysOpen: req.AlwaysOpen,
 		Services:   req.Services,
+		Source:     admin.HospitalSourceAdmin,
+		H3Cells:    admin.BuildH3Cells(req.Coordinates.Lng, req.Coordinates.Lat),
+	}
+	if req.Services == nil {
+		hospital.Services = []string{}
 	}
 	if req.Timing != nil {
 		hospital.Timing = &admin.Timing{
 			Start: req.Timing.Start,
 			End:   req.Timing.End,
 		}
+	} else {
+		hospital.Timing = &admin.Timing{Start: "12:00 AM", End: "11:59 PM"}
 	}
 
 	if err := h.HospitalStore.UpdateHospital(r.Context(), &hospital); err != nil {
@@ -878,4 +894,111 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 		HospitalID: req.HospitalID, RequestID: reqID,
 	})
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital deleted successfully"})
+}
+
+// -------------------------
+// HOSPITAL SERVICE AREAS (cities)
+// -------------------------
+
+type HospitalCityRequest struct {
+	ID       string  `json:"_id"`
+	Name     string  `json:"name" validate:"required"`
+	Lat      float64 `json:"lat" validate:"required,min=-90,max=90"`
+	Lng      float64 `json:"lng" validate:"required,min=-180,max=180"`
+	RadiusKM float64 `json:"radius_km" validate:"required,min=1"`
+	Enabled  bool    `json:"enabled"`
+}
+
+func (h *AdminHandler) HandleListHospitalCities(w http.ResponseWriter, r *http.Request) {
+	list, err := h.HospitalCityStore.ListAll(r.Context())
+	if err != nil {
+		response.Error(w, "Failed to fetch list", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func (h *AdminHandler) HandleAddHospitalCity(w http.ResponseWriter, r *http.Request) {
+	var req HospitalCityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+
+	city := &admin.HospitalCity{
+		Name:     req.Name,
+		Lat:      req.Lat,
+		Lng:      req.Lng,
+		RadiusM:  int64(req.RadiusKM * 1000),
+		Enabled:  req.Enabled,
+	}
+	if err := h.HospitalCityStore.Create(r.Context(), city); err != nil {
+		response.Error(w, "City add failed", http.StatusBadRequest)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Service area added successfully", "_id": city.ID.Hex()})
+}
+
+func (h *AdminHandler) HandleUpdateHospitalCity(w http.ResponseWriter, r *http.Request) {
+	var req HospitalCityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if req.ID == "" {
+		response.Error(w, "ID is required", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+
+	objID, err := primitive.ObjectIDFromHex(req.ID)
+	if err != nil {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+
+	city := &admin.HospitalCity{
+		ID:      objID,
+		Name:    req.Name,
+		Lat:     req.Lat,
+		Lng:     req.Lng,
+		RadiusM: int64(req.RadiusKM * 1000),
+		Enabled: req.Enabled,
+	}
+	if err := h.HospitalCityStore.Update(r.Context(), city); err != nil {
+		response.Error(w, "City update failed", http.StatusBadRequest)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Service area updated successfully"})
+}
+
+func (h *AdminHandler) HandleDeleteHospitalCity(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"_id" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+
+	objID, err := primitive.ObjectIDFromHex(req.ID)
+	if err != nil {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.HospitalCityStore.Delete(r.Context(), objID); err != nil {
+		response.Error(w, "City delete failed", http.StatusBadRequest)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Service area deleted successfully"})
 }

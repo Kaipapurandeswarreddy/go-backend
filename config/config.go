@@ -41,6 +41,7 @@ type AppConfig struct {
 
 	// Google APIs
 	GoogleRoutesAPIURL     string
+	GooglePlacesAPIURL     string
 	GoogleTranslateAPIURL  string
 
 	FirebaseCredentialsPath string
@@ -89,6 +90,7 @@ func LoadConfig() *AppConfig {
 		CloudshopeAPIBaseURL: envOrDefault("CLOUDSHOPE_API_BASE_URL", "https://apiv2.cloudshope.com/api/outboundCall"),
 
 		GoogleRoutesAPIURL:    envOrDefault("GOOGLE_ROUTES_API_URL", "https://routes.googleapis.com/directions/v2:computeRoutes"),
+		GooglePlacesAPIURL:    envOrDefault("GOOGLE_PLACES_API_URL", "https://places.googleapis.com/v1/places:searchNearby"),
 		GoogleTranslateAPIURL: envOrDefault("GOOGLE_TRANSLATE_API_URL", "https://translate.googleapis.com/translate_a/single"),
 
 		FirebaseCredentialsPath: os.Getenv("FIREBASE_CREDENTIALS_PATH"),

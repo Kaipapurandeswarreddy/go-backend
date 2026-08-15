@@ -3,11 +3,15 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"sort"
 
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/admin"
+	"ambigo-backend/internal/hospital"
+	"ambigo-backend/internal/location"
 	"ambigo-backend/internal/telephony"
 )
 
@@ -16,14 +20,16 @@ type SharedHandler struct {
 	CounterStore  *admin.CounterStore
 	AdminStore    *admin.Store
 	HospitalStore *admin.HospitalStore
+	Seeder        *hospital.Seeder
 }
 
-func NewSharedHandler(cs *telephony.CloudshopeService, cStore *admin.CounterStore, aStore *admin.Store, hStore *admin.HospitalStore) *SharedHandler {
+func NewSharedHandler(cs *telephony.CloudshopeService, cStore *admin.CounterStore, aStore *admin.Store, hStore *admin.HospitalStore, seeder *hospital.Seeder) *SharedHandler {
 	return &SharedHandler{
 		Cloudshope:    cs,
 		CounterStore:  cStore,
 		AdminStore:    aStore,
 		HospitalStore: hStore,
+		Seeder:        seeder,
 	}
 }
 
@@ -89,14 +95,84 @@ func (h *SharedHandler) HandleCheckHospitalUpdates(w http.ResponseWriter, r *htt
 	json.NewEncoder(w).Encode(fmt.Sprintf("%d", count))
 }
 
-// HandleListHospitals returns the static hospital list
+// HandleListHospitals returns hospitals. When the request body includes
+// lat/lng, it returns hospitals within the H3 ring around that point sorted by
+// distance; otherwise it returns the full list (backward compatible with the
+// current app that sends an empty body).
 func (h *SharedHandler) HandleListHospitals(w http.ResponseWriter, r *http.Request) {
-	list, err := h.HospitalStore.ListHospitals(r.Context())
+	var req struct {
+		Lat      *float64 `json:"lat"`
+		Lng      *float64 `json:"lng"`
+		RadiusKm *float64 `json:"radius_km"`
+	}
+	// Body is optional; ignore decode errors so an empty body works.
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	var list []admin.Hospital
+	var err error
+
+	if req.Lat != nil && req.Lng != nil {
+		cell := location.GetH3CellAtResolution(*req.Lat, *req.Lng, admin.HospitalH3Resolution)
+		cells, cerr := location.GetNeighborCellsAtRing(cell, admin.HospitalH3Ring)
+		if cerr != nil {
+			response.Error(w, "Failed to resolve location", http.StatusBadRequest)
+			return
+		}
+		list, err = h.HospitalStore.FindByCells(r.Context(), cells)
+	} else {
+		list, err = h.HospitalStore.ListHospitals(r.Context())
+	}
 	if err != nil {
 		response.Error(w, "Failed to fetch list", http.StatusInternalServerError)
 		return
 	}
+
+	if req.Lat != nil && req.Lng != nil {
+		radiusKm := 30.0
+		if req.RadiusKm != nil {
+			radiusKm = *req.RadiusKm
+		}
+		nearby := make([]admin.Hospital, 0, len(list))
+		for _, ho := range list {
+			// Hospital.Location.Coordinates is [lng, lat].
+			if len(ho.Location.Coordinates) < 2 {
+				continue
+			}
+			d := haversineKm(*req.Lat, *req.Lng, ho.Location.Coordinates[1], ho.Location.Coordinates[0])
+			if d <= radiusKm {
+				ho.DistanceKm = d
+				nearby = append(nearby, ho)
+			}
+		}
+		sort.Slice(nearby, func(i, j int) bool { return nearby[i].DistanceKm < nearby[j].DistanceKm })
+		list = nearby
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(list)
 }
 
+func haversineKm(lat1, lng1, lat2, lng2 float64) float64 {
+	const R = 6371.0
+	dLat := (lat2 - lat1) * (math.Pi / 180.0)
+	dLng := (lng2 - lng1) * (math.Pi / 180.0)
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1*(math.Pi/180.0))*math.Cos(lat2*(math.Pi/180.0))*math.Sin(dLng/2)*math.Sin(dLng/2)
+	return R * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
+// HandleSyncHospitals forces a Google re-seed of all configured cities (admin
+// triggered). Returns the number of hospital documents changed.
+func (h *SharedHandler) HandleSyncHospitals(w http.ResponseWriter, r *http.Request) {
+	if h.Seeder == nil {
+		response.Error(w, "Hospital seeding not configured", http.StatusServiceUnavailable)
+		return
+	}
+	n, err := h.Seeder.SeedAll(r.Context())
+	if err != nil {
+		response.Error(w, "Hospital sync failed", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"detail": "Hospital sync completed", "changed": n})
+}
