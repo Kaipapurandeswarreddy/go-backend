@@ -742,11 +742,12 @@ func (h *AdminHandler) HandleUpdateAmbulanceType(w http.ResponseWriter, r *http.
 // -------------------------
 
 type HospitalRequest struct {
-	ID          string `json:"_id"`
-	Name        string `json:"name" validate:"required"`
-	Address     string `json:"address" validate:"required"`
-	City        string `json:"city" validate:"required"`
-	Coordinates struct {
+	ID           string `json:"_id"`
+	Name         string `json:"name" validate:"required"`
+	Address      string `json:"address" validate:"required"`
+	City         string `json:"city" validate:"required"`
+	HospitalType string `json:"hospital_type"`
+	Coordinates  struct {
 		Lat float64 `json:"lat" validate:"required,min=-90,max=90"`
 		Lng float64 `json:"lng" validate:"required,min=-180,max=180"`
 	} `json:"coordinates" validate:"required"`
@@ -770,6 +771,11 @@ func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	hType := req.HospitalType
+	if hType == "" {
+		hType = admin.ClassifyHospitalType(req.Name, nil)
+	}
+
 	hospital := admin.Hospital{
 		Name:    translation.Map{"en_US": req.Name},
 		Address: translation.Map{"en_US": req.Address},
@@ -778,10 +784,13 @@ func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request)
 			Type:        "Point",
 			Coordinates: []float64{req.Coordinates.Lng, req.Coordinates.Lat},
 		},
-		AlwaysOpen: req.AlwaysOpen,
-		Services:   req.Services,
-		Source:     admin.HospitalSourceAdmin,
-		H3Cells:    admin.BuildH3Cells(req.Coordinates.Lng, req.Coordinates.Lat),
+		AlwaysOpen:   req.AlwaysOpen,
+		Services:     req.Services,
+		Source:       admin.HospitalSourceAdmin,
+		H3Cells:      admin.BuildH3Cells(req.Coordinates.Lng, req.Coordinates.Lat),
+		HospitalType: hType,
+		Category:     admin.HospitalCategoryFromType(hType),
+		TypeLocked:   true,
 	}
 	if req.Services == nil {
 		hospital.Services = []string{}
@@ -828,6 +837,11 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	hType := req.HospitalType
+	if hType == "" {
+		hType = admin.ClassifyHospitalType(req.Name, nil)
+	}
+
 	hospital := admin.Hospital{
 		ID:      objID,
 		Name:    translation.Map{"en_US": req.Name},
@@ -837,10 +851,13 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 			Type:        "Point",
 			Coordinates: []float64{req.Coordinates.Lng, req.Coordinates.Lat},
 		},
-		AlwaysOpen: req.AlwaysOpen,
-		Services:   req.Services,
-		Source:     admin.HospitalSourceAdmin,
-		H3Cells:    admin.BuildH3Cells(req.Coordinates.Lng, req.Coordinates.Lat),
+		AlwaysOpen:   req.AlwaysOpen,
+		Services:     req.Services,
+		Source:       admin.HospitalSourceAdmin,
+		H3Cells:      admin.BuildH3Cells(req.Coordinates.Lng, req.Coordinates.Lat),
+		HospitalType: hType,
+		Category:     admin.HospitalCategoryFromType(hType),
+		TypeLocked:   true,
 	}
 	if req.Services == nil {
 		hospital.Services = []string{}

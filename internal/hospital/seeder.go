@@ -69,32 +69,72 @@ func (s *Seeder) seedCity(ctx context.Context, city admin.HospitalCity) (int, er
 	}
 	changed := 0
 	for _, p := range places {
-		h, err := s.Hospitals.FindByPlaceID(ctx, p.ID)
+		existing, err := s.Hospitals.FindByPlaceID(ctx, p.ID)
 		if err != nil {
 			return changed, err
 		}
-		if h != nil {
-			// Keep the existing document; only refresh metadata if stale source.
+
+		hType := admin.ClassifyHospitalType(p.DisplayName, p.Types)
+		hCat := admin.HospitalCategoryFromType(hType)
+
+		if existing != nil {
+			// Keep admin overrides; fill missing data; refresh metadata. The
+			// classification is recomputed unless an admin locked it manually.
+			if existing.TypeLocked {
+				hType = existing.HospitalType
+				hCat = existing.Category
+			}
+			if existing.Name == nil {
+				existing.Name = translation.Map{"en_US": p.DisplayName}
+			}
+			if existing.Address == nil {
+				existing.Address = translation.Map{"en_US": p.FormattedAddr}
+			}
+			if len(existing.Location.Coordinates) == 0 {
+				existing.Location = admin.GeoJSON{Type: "Point", Coordinates: []float64{p.Lng, p.Lat}}
+			}
+			if len(existing.H3Cells) == 0 {
+				existing.H3Cells = admin.BuildH3Cells(p.Lng, p.Lat)
+			}
+			if existing.Services == nil {
+				existing.Services = []string{}
+			}
+			existing.GoogleTypes = p.Types
+			existing.HospitalType = hType
+			existing.Category = hCat
+			existing.FetchedAt = time.Now()
+
+			c, err := s.Hospitals.UpsertByPlaceID(ctx, existing)
+			if err != nil {
+				return changed, err
+			}
+			if c {
+				changed++
+			}
 			continue
 		}
+
 		doc := &admin.Hospital{
-			Name:       translation.Map{"en_US": p.DisplayName},
-			Address:    translation.Map{"en_US": p.FormattedAddr},
-			City:       translation.Map{"en_US": city.Name},
-			Location:   admin.GeoJSON{Type: "Point", Coordinates: []float64{p.Lng, p.Lat}},
-			Timing:     &admin.Timing{Start: "12:00 AM", End: "11:59 PM"},
-			AlwaysOpen: true,
-			Services:   []string{},
-			PlaceID:    p.ID,
-			Source:     admin.HospitalSourceGoogle,
-			FetchedAt:  time.Now(),
-			H3Cells:    admin.BuildH3Cells(p.Lng, p.Lat),
+			Name:         translation.Map{"en_US": p.DisplayName},
+			Address:      translation.Map{"en_US": p.FormattedAddr},
+			City:         translation.Map{"en_US": city.Name},
+			Location:     admin.GeoJSON{Type: "Point", Coordinates: []float64{p.Lng, p.Lat}},
+			Timing:       &admin.Timing{Start: "12:00 AM", End: "11:59 PM"},
+			AlwaysOpen:   true,
+			Services:     []string{},
+			PlaceID:      p.ID,
+			Source:       admin.HospitalSourceGoogle,
+			FetchedAt:    time.Now(),
+			H3Cells:      admin.BuildH3Cells(p.Lng, p.Lat),
+			GoogleTypes:  p.Types,
+			HospitalType: hType,
+			Category:     hCat,
 		}
-		newDoc, err := s.Hospitals.UpsertByPlaceID(ctx, doc)
+		c, err := s.Hospitals.UpsertByPlaceID(ctx, doc)
 		if err != nil {
 			return changed, err
 		}
-		if newDoc {
+		if c {
 			changed++
 		}
 	}

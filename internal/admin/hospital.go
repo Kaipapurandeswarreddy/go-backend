@@ -31,6 +31,26 @@ const (
 	HospitalSourceGoogle = "google"
 )
 
+// Hospital types used for the Emergency / Non-Emergency split.
+const (
+	HospitalTypeGovernment      = "government"
+	HospitalTypeMultiSpeciality = "multi_speciality"
+	HospitalTypePrivate         = "private"
+	HospitalTypeClinic          = "clinic"
+	HospitalTypeGeneral         = "general"
+)
+
+// Hospital categories exposed to the app.
+const (
+	HospitalCategoryEmergency    = "emergency"
+	HospitalCategoryNonEmergency = "non_emergency"
+)
+
+// IsEmergencyCategory reports whether a category should appear in Emergency.
+func IsEmergencyCategory(category string) bool {
+	return category == HospitalCategoryEmergency
+}
+
 // HospitalResolution / ring used to bucket hospitals into H3 cells for fast
 // ring lookups (~25-30km coverage with ring-2 at resolution 5).
 const (
@@ -49,11 +69,15 @@ type Hospital struct {
 	Timing     *Timing            `bson:"timing,omitempty" json:"timing,omitempty"`
 	AlwaysOpen bool               `bson:"always_open" json:"always_open"`
 	Services   []string           `bson:"services" json:"services"`
-	PlaceID    string             `bson:"place_id,omitempty" json:"place_id,omitempty"`
-	H3Cells    []string           `bson:"h3_cells,omitempty" json:"h3_cells,omitempty"`
-	Source     string             `bson:"source,omitempty" json:"source,omitempty"`
-	FetchedAt  time.Time          `bson:"fetched_at,omitempty" json:"fetched_at,omitempty"`
-	DistanceKm float64            `bson:"-" json:"distance_km,omitempty"`
+	PlaceID      string             `bson:"place_id,omitempty" json:"place_id,omitempty"`
+	H3Cells      []string           `bson:"h3_cells,omitempty" json:"h3_cells,omitempty"`
+	Source       string             `bson:"source,omitempty" json:"source,omitempty"`
+	FetchedAt    time.Time          `bson:"fetched_at,omitempty" json:"fetched_at,omitempty"`
+	DistanceKm   float64            `bson:"-" json:"distance_km,omitempty"`
+	HospitalType string             `bson:"hospital_type,omitempty" json:"hospital_type,omitempty"`
+	Category     string             `bson:"category,omitempty" json:"category,omitempty"`
+	GoogleTypes  []string           `bson:"google_types,omitempty" json:"google_types,omitempty"`
+	TypeLocked   bool               `bson:"type_locked,omitempty" json:"type_locked,omitempty"`
 }
 
 // BuildH3Cells computes the H3 cell(s) covering the hospital's location.
@@ -132,9 +156,9 @@ func (s *HospitalStore) FindByPlaceID(ctx context.Context, placeID string) (*Hos
 	return &h, nil
 }
 
-// UpsertByPlaceID inserts or replaces a Google-sourced hospital keyed by place_id.
-// Returns true when the document was newly inserted.
-func (s *HospitalStore) UpsertByPlaceID(ctx context.Context, h *Hospital) (new bool, err error) {
+// UpsertByPlaceID inserts or replaces a Google-sourced hospital keyed by
+// place_id. Returns true when the document was inserted or modified.
+func (s *HospitalStore) UpsertByPlaceID(ctx context.Context, h *Hospital) (changed bool, err error) {
 	if len(h.H3Cells) == 0 {
 		h.H3Cells = BuildH3Cells(h.Location.Coordinates[0], h.Location.Coordinates[1])
 	}
@@ -145,7 +169,7 @@ func (s *HospitalStore) UpsertByPlaceID(ctx context.Context, h *Hospital) (new b
 	if err != nil {
 		return false, err
 	}
-	return res.UpsertedCount > 0, nil
+	return res.UpsertedCount > 0 || res.ModifiedCount > 0, nil
 }
 
 func (s *HospitalStore) UpdateHospital(ctx context.Context, h *Hospital) error {
