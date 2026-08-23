@@ -19,14 +19,16 @@ import (
 type HospitalDashboardHandler struct {
 	RideStore     *ride.Store
 	HospitalStore *admin.HospitalStore
+	AdminStore    *admin.Store
 	AuthStore     *auth.Store
 	WSManager     *websocket.Manager
 }
 
-func NewHospitalDashboardHandler(rideStore *ride.Store, hospitalStore *admin.HospitalStore, authStore *auth.Store, wsManager *websocket.Manager) *HospitalDashboardHandler {
+func NewHospitalDashboardHandler(rideStore *ride.Store, hospitalStore *admin.HospitalStore, adminStore *admin.Store, authStore *auth.Store, wsManager *websocket.Manager) *HospitalDashboardHandler {
 	return &HospitalDashboardHandler{
 		RideStore:     rideStore,
 		HospitalStore: hospitalStore,
+		AdminStore:    adminStore,
 		AuthStore:     authStore,
 		WSManager:     wsManager,
 	}
@@ -160,6 +162,51 @@ func (h *HospitalDashboardHandler) HandleHospitalProfile(w http.ResponseWriter, 
 	json.NewEncoder(w).Encode(hospital)
 }
 
+func (h *HospitalDashboardHandler) HandleUpdateHospitalProfile(w http.ResponseWriter, r *http.Request) {
+	hid, ok := hospitalIDFromContext(r)
+	if !ok {
+		response.Error(w, "Hospital not linked", http.StatusBadRequest)
+		return
+	}
+	objID, err := primitive.ObjectIDFromHex(hid)
+	if err != nil {
+		response.Error(w, "Invalid hospital ID", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Timing     *admin.Timing `json:"timing"`
+		AlwaysOpen *bool         `json:"always_open"`
+		Services   []string      `json:"services"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	hospital, err := h.HospitalStore.FindByID(r.Context(), objID)
+	if err != nil || hospital == nil {
+		response.Error(w, "Hospital not found", http.StatusNotFound)
+		return
+	}
+	if req.Timing != nil {
+		hospital.Timing = req.Timing
+	}
+	if req.AlwaysOpen != nil {
+		hospital.AlwaysOpen = *req.AlwaysOpen
+	}
+	if req.Services != nil {
+		hospital.Services = req.Services
+	}
+	if hospital.Services == nil {
+		hospital.Services = []string{}
+	}
+	if err := h.HospitalStore.UpdateHospital(r.Context(), hospital); err != nil {
+		response.Error(w, "Failed to update", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital updated"})
+}
+
 func (h *HospitalDashboardHandler) HandleHospitalAnalytics(w http.ResponseWriter, r *http.Request) {
 	hid, ok := hospitalIDFromContext(r)
 	if !ok {
@@ -180,6 +227,13 @@ func (h *HospitalDashboardHandler) HandleHospitalAnalytics(w http.ResponseWriter
 		response.Error(w, "Failed to fetch analytics", http.StatusInternalServerError)
 		return
 	}
+	// Resolve ambulance type IDs to names
+	nameByID := map[string]string{}
+	if ambTypes, err := h.AdminStore.ListAmbulanceTypes(r.Context()); err == nil {
+		for _, t := range ambTypes {
+			nameByID[t.ID.Hex()] = t.Name
+		}
+	}
 	byCondition := map[string]int64{"stable": 0, "serious": 0, "critical": 0, "worsening": 0}
 	byAmbulanceType := map[string]int64{}
 	byDate := map[string]int64{}
@@ -187,11 +241,17 @@ func (h *HospitalDashboardHandler) HandleHospitalAnalytics(w http.ResponseWriter
 		if ride.LatestCondition != nil {
 			byCondition[ride.LatestCondition.Level]++
 		}
-		key := "unknown"
-		if ride.AmbTypeID != nil {
-			key = *ride.AmbTypeID
+		rawKey := "Unknown"
+		if ride.AmbTypeID != nil && *ride.AmbTypeID != "" {
+			rawKey = *ride.AmbTypeID
 		}
-		byAmbulanceType[key]++
+		displayKey := rawKey
+		if n, ok := nameByID[rawKey]; ok && n != "" {
+			displayKey = n
+		} else if rawKey == "Unknown" {
+			displayKey = "Unknown"
+		}
+		byAmbulanceType[displayKey]++
 		dateKey := ride.Time.CreatedAt.Format("2006-01-02")
 		byDate[dateKey]++
 	}
