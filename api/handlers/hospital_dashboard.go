@@ -83,6 +83,30 @@ func (h *HospitalDashboardHandler) HandleHospitalIncomingRides(w http.ResponseWr
 	json.NewEncoder(w).Encode(rides)
 }
 
+func (h *HospitalDashboardHandler) HandleHospitalHistory(w http.ResponseWriter, r *http.Request) {
+	hid, ok := hospitalIDFromContext(r)
+	if !ok {
+		response.Error(w, "Hospital not linked", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Limit int64 `json:"limit"`
+		Skip  int64 `json:"skip"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Limit <= 0 || req.Limit > 100 {
+		req.Limit = 20
+	}
+	statuses := []ride.RideStatus{ride.StatusCompleted, ride.StatusCancelled}
+	rides, err := h.RideStore.ListRidesByHospital(r.Context(), hid, statuses, req.Limit, req.Skip)
+	if err != nil {
+		response.Error(w, "Failed to fetch", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rides)
+}
+
 func (h *HospitalDashboardHandler) HandleHospitalRideDetail(w http.ResponseWriter, r *http.Request) {
 	hid, ok := hospitalIDFromContext(r)
 	if !ok {
@@ -134,6 +158,50 @@ func (h *HospitalDashboardHandler) HandleHospitalProfile(w http.ResponseWriter, 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(hospital)
+}
+
+func (h *HospitalDashboardHandler) HandleHospitalAnalytics(w http.ResponseWriter, r *http.Request) {
+	hid, ok := hospitalIDFromContext(r)
+	if !ok {
+		response.Error(w, "Hospital not linked", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Range string `json:"range"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	days := 7
+	if req.Range == "30d" {
+		days = 30
+	}
+	since := time.Now().AddDate(0, 0, -days)
+	rides, err := h.RideStore.ListRidesByHospitalSince(r.Context(), hid, since)
+	if err != nil {
+		response.Error(w, "Failed to fetch analytics", http.StatusInternalServerError)
+		return
+	}
+	byCondition := map[string]int64{"stable": 0, "serious": 0, "critical": 0, "worsening": 0}
+	byAmbulanceType := map[string]int64{}
+	byDate := map[string]int64{}
+	for _, ride := range rides {
+		if ride.LatestCondition != nil {
+			byCondition[ride.LatestCondition.Level]++
+		}
+		key := "unknown"
+		if ride.AmbTypeID != nil {
+			key = *ride.AmbTypeID
+		}
+		byAmbulanceType[key]++
+		dateKey := ride.Time.CreatedAt.Format("2006-01-02")
+		byDate[dateKey]++
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"byCondition":     byCondition,
+		"byAmbulanceType": byAmbulanceType,
+		"byDate":          byDate,
+		"total":           len(rides),
+	})
 }
 
 // HandleUpdateRideCondition is called by the user/attendant during an ongoing ride

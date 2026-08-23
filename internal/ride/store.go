@@ -335,3 +335,20 @@ func (s *Store) CountRidesByHospital(ctx context.Context, hospitalID string, sta
 	}
 	return s.collection.CountDocuments(ctx, filter)
 }
+
+func (s *Store) ListRidesByHospitalSince(ctx context.Context, hospitalID string, since time.Time) ([]*Ride, error) {
+	filter := bson.M{"hospital_id": hospitalID, "time.created_at": bson.M{"$gte": since}}
+	cursor, err := s.collection.Find(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	var rides []*Ride
+	if err = cursor.All(ctx, &rides); err != nil {
+		return nil, err
+	}
+	if rides == nil {
+		rides = []*Ride{}
+	}
+	return rides, nil
+}
