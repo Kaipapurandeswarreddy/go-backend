@@ -97,6 +97,7 @@ func EnsureIndexes(client *mongo.Client) error {
 		{Keys: bson.D{{"user_id", 1}, {"time.created_at", -1}}},
 		{Keys: bson.D{{"driver_id", 1}, {"time.created_at", -1}}},
 		{Keys: bson.D{{"status", 1}, {"time.created_at", -1}}},
+		{Keys: bson.D{{"hospital_id", 1}}},
 	}); err != nil {
 		return err
 	}
@@ -140,6 +141,25 @@ func EnsureIndexes(client *mongo.Client) error {
 	}
 	if _, err := dataDB.Collection("hospital_cities").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{"enabled", 1}},
+	}); err != nil {
+		return err
+	}
+	if _, err := dataDB.Collection("pending_hospitals").Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{"status", 1}}},
+		{Keys: bson.D{{"md_number", 1}}},
+	}); err != nil {
+		return err
+	}
+	if _, err := users.Collection("hospital_mds").Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{"mobile", 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{"username", 1}}, Options: options.Index().SetUnique(true).SetSparse(true)},
+		{Keys: bson.D{{"hospital_id", 1}}},
+	}); err != nil {
+		return err
+	}
+	if _, err := users.Collection("hospital_receptionists").Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{"username", 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{"hospital_id", 1}}},
 	}); err != nil {
 		return err
 	}

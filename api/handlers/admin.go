@@ -20,28 +20,30 @@ import (
 )
 
 type AdminHandler struct {
-	Store             *admin.Store
-	AuthStore         *auth.Store
-	EventBus          *eventbus.InMemoryBus
-	HospitalStore     *admin.HospitalStore
-	HospitalCityStore *admin.HospitalCityStore
-	CounterStore      *admin.CounterStore
-	RideStore         *ride.Store
-	JWTSecret         string
-	SMSCfg            auth.SMSCountryConfig
+	Store                *admin.Store
+	AuthStore            *auth.Store
+	EventBus             *eventbus.InMemoryBus
+	HospitalStore        *admin.HospitalStore
+	HospitalCityStore    *admin.HospitalCityStore
+	PendingHospitalStore *admin.PendingHospitalStore
+	CounterStore         *admin.CounterStore
+	RideStore            *ride.Store
+	JWTSecret            string
+	SMSCfg               auth.SMSCountryConfig
 }
 
-func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, hcStore *admin.HospitalCityStore, cStore *admin.CounterStore, rStore *ride.Store, jwtSecret string, smsCfg auth.SMSCountryConfig) *AdminHandler {
+func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, hcStore *admin.HospitalCityStore, pStore *admin.PendingHospitalStore, cStore *admin.CounterStore, rStore *ride.Store, jwtSecret string, smsCfg auth.SMSCountryConfig) *AdminHandler {
 	return &AdminHandler{
-		Store:             store,
-		AuthStore:         authStore,
-		EventBus:          eventBus,
-		HospitalStore:     hStore,
-		HospitalCityStore: hcStore,
-		CounterStore:      cStore,
-		RideStore:         rStore,
-		JWTSecret:         jwtSecret,
-		SMSCfg:            smsCfg,
+		Store:                store,
+		AuthStore:            authStore,
+		EventBus:             eventBus,
+		HospitalStore:        hStore,
+		HospitalCityStore:    hcStore,
+		PendingHospitalStore: pStore,
+		CounterStore:         cStore,
+		RideStore:            rStore,
+		JWTSecret:            jwtSecret,
+		SMSCfg:               smsCfg,
 	}
 }
 
@@ -1018,4 +1020,162 @@ func (h *AdminHandler) HandleDeleteHospitalCity(w http.ResponseWriter, r *http.R
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Service area deleted successfully"})
+}
+
+// -------------------------
+// PENDING HOSPITALS (MD signup queue)
+// -------------------------
+
+func (h *AdminHandler) HandleListPendingHospitals(w http.ResponseWriter, r *http.Request) {
+	list, err := h.PendingHospitalStore.ListPending(r.Context())
+	if err != nil {
+		response.Error(w, "Failed to fetch pending list", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func (h *AdminHandler) HandleFetchPendingHospital(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	objID, err := primitive.ObjectIDFromHex(req.ID)
+	if err != nil {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	p, err := h.PendingHospitalStore.FindByID(r.Context(), objID)
+	if err != nil || p == nil {
+		response.Error(w, "Pending hospital not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p)
+}
+
+func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	objID, err := primitive.ObjectIDFromHex(req.ID)
+	if err != nil {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	pending, err := h.PendingHospitalStore.FindByID(r.Context(), objID)
+	if err != nil || pending == nil {
+		response.Error(w, "Pending hospital not found", http.StatusNotFound)
+		return
+	}
+	if pending.Status != "pending" {
+		response.Error(w, "Already processed", http.StatusBadRequest)
+		return
+	}
+	// Create active hospital from pending details
+	hType := admin.ClassifyHospitalType(pending.Name, nil)
+	hospital := admin.Hospital{
+		Name:         translation.Map{"en_US": pending.Name},
+		Address:      translation.Map{"en_US": pending.Address},
+		City:         translation.Map{"en_US": pending.City},
+		Location:     admin.GeoJSON{Type: "Point", Coordinates: []float64{0, 0}},
+		Timing:       &admin.Timing{Start: "12:00 AM", End: "11:59 PM"},
+		AlwaysOpen:   true,
+		Services:     []string{},
+		Source:       admin.HospitalSourceAdmin,
+		HospitalType: hType,
+		Category:     admin.HospitalCategoryFromType(hType),
+		TypeLocked:   true,
+	}
+	if pending.Location != nil && len(pending.Location.Coordinates) == 2 {
+		hospital.Location = *pending.Location
+		hospital.H3Cells = admin.BuildH3Cells(pending.Location.Coordinates[0], pending.Location.Coordinates[1])
+	}
+	if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
+		response.Error(w, "Failed to create hospital", http.StatusInternalServerError)
+		return
+	}
+	// Update pending status
+	reviewerID, _ := r.Context().Value(middleware.UserIDKey).(string)
+	_ = h.PendingHospitalStore.Approve(r.Context(), objID, reviewerID)
+
+	// Link MD to hospital and activate
+	if pending.MDID != "" {
+		if mdID, err := primitive.ObjectIDFromHex(pending.MDID); err == nil {
+			md, _ := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
+			if md != nil {
+				md.HospitalID = &hospital.ID
+				md.Status = "active"
+				_ = h.AuthStore.UpdateHospitalMD(r.Context(), md)
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital approved", "hospital_id": hospital.ID.Hex()})
+}
+
+func (h *AdminHandler) HandleRejectPendingHospital(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID           string `json:"id" validate:"required"`
+		ErrorMessage string `json:"error_message" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	objID, err := primitive.ObjectIDFromHex(req.ID)
+	if err != nil {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	pending, err := h.PendingHospitalStore.FindByID(r.Context(), objID)
+	if err != nil || pending == nil {
+		response.Error(w, "Pending hospital not found", http.StatusNotFound)
+		return
+	}
+	reviewerID, _ := r.Context().Value(middleware.UserIDKey).(string)
+	if err := h.PendingHospitalStore.Reject(r.Context(), objID, reviewerID, req.ErrorMessage); err != nil {
+		response.Error(w, "Reject failed", http.StatusInternalServerError)
+		return
+	}
+	// Also mark MD as rejected
+	if pending.MDID != "" {
+		if mdID, err := primitive.ObjectIDFromHex(pending.MDID); err == nil {
+			md, _ := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
+			if md != nil {
+				md.Status = "rejected"
+				_ = h.AuthStore.UpdateHospitalMD(r.Context(), md)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital rejected"})
+}
+
+func (h *AdminHandler) HandlePendingHospitalCounter(w http.ResponseWriter, r *http.Request) {
+	count, err := h.PendingHospitalStore.CountPending(r.Context())
+	if err != nil {
+		response.Error(w, "Failed to fetch counter", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int64{"count": count})
 }

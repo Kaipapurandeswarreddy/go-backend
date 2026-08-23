@@ -292,3 +292,46 @@ func (s *Store) GetCurrentRide(ctx context.Context, entityID string, role string
 	}
 	return &ride, nil
 }
+
+func (s *Store) AppendConditionUpdate(ctx context.Context, rideID string, upd ConditionUpdate) error {
+	objID, err := primitive.ObjectIDFromHex(rideID)
+	if err != nil {
+		return err
+	}
+	return retry.Do(ctx, retry.Default, func(ctx context.Context) error {
+		_, err := s.collection.UpdateOne(ctx, bson.M{"_id": objID}, bson.M{
+			"$push": bson.M{"condition_updates": upd},
+			"$set":  bson.M{"latest_condition": upd},
+		})
+		return err
+	})
+}
+
+func (s *Store) ListRidesByHospital(ctx context.Context, hospitalID string, statuses []RideStatus, limit, skip int64) ([]*Ride, error) {
+	filter := bson.M{"hospital_id": hospitalID}
+	if len(statuses) > 0 {
+		filter["status"] = bson.M{"$in": statuses}
+	}
+	opts := options.Find().SetSort(bson.M{"time.created_at": -1}).SetSkip(skip).SetLimit(limit)
+	cursor, err := s.collection.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	var rides []*Ride
+	if err = cursor.All(ctx, &rides); err != nil {
+		return nil, err
+	}
+	if rides == nil {
+		rides = []*Ride{}
+	}
+	return rides, nil
+}
+
+func (s *Store) CountRidesByHospital(ctx context.Context, hospitalID string, statuses []RideStatus) (int64, error) {
+	filter := bson.M{"hospital_id": hospitalID}
+	if len(statuses) > 0 {
+		filter["status"] = bson.M{"$in": statuses}
+	}
+	return s.collection.CountDocuments(ctx, filter)
+}

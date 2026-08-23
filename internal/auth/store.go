@@ -30,24 +30,28 @@ const (
 )
 
 type Store struct {
-	authOTP           *mongo.Collection
-	users             *mongo.Collection
-	drivers           *mongo.Collection
-	referrals         *mongo.Collection
-	unverifiedDrivers *mongo.Collection
-	refreshTokens     *mongo.Collection
-	otpAttempts       *mongo.Collection
+	authOTP               *mongo.Collection
+	users                 *mongo.Collection
+	drivers               *mongo.Collection
+	referrals             *mongo.Collection
+	unverifiedDrivers     *mongo.Collection
+	refreshTokens         *mongo.Collection
+	otpAttempts           *mongo.Collection
+	hospitalMDs           *mongo.Collection
+	hospitalReceptionists *mongo.Collection
 }
 
 func NewStore(usersDB, recordsDB *mongo.Database) *Store {
 	return &Store{
-		authOTP:           usersDB.Collection("auth_otp"),
-		users:             usersDB.Collection("users"),
-		drivers:           usersDB.Collection("drivers"),
-		referrals:         recordsDB.Collection("referrals"),
-		unverifiedDrivers: usersDB.Collection("unverified_drivers"),
-		refreshTokens:     recordsDB.Collection("refresh_tokens"),
-		otpAttempts:       usersDB.Collection("otp_attempts"),
+		authOTP:               usersDB.Collection("auth_otp"),
+		users:                 usersDB.Collection("users"),
+		drivers:               usersDB.Collection("drivers"),
+		referrals:             recordsDB.Collection("referrals"),
+		unverifiedDrivers:     usersDB.Collection("unverified_drivers"),
+		refreshTokens:         recordsDB.Collection("refresh_tokens"),
+		otpAttempts:           usersDB.Collection("otp_attempts"),
+		hospitalMDs:           usersDB.Collection("hospital_mds"),
+		hospitalReceptionists: usersDB.Collection("hospital_receptionists"),
 	}
 }
 
@@ -796,4 +800,137 @@ func (s *Store) GetUserFCMToken(ctx context.Context, userID string) (*string, er
 		return nil, err
 	}
 	return user.FCMToken, nil
+}
+
+// ---- Hospital MD (Phase 1) ----
+
+func (s *Store) CreateHospitalMD(ctx context.Context, md *HospitalMD) error {
+	md.ID = primitive.NewObjectID()
+	md.CreatedAt = time.Now()
+	if md.Status == "" {
+		md.Status = "pending"
+	}
+	_, err := s.hospitalMDs.InsertOne(ctx, md)
+	return err
+}
+
+func (s *Store) FindHospitalMDByMobile(ctx context.Context, mobile string) (*HospitalMD, error) {
+	var md HospitalMD
+	err := s.hospitalMDs.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&md)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &md, nil
+}
+
+func (s *Store) FindHospitalMDByUsername(ctx context.Context, username string) (*HospitalMD, error) {
+	var md HospitalMD
+	err := s.hospitalMDs.FindOne(ctx, bson.M{"username": username}).Decode(&md)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &md, nil
+}
+
+func (s *Store) FindHospitalMDByID(ctx context.Context, id primitive.ObjectID) (*HospitalMD, error) {
+	var md HospitalMD
+	err := s.hospitalMDs.FindOne(ctx, bson.M{"_id": id}).Decode(&md)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &md, nil
+}
+
+func (s *Store) UpdateHospitalMD(ctx context.Context, md *HospitalMD) error {
+	_, err := s.hospitalMDs.ReplaceOne(ctx, bson.M{"_id": md.ID}, md)
+	return err
+}
+
+func (s *Store) UpdateHospitalMDJWT(ctx context.Context, id primitive.ObjectID, token string) error {
+	_, err := s.hospitalMDs.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"jwt_token": token}})
+	return err
+}
+
+func (s *Store) ClearHospitalMDJWT(ctx context.Context, id primitive.ObjectID) error {
+	_, err := s.hospitalMDs.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+	return err
+}
+
+func (s *Store) SetHospitalMDHospitalID(ctx context.Context, mdID primitive.ObjectID, hospitalID primitive.ObjectID) error {
+	_, err := s.hospitalMDs.UpdateOne(ctx, bson.M{"_id": mdID}, bson.M{"$set": bson.M{"hospital_id": hospitalID, "status": "active"}})
+	return err
+}
+
+// ---- Hospital Receptionist (Phase 2) ----
+
+func (s *Store) CreateHospitalReceptionist(ctx context.Context, r *HospitalReceptionist) error {
+	r.ID = primitive.NewObjectID()
+	r.CreatedAt = time.Now()
+	r.Active = true
+	_, err := s.hospitalReceptionists.InsertOne(ctx, r)
+	return err
+}
+
+func (s *Store) FindHospitalReceptionistByUsername(ctx context.Context, username string) (*HospitalReceptionist, error) {
+	var r HospitalReceptionist
+	err := s.hospitalReceptionists.FindOne(ctx, bson.M{"username": username}).Decode(&r)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Store) FindHospitalReceptionistByID(ctx context.Context, id primitive.ObjectID) (*HospitalReceptionist, error) {
+	var r HospitalReceptionist
+	err := s.hospitalReceptionists.FindOne(ctx, bson.M{"_id": id}).Decode(&r)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Store) ListReceptionistsByHospital(ctx context.Context, hospitalID primitive.ObjectID) ([]HospitalReceptionist, error) {
+	cursor, err := s.hospitalReceptionists.Find(ctx, bson.M{"hospital_id": hospitalID})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	var list []HospitalReceptionist
+	if err = cursor.All(ctx, &list); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []HospitalReceptionist{}
+	}
+	return list, nil
+}
+
+func (s *Store) DeleteHospitalReceptionist(ctx context.Context, id primitive.ObjectID) error {
+	_, err := s.hospitalReceptionists.DeleteOne(ctx, bson.M{"_id": id})
+	return err
+}
+
+func (s *Store) UpdateHospitalReceptionistJWT(ctx context.Context, id primitive.ObjectID, token string) error {
+	_, err := s.hospitalReceptionists.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"jwt_token": token}})
+	return err
+}
+
+func (s *Store) ClearHospitalReceptionistJWT(ctx context.Context, id primitive.ObjectID) error {
+	_, err := s.hospitalReceptionists.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+	return err
 }

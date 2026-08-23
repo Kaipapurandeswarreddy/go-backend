@@ -11,9 +11,10 @@ import (
 const accessTokenExpiry = 15 * time.Minute
 
 type Claims struct {
-	ID        string `json:"_id"`
-	Role      string `json:"role"`
-	AdminRole string `json:"admin_role,omitempty"`
+	ID         string `json:"_id"`
+	Role       string `json:"role"`
+	AdminRole  string `json:"admin_role,omitempty"`
+	HospitalID string `json:"hospital_id,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -56,6 +57,34 @@ func GenerateJWT(id string, role string, adminRole string, secret string) (strin
 		ID:        id,
 		Role:      role,
 		AdminRole: adminRole,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(secret))
+}
+
+func GenerateHospitalAccessToken(id, role, hospitalID, secret string) (string, error) {
+	claims := Claims{
+		ID:         id,
+		Role:       role,
+		HospitalID: hospitalID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(accessTokenExpiry)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(secret))
+}
+
+func GenerateHospitalJWT(id, role, hospitalID, secret string) (string, error) {
+	claims := Claims{
+		ID:         id,
+		Role:       role,
+		HospitalID: hospitalID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

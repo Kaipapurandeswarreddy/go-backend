@@ -1,0 +1,1838 @@
+{
+  "info": {
+    "_postman_id": "ambigo-v2-collection",
+    "name": "Ambigo V2 Backend API",
+    "description": "Complete API collection for the Ambigo V2 Go backend.\n\n## Authentication\n- **API Key**: All requests (except /metrics, /health, /ws, /webhook) require `X-API-Key` header\n- **JWT Bearer**: Protected endpoints require `Authorization: Bearer <access_token>`\n- **Roles**: `user`, `driver`, `unvrf_driver`, `admin`\n\n## Base URL\n`{{base_url}}` defaults to `http://localhost:8080`\n\n## Rate Limits\n- OTP Request: 3 requests per 5 seconds (IP-based)\n- OTP Verify: 3 requests per 5 seconds (mobile-based)\n- Admin Login: 5 requests per 10 seconds (IP-based)\n- Global: 100 requests per 200 seconds (IP-based)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      {
+        "key": "key",
+        "value": "X-API-Key",
+        "type": "string"
+      },
+      {
+        "key": "value",
+        "value": "{{api_key}}",
+        "type": "string"
+      },
+      {
+        "key": "in",
+        "value": "header",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health & Metrics",
+      "description": "Infrastructure endpoints for health checks and Prometheus metrics. These do NOT require API key or JWT.",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/health",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "health"]
+            },
+            "description": "Returns the health status of the backend including MongoDB connectivity and Google API configuration.\n\n**Auth**: None\n**Rate Limit**: None"
+          },
+          "response": [
+            {
+              "name": "Healthy",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"status\": \"ok\",\n  \"version\": \"v2\",\n  \"checks\": {\n    \"mongodb\": \"ok\",\n    \"googleap\": \"ok\"\n  }\n}"
+            },
+            {
+              "name": "Degraded",
+              "status": "Service Unavailable",
+              "code": 503,
+              "body": "{\n  \"status\": \"degraded\",\n  \"version\": \"v2\",\n  \"checks\": {\n    \"mongodb\": \"unreachable\",\n    \"googleap\": \"ok\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Prometheus Metrics",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/metrics",
+              "host": ["{{base_url}}"],
+              "path": ["metrics"]
+            },
+            "description": "Prometheus-compatible metrics endpoint for scraping.\n\n**Auth**: None\n**Rate Limit**: None"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth — User",
+      "description": "User authentication via OTP (SMS). New users are auto-registered on first verify.",
+      "auth": {
+        "type": "apikey",
+        "apikey": [
+          { "key": "key", "value": "X-API-Key", "type": "string" },
+          { "key": "value", "value": "{{api_key}}", "type": "string" },
+          { "key": "in", "value": "header", "type": "string" }
+        ]
+      },
+      "item": [
+        {
+          "name": "Request OTP (User)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  pm.test('OTP sent successfully', function() {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.detail).to.eql('OTP sent');",
+                  "  });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{api_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobile\": \"{{test_mobile}}\",\n  \"app_signature\": \"ABC123\",\n  \"device_id\": \"{{device_id}}\",\n  \"device_name\": \"{{device_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/auth/user/request-otp",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "auth", "user", "request-otp"]
+            },
+            "description": "Sends an OTP to the user's mobile number via SMS.\n\n**Auth**: API Key only (no JWT)\n**Rate Limit**: 3 per 5s (IP-based)\n**Validation**: Mobile must match `^[6-9]\\d{9}$` (Indian 10-digit)\n\n**Request Fields**:\n- `mobile` (required): 10-digit Indian mobile number\n- `app_signature` (optional): Android app signature for auto-read\n- `device_id` (optional): Device identifier\n- `device_name` (optional): Device name"
+          },
+          "response": [
+            {
+              "name": "Success",
+              "code": 200,
+              "body": "{\n  \"detail\": \"OTP sent\",\n  \"name\": \"John Doe\"\n}"
+            },
+            {
+              "name": "Invalid Mobile",
+              "code": 400,
+              "body": "{\n  \"error\": \"Bad Request\",\n  \"detail\": \"Invalid mobile number\",\n  \"code\": 400\n}"
+            },
+            {
+              "name": "Rate Limited",
+              "code": 429,
+              "body": "{\n  \"error\": \"Too Many Requests\",\n  \"detail\": \"Too many attempts. Try again later.\",\n  \"code\": 429\n}"
+            }
+          ]
+        },
+        {
+          "name": "Verify OTP (User)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  var jsonData = pm.response.json();",
+                  "  pm.environment.set('access_token', jsonData.access_token);",
+                  "  pm.environment.set('refresh_token', jsonData.refresh_token);",
+                  "  pm.test('Tokens received', function() {",
+                  "    pm.expect(jsonData.access_token).to.be.a('string');",
+                  "    pm.expect(jsonData.refresh_token).to.be.a('string');",
+                  "  });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{api_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobile\": \"{{test_mobile}}\",\n  \"otp\": \"123456\",\n  \"name\": \"Test User\",\n  \"referral_code\": \"\",\n  \"device_id\": \"{{device_id}}\",\n  \"device_name\": \"{{device_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/auth/user/verify-otp",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "auth", "user", "verify-otp"]
+            },
+            "description": "Verifies the OTP and returns JWT access + refresh tokens. Creates user if new.\n\n**Auth**: API Key only\n**Rate Limit**: 3 per 5s (mobile-based)\n\n**Request Fields**:\n- `mobile` (required): 10-digit Indian mobile\n- `otp` (required): 6-digit OTP\n- `name` (required for new users): User's display name\n- `referral_code` (optional): Referral code from another user/driver\n- `device_id` (optional): Device identifier\n- `device_name` (optional): Device name"
+          },
+          "response": [
+            {
+              "name": "Success",
+              "code": 200,
+              "body": "{\n  \"access_token\": \"eyJhbGciOiJIUzI1NiIs...\",\n  \"refresh_token\": \"a1b2c3d4e5f6...\"\n}"
+            },
+            {
+              "name": "Invalid OTP",
+              "code": 401,
+              "body": "{\n  \"error\": \"Unauthorized\",\n  \"detail\": \"Invalid OTP\",\n  \"code\": 401\n}"
+            },
+            {
+              "name": "Name Required",
+              "code": 400,
+              "body": "{\n  \"error\": \"Bad Request\",\n  \"detail\": \"Name is required for new users\",\n  \"code\": 400\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Auth — Driver",
+      "description": "Driver authentication via OTP (SMS). New drivers are auto-registered as unverified.",
+      "item": [
+        {
+          "name": "Request OTP (Driver)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{api_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobile\": \"9876543211\",\n  \"app_signature\": \"\",\n  \"device_id\": \"{{device_id}}\",\n  \"device_name\": \"{{device_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/auth/driver/request-otp",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "auth", "driver", "request-otp"]
+            },
+            "description": "Sends an OTP to the driver's mobile number.\n\n**Auth**: API Key only\n**Rate Limit**: 3 per 5s (IP-based)"
+          }
+        },
+        {
+          "name": "Verify OTP (Driver)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  var jsonData = pm.response.json();",
+                  "  pm.environment.set('access_token', jsonData.access_token);",
+                  "  pm.environment.set('refresh_token', jsonData.refresh_token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{api_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobile\": \"9876543211\",\n  \"otp\": \"123456\",\n  \"name\": \"Test Driver\",\n  \"referral_code\": \"\",\n  \"device_id\": \"{{device_id}}\",\n  \"device_name\": \"{{device_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/auth/driver/verify-otp",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "auth", "driver", "verify-otp"]
+            },
+            "description": "Verifies OTP and returns tokens. Returns role `driver` or `unvrf_driver` depending on verification status.\n\n**Auth**: API Key only\n**Rate Limit**: 3 per 5s (mobile-based)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth — Common",
+      "description": "Token refresh, logout, and session management.",
+      "item": [
+        {
+          "name": "Refresh Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  var jsonData = pm.response.json();",
+                  "  pm.environment.set('access_token', jsonData.access_token);",
+                  "  pm.environment.set('refresh_token', jsonData.refresh_token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{api_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\",\n  \"device_id\": \"{{device_id}}\",\n  \"device_name\": \"{{device_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/auth/refresh",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "auth", "refresh"]
+            },
+            "description": "Rotates the refresh token and issues new access + refresh tokens.\n\nSupports stale refresh chain recovery when `ALLOW_STALE_REFRESH_CHAIN=true`.\n\n**Auth**: API Key only (no JWT required)\n**Rate Limit**: Global"
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/auth/logout",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "auth", "logout"]
+            },
+            "description": "Revokes all refresh tokens and clears stored JWT for the authenticated user/driver.\n\n**Auth**: JWT (any role)\n**Rate Limit**: Global"
+          }
+        },
+        {
+          "name": "List Sessions",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/auth/sessions",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "auth", "sessions"]
+            },
+            "description": "Lists all active sessions (refresh tokens) for the authenticated user.\n\n**Auth**: JWT (any role)"
+          },
+          "response": [
+            {
+              "name": "Success",
+              "code": 200,
+              "body": "{\n  \"sessions\": [\n    {\n      \"device_id\": \"test-device-001\",\n      \"device_name\": \"Postman Test Device\",\n      \"created_at\": \"2026-07-20T05:00:00Z\",\n      \"expires_at\": \"2026-08-19T05:00:00Z\"\n    }\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Revoke Session",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"device_id\": \"{{device_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/auth/sessions/revoke",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "auth", "sessions", "revoke"]
+            },
+            "description": "Revokes a specific session by device ID.\n\n**Auth**: JWT (any role)\n**Required Fields**: `device_id`"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Profile",
+      "description": "User and driver profile retrieval and FCM token management.",
+      "item": [
+        {
+          "name": "Get User Profile",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/user/profile",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "user", "profile"]
+            },
+            "description": "Returns the authenticated user's full profile.\n\n**Auth**: JWT (role: user)"
+          }
+        },
+        {
+          "name": "Update User FCM Token",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fcm_token\": \"dMr8t3x4R1K...\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/user/fcm",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "user", "fcm"]
+            },
+            "description": "Updates the user's FCM push notification token.\n\n**Auth**: JWT (role: user)"
+          }
+        },
+        {
+          "name": "Get Driver Profile",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/driver/profile",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "driver", "profile"]
+            },
+            "description": "Returns the driver's profile. Works for both verified and unverified drivers.\n\n**Auth**: JWT (role: driver OR unvrf_driver)"
+          }
+        },
+        {
+          "name": "Update Driver FCM Token",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fcm_token\": \"dMr8t3x4R1K...\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/driver/fcm",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "driver", "fcm"]
+            },
+            "description": "Updates the driver's FCM token.\n\n**Auth**: JWT (role: driver OR unvrf_driver)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Verification",
+      "description": "Driver verification status and document upload.",
+      "item": [
+        {
+          "name": "Check Verification Status",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/driver/verification/check",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "driver", "verification", "check"]
+            },
+            "description": "Returns `true` if driver is verified, `false` if unverified, `404` if not found.\n\n**Auth**: JWT (any role)"
+          },
+          "response": [
+            {
+              "name": "Verified",
+              "code": 200,
+              "body": "true"
+            },
+            {
+              "name": "Unverified",
+              "code": 200,
+              "body": "false"
+            }
+          ]
+        },
+        {
+          "name": "Update Verification Documents",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portrait_image\": \"https://storage.example.com/portrait.jpg\",\n  \"poi_image\": \"https://storage.example.com/poi.jpg\",\n  \"dl_image\": \"https://storage.example.com/dl.jpg\",\n  \"rc_image\": \"https://storage.example.com/rc.jpg\",\n  \"amb_front\": \"https://storage.example.com/amb_front.jpg\",\n  \"amb_inside\": \"https://storage.example.com/amb_inside.jpg\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/driver/verification/update",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "driver", "verification", "update"]
+            },
+            "description": "Uploads verification documents for review. Sets `under_progress=true` and clears previous error.\n\n**Auth**: JWT (role: unvrf_driver)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Rides",
+      "description": "Full ride lifecycle: request, accept, arrive, start, complete, cancel.",
+      "item": [
+        {
+          "name": "Request Ride",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  var jsonData = pm.response.json();",
+                  "  pm.environment.set('ride_id', jsonData.ride_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pickup_lat\": 17.385044,\n  \"pickup_lng\": 78.486671,\n  \"dropoff_lat\": 17.445045,\n  \"dropoff_lng\": 78.348671,\n  \"amb_type_id\": \"{{amb_type_id}}\",\n  \"hospital_id\": \"{{hospital_id}}\",\n  \"pickup_address\": \"Charminar, Hyderabad\",\n  \"drop_address\": \"KIMS Hospital, Secunderabad\",\n  \"payment_mode\": \"cash\",\n  \"is_sos\": false\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/request",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "request"]
+            },
+            "description": "Creates a new ride request and triggers driver matching.\n\n**Auth**: JWT (role: user)\n**Validation**:\n- `pickup_lat/lng`, `dropoff_lat/lng`: required, valid lat/lng ranges\n- `pickup_address`, `drop_address`: required\n- `payment_mode`: optional, one of `cash` | `online` (default: `cash`)\n- `amb_type_id`: optional (empty = Book Any)\n- `hospital_id`: optional\n- `is_sos`: optional boolean"
+          },
+          "response": [
+            {
+              "name": "Created",
+              "code": 201,
+              "body": "{\n  \"message\": \"Ride requested successfully\",\n  \"ride_id\": \"668a1b2c3d4e5f6a7b8c9d0e\",\n  \"otp\": \"1234\"\n}"
+            },
+            {
+              "name": "Active Ride Exists",
+              "code": 409,
+              "body": "{\n  \"error\": \"Conflict\",\n  \"detail\": \"You already have an active ride\",\n  \"code\": 409\n}"
+            },
+            {
+              "name": "No Drivers",
+              "code": 404,
+              "body": "{\n  \"error\": \"Not Found\",\n  \"detail\": \"No ambulances available nearby\",\n  \"code\": 404,\n  \"available_types\": [\"BLS\", \"ALS\"]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Accept Ride (Driver)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/{{ride_id}}/accept",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "{{ride_id}}", "accept"]
+            },
+            "description": "Driver accepts an offered ride.\n\n**Auth**: JWT (role: driver)\n**Path Params**: `id` — Ride ObjectID"
+          }
+        },
+        {
+          "name": "Arrive at Pickup",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/{{ride_id}}/arrive",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "{{ride_id}}", "arrive"]
+            },
+            "description": "Driver marks arrival at pickup. Only the assigned driver can call this.\n\n**Auth**: JWT (role: driver)"
+          }
+        },
+        {
+          "name": "Start Ride",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"otp\": \"1234\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/{{ride_id}}/start",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "{{ride_id}}", "start"]
+            },
+            "description": "Driver starts the ride after OTP verification.\n\n**Auth**: JWT (role: driver)\n**Fields**: `otp` or `user_otp` (required if ambulance type has OTP enabled)"
+          }
+        },
+        {
+          "name": "Complete Ride",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  var jsonData = pm.response.json();",
+                  "  if (jsonData.payment_id) pm.environment.set('payment_id', jsonData.payment_id);",
+                  "  if (jsonData.razorpay_order_id) pm.environment.set('razorpay_order_id', jsonData.razorpay_order_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"drop_address\": \"KIMS Hospital, Secunderabad\",\n  \"payment_mode\": \"cash\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/{{ride_id}}/complete",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "{{ride_id}}", "complete"]
+            },
+            "description": "Driver completes the ride. Creates payment record, calculates fare.\n\n**Auth**: JWT (role: driver)\n**Fields**: `drop_address` (optional), `payment_mode` (optional, default: cash)"
+          },
+          "response": [
+            {
+              "name": "Success (Cash)",
+              "code": 200,
+              "body": "{\n  \"detail\": \"Ride Completed\",\n  \"payment_id\": \"668a1b2c3d4e5f6...\",\n  \"razorpay_order_id\": null,\n  \"take_cash\": true,\n  \"amount\": 350.00\n}"
+            }
+          ]
+        },
+        {
+          "name": "Cancel Ride",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/{{ride_id}}/cancel",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "{{ride_id}}", "cancel"]
+            },
+            "description": "Cancels a ride. Both users and drivers can cancel.\n\n**Auth**: JWT (any role — user or driver)\n**Business Logic**: Cancel reason auto-determined (user_cancelled, driver_cancelled, user_cancelled_before_assignment)"
+          }
+        },
+        {
+          "name": "Get Ride History",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/history?limit=10&skip=0",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "history"],
+              "query": [
+                { "key": "limit", "value": "10" },
+                { "key": "skip", "value": "0" }
+              ]
+            },
+            "description": "Returns ride history for the authenticated user or driver.\n\n**Auth**: JWT (any role)\n**Query Params**: `limit` (default 10), `skip` (default 0)"
+          }
+        },
+        {
+          "name": "Get Current Ride",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ride_id\": \"\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/current",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "current"]
+            },
+            "description": "Returns the current active ride for the user/driver. Optionally pass `ride_id` to fetch a specific ride.\n\n**Auth**: JWT (any role)"
+          },
+          "response": [
+            {
+              "name": "No Active Ride",
+              "code": 200,
+              "body": "{\"found\": false}"
+            },
+            {
+              "name": "Active Ride Found",
+              "code": 200,
+              "body": "{\n  \"found\": true,\n  \"status\": \"accepted_rides\",\n  \"data\": { ... }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get Driver Details (for User)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ride_id\": \"{{ride_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/driver/details",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "driver", "details"]
+            },
+            "description": "User fetches assigned driver's profile during an active ride.\n\n**Auth**: JWT (any role, ownership enforced)\n**Required**: `ride_id`"
+          }
+        },
+        {
+          "name": "Get User Details (for Driver)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ride_id\": \"{{ride_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/user/details",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "user", "details"]
+            },
+            "description": "Driver fetches the ride requester's profile.\n\n**Auth**: JWT (any role, ownership enforced)\n**Required**: `ride_id`"
+          }
+        },
+        {
+          "name": "Driver Feedback List",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/rides/feedback/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "rides", "feedback", "list"]
+            },
+            "description": "Driver fetches feedback received from users.\n\n**Auth**: JWT (role: driver)"
+          }
+        },
+        {
+          "name": "Route Preview",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"origin_lat\": 17.385044,\n  \"origin_lng\": 78.486671,\n  \"dest_lat\": 17.445045,\n  \"dest_lng\": 78.348671\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/route",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "route"]
+            },
+            "description": "Computes route between two points using Google Routes API.\n\n**Auth**: JWT (any role)\n**Validation**: All 4 coordinate fields required with valid ranges"
+          },
+          "response": [
+            {
+              "name": "Success",
+              "code": 200,
+              "body": "{\n  \"distance_km\": 12.5,\n  \"duration_seconds\": 1800,\n  \"polyline_coords\": [[17.385,78.486],[17.445,78.348]]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Fare Estimate",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"distance_km\": 12.5,\n  \"amb_type_id\": \"\",\n  \"is_sos\": false\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/fare/estimate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "fare", "estimate"]
+            },
+            "description": "Estimates fare for all or a specific ambulance type.\n\n**Auth**: JWT (any role)\n**Required**: `distance_km` (must be > 0)\n**Optional**: `amb_type_id` (empty = all types), `is_sos`"
+          },
+          "response": [
+            {
+              "name": "All Types",
+              "code": 200,
+              "body": "{\n  \"estimates\": [\n    {\n      \"amb_type_id\": \"668a...\",\n      \"name\": \"BLS Ambulance\",\n      \"base_fare\": 500,\n      \"total\": 750.50,\n      \"driver_share\": 600.40\n    }\n  ]\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Payment",
+      "description": "Payment processing for rides — Razorpay online and cash payments.",
+      "item": [
+        {
+          "name": "Get Pending Payment",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/payment/pending",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "payment", "pending"]
+            },
+            "description": "Fetches unpaid payment for the authenticated user or driver.\n\n**Auth**: JWT (any role)"
+          }
+        },
+        {
+          "name": "Get Payment by Ride",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ride_id\": \"{{ride_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/payment/ride",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "payment", "ride"]
+            },
+            "description": "Fetches payment by ride ID. Ownership enforced.\n\n**Auth**: JWT (any role, ownership check)"
+          }
+        },
+        {
+          "name": "Process User Online Payment",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payment_id\": \"{{payment_id}}\",\n  \"rzp_payment_id\": \"pay_XXXXXXXXXXXX\",\n  \"rzp_signature\": \"signature_hash_here\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/payment/user/process",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "payment", "user", "process"]
+            },
+            "description": "Verifies Razorpay signature and marks payment as paid. Credits driver wallet.\n\n**Auth**: JWT (role: user)\n**All fields required**"
+          }
+        },
+        {
+          "name": "Process User Cash Payment",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payment_id\": \"{{payment_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/payment/user/process-cash",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "payment", "user", "process-cash"]
+            },
+            "description": "User switches payment from online to cash. Debits commission from driver wallet.\n\n**Auth**: JWT (role: user)\n**Required**: `payment_id`"
+          }
+        },
+        {
+          "name": "Process Driver Cash Payment",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"_id\": \"{{payment_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/payment/driver/process",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "payment", "driver", "process"]
+            },
+            "description": "Driver confirms cash payment collected. Debits platform commission from wallet.\n\n**Auth**: JWT (role: driver)\n**Fields**: `_id` or `id` (payment ObjectID)"
+          }
+        },
+        {
+          "name": "Razorpay Webhook",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "x-razorpay-signature", "value": "{{razorpay_signature}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"event\": \"payment.captured\",\n  \"payload\": {\n    \"payment\": {\n      \"entity\": {\n        \"id\": \"pay_XXXXXXXXXXXX\",\n        \"order_id\": \"order_XXXXXXXXXXXX\",\n        \"status\": \"captured\"\n      }\n    }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/payment/webhook/razorpay",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "payment", "webhook", "razorpay"]
+            },
+            "description": "Server-to-server Razorpay webhook. Verifies HMAC-SHA256 signature.\n\n**Auth**: HMAC signature verification (no API key, no JWT)\n**Header**: `x-razorpay-signature` (required)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Wallet",
+      "description": "Driver wallet management — balance, bank details, withdrawals.",
+      "item": [
+        {
+          "name": "Get Wallet",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/driver/wallet/get",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "driver", "wallet", "get"]
+            },
+            "description": "Returns the driver's wallet details.\n\n**Auth**: JWT (role: driver)"
+          }
+        },
+        {
+          "name": "Update Wallet (Bank Details)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_no\": \"1234567890123456\",\n  \"ifsc\": \"SBIN0001234\",\n  \"account_holder_name\": \"Test Driver\",\n  \"bank_name\": \"State Bank of India\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/driver/wallet/update",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "driver", "wallet", "update"]
+            },
+            "description": "Updates bank account details. Creates/updates Zwitch beneficiary.\n\n**Auth**: JWT (role: driver)"
+          }
+        },
+        {
+          "name": "Withdraw from Wallet",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 500.00\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/driver/wallet/withdraw",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "driver", "wallet", "withdraw"]
+            },
+            "description": "Initiates bank payout via Zwitch. Rs.7 transaction fee deducted.\n\n**Auth**: JWT (role: driver)\n**Validation**: `amount` required, must be > 0, must cover 7rs fee\n**Pre-requisite**: Bank details configured"
+          }
+        },
+        {
+          "name": "List Wallet Transactions",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/driver/wallet/transactions/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "driver", "wallet", "transactions", "list"]
+            },
+            "description": "Lists all wallet withdrawal transactions.\n\n**Auth**: JWT (role: driver)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Shared",
+      "description": "Shared endpoints available to all clients — call masking, ambulance types, hospitals, feedback.",
+      "item": [
+        {
+          "name": "Call Mask",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_number\": \"9876543210\",\n  \"to_number\": \"9876543211\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/shared/call/mask",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "shared", "call", "mask"]
+            },
+            "description": "Initiates a masked phone call via Cloudshope.\n\n**Auth**: JWT (any role)\n**Required**: `from_number`, `to_number`"
+          }
+        },
+        {
+          "name": "Check Ambulance Type Updates",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v2/shared/updates/ambulance_types/check",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "shared", "updates", "ambulance_types", "check"]
+            },
+            "description": "Returns the ambulance_type update counter. Used by clients to detect changes.\n\n**Auth**: API Key only (no JWT)"
+          }
+        },
+        {
+          "name": "List Ambulance Types",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v2/shared/ambulance/types/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "shared", "ambulance", "types", "list"]
+            },
+            "description": "Lists all active ambulance types.\n\n**Auth**: API Key only (no JWT)"
+          }
+        },
+        {
+          "name": "Check Hospital Updates",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v2/shared/updates/hospitals/check",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "shared", "updates", "hospitals", "check"]
+            },
+            "description": "Returns the hospitals update counter.\n\n**Auth**: API Key only (no JWT)"
+          }
+        },
+        {
+          "name": "List Hospitals",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v2/shared/hospitals/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "shared", "hospitals", "list"]
+            },
+            "description": "Lists all hospitals.\n\n**Auth**: API Key only (no JWT)"
+          }
+        },
+        {
+          "name": "Submit Feedback",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ride_id\": \"{{ride_id}}\",\n  \"driver_id\": \"{{driver_id}}\",\n  \"rating\": 5,\n  \"comment\": \"Excellent service, very prompt!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/shared/feedback/submit",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "shared", "feedback", "submit"]
+            },
+            "description": "Submits ride feedback. User ID is enforced from JWT.\n\n**Auth**: JWT (any role)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Referral",
+      "description": "Referral rewards for users and drivers.",
+      "item": [
+        {
+          "name": "Get My Rewards",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/referral/rewards",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "referral", "rewards"]
+            },
+            "description": "Returns referral rewards summary for the authenticated user or driver.\n\n**Auth**: JWT (any role)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin — Auth",
+      "description": "Admin authentication via username/password or mobile OTP.",
+      "item": [
+        {
+          "name": "Admin Login (Username/Password)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  var jsonData = pm.response.json();",
+                  "  pm.environment.set('admin_token', jsonData.token);",
+                  "  pm.environment.set('access_token', jsonData.token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{admin_username}}\",\n  \"password\": \"{{admin_password}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/login",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "login"]
+            },
+            "description": "Admin login with bcrypt password verification.\n\n**Rate Limit**: 5 per 10s (IP-based)"
+          }
+        },
+        {
+          "name": "Admin Mobile OTP Request",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobile\": \"9876543210\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/login/mobile",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "login", "mobile"]
+            },
+            "description": "Sends OTP to admin's registered mobile.\n\n**Validation**: `mobile` required, exactly 10 digits"
+          }
+        },
+        {
+          "name": "Admin Mobile OTP Verify",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  var jsonData = pm.response.json();",
+                  "  pm.environment.set('admin_token', jsonData.access_token);",
+                  "  pm.environment.set('access_token', jsonData.access_token);",
+                  "  if (jsonData.refresh_token) pm.environment.set('refresh_token', jsonData.refresh_token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobile\": \"9876543210\",\n  \"otp\": \"123456\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/login/mobile/verify",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "login", "mobile", "verify"]
+            },
+            "description": "Verifies admin OTP and returns access + refresh tokens.\n\n**Validation**: `mobile` (10 digits), `otp` (6 digits)"
+          }
+        },
+        {
+          "name": "Change Admin Password",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"current_password\": \"oldpassword\",\n  \"new_password\": \"newpassword123\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/password",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "password"]
+            },
+            "description": "Changes admin password. Current password must be verified.\n\n**Auth**: JWT (role: admin)\n**Validation**: `new_password` min 8 chars"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin — Ambulance Types",
+      "description": "CRUD operations for ambulance type configuration.",
+      "item": [
+        {
+          "name": "Create Ambulance Type",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"BLS Ambulance\",\n  \"base_fare\": 500,\n  \"driver_share\": 80,\n  \"otp_required\": true,\n  \"pricing_tier\": [\n    { \"threshold_distance\": 5, \"cost_per_km\": 20 },\n    { \"threshold_distance\": 15, \"cost_per_km\": 15 },\n    { \"threshold_distance\": 9999, \"cost_per_km\": 10 }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/ambulance_types",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "ambulance_types"]
+            },
+            "description": "Creates a new ambulance type.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "List Ambulance Types (Admin)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/ambulance_types",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "ambulance_types"]
+            },
+            "description": "Lists all ambulance types.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Update Ambulance Type",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"_id\": \"{{amb_type_id}}\",\n  \"name\": \"BLS Ambulance Updated\",\n  \"base_fare\": 550,\n  \"driver_share\": 80,\n  \"otp_required\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/ambulance/types/update",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "ambulance", "types", "update"]
+            },
+            "description": "Updates an existing ambulance type.\n\n**Auth**: JWT (role: admin)\n**Required**: `_id`"
+          }
+        },
+        {
+          "name": "Delete Ambulance Type",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/ambulance_types/{{amb_type_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "ambulance_types", "{{amb_type_id}}"]
+            },
+            "description": "Deletes an ambulance type.\n\n**Auth**: JWT (role: admin)\n**Path Param**: `id` — ObjectID"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin — Drivers",
+      "description": "Verified and unverified driver management.",
+      "item": [
+        {
+          "name": "List Drivers",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"skip\": 0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "list"]
+            },
+            "description": "Lists verified drivers with pagination.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Get Driver Details",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"{{driver_id}}\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/details",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "details"]
+            },
+            "description": "Fetches a single driver's full details.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Add Driver",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"New Driver\",\n  \"mobile\": \"9876543215\",\n  \"vehicle_type\": \"{{amb_type_id}}\",\n  \"vehicle_number\": \"TS09AB1234\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/add",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "add"]
+            },
+            "description": "Creates a verified driver directly.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Update Driver",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"_id\": \"{{driver_id}}\",\n  \"name\": \"Updated Driver Name\",\n  \"mobile\": \"9876543215\",\n  \"vehicle_type\": \"{{amb_type_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/update",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "update"]
+            },
+            "description": "Updates a verified driver. `_id` is required.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Delete Driver",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"{{driver_id}}\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/delete",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "delete"]
+            },
+            "description": "Deletes a verified driver.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "List Unverified Drivers (Pending)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/unverified/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "unverified", "list"]
+            },
+            "description": "Lists unverified drivers pending approval.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "List All Unverified Drivers",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/unverified/list/all",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "unverified", "list", "all"]
+            },
+            "description": "Lists ALL unverified drivers (including rejected/in-progress).\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Fetch Unverified Driver",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"{{unverified_driver_id}}\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/unverified/fetch",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "unverified", "fetch"]
+            },
+            "description": "Fetches a single unverified driver's details.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Accept (Approve) Driver",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"_id\": \"{{unverified_driver_id}}\",\n  \"name\": \"Approved Driver\",\n  \"mobile\": \"9876543211\",\n  \"vehicle_type\": \"{{amb_type_id}}\",\n  \"vehicle_number\": \"TS09CD5678\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/unverified/accept",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "unverified", "accept"]
+            },
+            "description": "Approves an unverified driver, moving them to the verified collection.\n\n**Auth**: JWT (role: admin, sub-role: super_admin | admin)"
+          }
+        },
+        {
+          "name": "Reject Driver",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"driver_id\": \"{{unverified_driver_id}}\",\n  \"error_message\": \"Documents are unclear. Please re-upload.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/unverified/reject",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "unverified", "reject"]
+            },
+            "description": "Rejects an unverified driver with an error message.\n\n**Auth**: JWT (role: admin, sub-role: super_admin | admin)"
+          }
+        },
+        {
+          "name": "Unverified Driver Counter",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/unverified/counter",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "unverified", "counter"]
+            },
+            "description": "Returns the count of unverified drivers.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Driver Ride History",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"{{driver_id}}\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/drivers/rides/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "drivers", "rides", "list"]
+            },
+            "description": "Admin view of a specific driver's ride history.\n\n**Auth**: JWT (role: admin)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin — Profile",
+      "description": "Admin profile management.",
+      "item": [
+        {
+          "name": "Update Admin FCM Token",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"fcm_token\": \"admin_fcm_token_here\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/profile/fcm",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "profile", "fcm"]
+            },
+            "description": "Updates admin FCM token.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Update Admin Location",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"Point\",\n  \"coordinates\": [78.486671, 17.385044]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/profile/location",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "profile", "location"]
+            },
+            "description": "Updates admin's GPS location.\n\n**Auth**: JWT (role: admin)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin — Users & Rides",
+      "description": "Admin views for users, user rides, completed rides, ongoing rides.",
+      "item": [
+        {
+          "name": "List Users",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/users/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "users", "list"]
+            },
+            "description": "Lists all registered users.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "User Ride History",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"id\": \"{{user_id}}\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/rides/user/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "rides", "user", "list"]
+            },
+            "description": "Admin view of a specific user's ride history.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "List Completed Rides",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/rides/completed/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "rides", "completed", "list"]
+            },
+            "description": "Lists all completed rides.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "List Ongoing Rides",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/rides/ongoing/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "rides", "ongoing", "list"]
+            },
+            "description": "Lists all active rides (ASSIGNED, ARRIVED, IN_PROGRESS).\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Admin List Feedback",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/feedback/list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "feedback", "list"]
+            },
+            "description": "Lists all feedback from all users.\n\n**Auth**: JWT (role: admin)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin — Hospitals",
+      "description": "Hospital CRUD operations.",
+      "item": [
+        {
+          "name": "Add Hospital",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"KIMS Hospital\",\n  \"address\": \"Minister Road, Secunderabad\",\n  \"city\": \"Hyderabad\",\n  \"coordinates\": {\n    \"lat\": 17.4344,\n    \"lng\": 78.4983\n  },\n  \"always_open\": true,\n  \"services\": [\"Emergency\", \"ICU\", \"Cardiology\"],\n  \"timing\": null\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/hospitals/add",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "hospitals", "add"]
+            },
+            "description": "Adds a hospital. Names/addresses auto-translated.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Update Hospital",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"_id\": \"{{hospital_id}}\",\n  \"name\": \"KIMS Hospital Updated\",\n  \"address\": \"Minister Road, Secunderabad\",\n  \"city\": \"Hyderabad\",\n  \"coordinates\": {\n    \"lat\": 17.4344,\n    \"lng\": 78.4983\n  },\n  \"always_open\": true,\n  \"services\": [\"Emergency\", \"ICU\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/hospitals/update",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "hospitals", "update"]
+            },
+            "description": "Updates a hospital.\n\n**Auth**: JWT (role: admin)\n**Required**: `_id`"
+          }
+        },
+        {
+          "name": "Delete Hospital",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"hospital_id\": \"{{hospital_id}}\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/hospitals/delete",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "hospitals", "delete"]
+            },
+            "description": "Deletes a hospital.\n\n**Auth**: JWT (role: admin)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin — Offers",
+      "description": "Promotional offer management.",
+      "item": [
+        {
+          "name": "Create Offer",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"description\": \"50% off first ride\",\n  \"discount_percent\": 50,\n  \"max_discount\": 200,\n  \"valid_until\": \"2026-12-31T23:59:59Z\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/offers",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "offers"]
+            },
+            "description": "Creates a promotional offer.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "List Offers",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/offers",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "offers"]
+            },
+            "description": "Lists all offers.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Delete Offer",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/offers/{{offer_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "offers", "{{offer_id}}"]
+            },
+            "description": "Deletes an offer.\n\n**Auth**: JWT (role: admin)\n**Path Param**: `id`"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin — Referral Config",
+      "description": "Referral program configuration management.",
+      "item": [
+        {
+          "name": "Get Referral Config",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/referral/config",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "referral", "config"]
+            },
+            "description": "Returns all referral type configurations.\n\n**Auth**: JWT (role: admin)"
+          }
+        },
+        {
+          "name": "Save Referral Config",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"type\": \"user_signup\",\n    \"referrer_reward\": 50,\n    \"referee_reward\": 25,\n    \"enabled\": true\n  },\n  {\n    \"type\": \"driver_signup\",\n    \"referrer_reward\": 100,\n    \"referee_reward\": 50,\n    \"enabled\": true\n  }\n]"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/admin/referral/config",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "admin", "referral", "config"]
+            },
+            "description": "Saves referral configurations. Validates type against allowed values.\n\n**Auth**: JWT (role: admin)"
+          }
+        }
+      ]
+    }
+  ]
+}

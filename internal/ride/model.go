@@ -49,12 +49,35 @@ type TimeLog struct {
 	CancelledAt *time.Time `bson:"cancelled_at,omitempty" json:"cancelled_at,omitempty"`
 }
 
+type ConditionUpdate struct {
+	Level     string    `bson:"level" json:"level"` // stable | serious | critical | worsening
+	Severity  int       `bson:"severity" json:"severity"`
+	Note      string    `bson:"note,omitempty" json:"note,omitempty"`
+	Source    string    `bson:"source" json:"source"` // user | attendant
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+}
+
 type DispatchMetadata struct {
 	CandidatesSearched  int `bson:"candidates_searched" json:"candidates_searched"`
 	OffersSent          int `bson:"offers_sent" json:"offers_sent"`
 	OffersDeclined      int `bson:"offers_declined" json:"offers_declined"`
 	OffersTimedOut      int `bson:"offers_timed_out" json:"offers_timed_out"`
 	AssignmentLatencyMs int `bson:"assignment_latency_ms" json:"assignment_latency_ms"`
+}
+
+func ConditionSeverity(level string) int {
+	switch level {
+	case "stable":
+		return 1
+	case "serious":
+		return 2
+	case "critical":
+		return 3
+	case "worsening":
+		return 4
+	default:
+		return 0
+	}
 }
 
 // Ride represents the V2 single-collection document schema
@@ -81,4 +104,7 @@ type Ride struct {
 	DispatchMetadata  DispatchMetadata   `bson:"dispatch_metadata" json:"dispatch_metadata"`
 	CancellationReason string            `bson:"cancellation_reason,omitempty" json:"cancellation_reason,omitempty"`
 	AvailableTypes     []string           `bson:"available_types,omitempty" json:"available_types,omitempty"`
+	ConditionUpdates   []ConditionUpdate  `bson:"condition_updates,omitempty" json:"condition_updates,omitempty"`
+	LatestCondition    *ConditionUpdate   `bson:"latest_condition,omitempty" json:"latest_condition,omitempty"`
+	ConditionOnArrival *ConditionUpdate   `bson:"condition_on_arrival,omitempty" json:"condition_on_arrival,omitempty"`
 }

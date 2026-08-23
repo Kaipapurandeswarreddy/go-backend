@@ -124,3 +124,32 @@ type OTPAttempt struct {
 	LockedUntil *time.Time         `bson:"locked_until,omitempty" json:"locked_until,omitempty"`
 	UpdatedAt  time.Time          `bson:"updated_at" json:"updated_at"`
 }
+
+type HospitalMD struct {
+	ID              primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
+	HospitalPendingID *primitive.ObjectID `bson:"hospital_pending_id,omitempty" json:"hospital_pending_id,omitempty"`
+	HospitalID      *primitive.ObjectID `bson:"hospital_id,omitempty" json:"hospital_id,omitempty"`
+	Name            string             `bson:"name" json:"name"`
+	Email           string             `bson:"email" json:"email"`
+	Mobile          string             `bson:"mobile" json:"mobile"`
+	OfficialNumber  string             `bson:"official_number" json:"official_number"`
+	Username        *string            `bson:"username,omitempty" json:"username,omitempty"`
+	PasswordHash    *string            `bson:"password_hash,omitempty" json:"-"`
+	Status          string             `bson:"status" json:"status"` // pending | active | rejected
+	JWTToken        *string            `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
+	FCMToken        *string            `bson:"fcm_token,omitempty" json:"fcm_token,omitempty"`
+	CreatedAt       time.Time          `bson:"created_at" json:"created_at"`
+}
+
+type HospitalReceptionist struct {
+	ID            primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
+	HospitalID    primitive.ObjectID `bson:"hospital_id" json:"hospital_id"`
+	CreatedByMDID primitive.ObjectID `bson:"created_by_md_id" json:"created_by_md_id"`
+	Name          string             `bson:"name" json:"name"`
+	Username      string             `bson:"username" json:"username"`
+	PasswordHash  string             `bson:"password_hash" json:"-"`
+	Mobile        *string            `bson:"mobile,omitempty" json:"mobile,omitempty"`
+	Active        bool               `bson:"active" json:"active"`
+	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
+	JWTToken      *string            `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
+}

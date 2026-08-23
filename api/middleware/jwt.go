@@ -30,6 +30,7 @@ const (
 	UserIDKey      contextKey = "userID"
 	UserRoleKey    contextKey = "userRole"
 	AdminRoleKey   contextKey = "adminRole"
+	HospitalIDKey  contextKey = "hospitalID"
 )
 
 // JWTAuth creates a middleware that validates a Bearer token
@@ -61,6 +62,7 @@ func JWTAuth(secret string, jwtOpts ...jwt.ParserOption) func(http.Handler) http
 			ctx := context.WithValue(r.Context(), UserIDKey, claims.ID)
 			ctx = context.WithValue(ctx, UserRoleKey, claims.Role)
 			ctx = context.WithValue(ctx, AdminRoleKey, claims.AdminRole)
+			ctx = context.WithValue(ctx, HospitalIDKey, claims.HospitalID)
 			
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

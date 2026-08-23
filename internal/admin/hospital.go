@@ -179,6 +179,18 @@ func (s *HospitalStore) UpdateHospital(ctx context.Context, h *Hospital) error {
 	return err
 }
 
+func (s *HospitalStore) FindByID(ctx context.Context, id primitive.ObjectID) (*Hospital, error) {
+	var h Hospital
+	err := s.hospitals.FindOne(ctx, bson.M{"_id": id}).Decode(&h)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &h, nil
+}
+
 func (s *HospitalStore) DeleteHospital(ctx context.Context, id primitive.ObjectID) error {
 	_, err := s.hospitals.DeleteOne(ctx, bson.M{"_id": id})
 	return err

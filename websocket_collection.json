@@ -1,0 +1,263 @@
+{
+  "info": {
+    "name": "Ambigo V2 WebSocket Collection",
+    "description": "WebSocket testing collection for the Ambigo V2 backend. Contains connection details, message schemas, and example payloads for all WebSocket interactions.",
+    "version": "2.0.0"
+  },
+  "endpoints": [
+    {
+      "name": "Main WebSocket Connection",
+      "description": "Primary WebSocket endpoint for real-time communication between drivers, users, and the backend server. Handles location updates, ride lifecycle events, and push notifications.",
+      "url": "ws://{{base_url}}/ws?token={{access_token}}&api_key={{api_key}}",
+      "method": "WebSocket",
+      "headers": {
+        "Origin": "http://localhost",
+        "Connection": "Upgrade",
+        "Upgrade": "websocket",
+        "Sec-WebSocket-Version": "13"
+      },
+      "authentication": {
+        "type": "query_parameter",
+        "parameters": {
+          "token": "JWT access token (same as used in Authorization: Bearer header)",
+          "api_key": "Application API key (same as X-API-Key header)"
+        },
+        "notes": "Both token and api_key are required as query parameters during the WebSocket handshake. The server validates the API key first, then parses the JWT to extract user ID and role."
+      },
+      "connection_steps": [
+        "1. Obtain an access_token via /api/v2/auth/{user|driver}/verify-otp or /api/v2/admin/login",
+        "2. Open WebSocket connection to ws://<host>/ws?token=<access_token>&api_key=<api_key>",
+        "3. Server validates API key and JWT token",
+        "4. On success, connection is upgraded and client is registered in the hub",
+        "5. If the same (role, id) already has a connection, the old one receives SESSION_REPLACED and is closed",
+        "6. Begin sending/receiving messages"
+      ],
+      "connection_lifecycle": {
+        "ping_interval_seconds": 54,
+        "pong_timeout_seconds": 60,
+        "write_timeout_seconds": 10,
+        "max_message_size_bytes": 1024,
+        "send_buffer_size": 256,
+        "notes": "Server sends WebSocket Ping frames every 54 seconds. Client must respond with Pong within 60 seconds or the connection will be closed. The server also accepts raw text 'ping' messages from clients."
+      },
+      "disconnect_handling": {
+        "server_initiated": [
+          "SESSION_REPLACED: Another client with the same role+ID connected",
+          "CloseMessage: Server is shutting down gracefully",
+          "Write error: Network failure"
+        ],
+        "client_initiated": [
+          "CloseGoingAway (1001): Client navigating away",
+          "CloseAbnormalClosure (1006): Unexpected close"
+        ],
+        "cleanup": "On disconnect, client is unregistered from the hub, removed from ride watchers, and the connection is closed."
+      },
+      "client_messages": [
+        {
+          "type": "LOCATION_UPDATE",
+          "description": "Driver sends GPS coordinates continuously (every 3-5 seconds). Updates the H3 spatial index for driver matching and relays location to ride watchers.",
+          "roles": ["driver"],
+          "schema": {
+            "type": "LOCATION_UPDATE",
+            "payload": {
+              "lat": 17.385044,
+              "lng": 78.486671
+            }
+          },
+          "sample_message": "{\"type\":\"LOCATION_UPDATE\",\"payload\":{\"lat\":17.385044,\"lng\":78.486671}}",
+          "notes": "Only drivers should send this. User location updates are ignored. On first location ping, the server caches the driver's vehicle type from the database."
+        },
+        {
+          "type": "WATCH_RIDE",
+          "description": "Client subscribes to real-time updates for a specific ride. After subscribing, the client receives all RIDE_UPDATE and LOCATION_UPDATE events for that ride.",
+          "roles": ["user", "driver", "admin"],
+          "schema": {
+            "type": "WATCH_RIDE",
+            "payload": {
+              "ride_id": "668a1b2c3d4e5f6a7b8c9d0e"
+            }
+          },
+          "sample_message": "{\"type\":\"WATCH_RIDE\",\"payload\":{\"ride_id\":\"668a1b2c3d4e5f6a7b8c9d0e\"}}",
+          "notes": "Multiple clients can watch the same ride. On disconnect, the watcher is automatically removed."
+        },
+        {
+          "type": "RIDE_DECLINED",
+          "description": "Driver declines a ride offer. The dispatcher moves to the next candidate driver.",
+          "roles": ["driver"],
+          "schema": {
+            "type": "RIDE_DECLINED",
+            "payload": {
+              "ride_id": "668a1b2c3d4e5f6a7b8c9d0e"
+            }
+          },
+          "sample_message": "{\"type\":\"RIDE_DECLINED\",\"payload\":{\"ride_id\":\"668a1b2c3d4e5f6a7b8c9d0e\"}}",
+          "notes": "After declining, the dispatcher removes this driver from the candidate list and offers to the next nearest driver."
+        },
+        {
+          "type": "PING",
+          "description": "Application-level ping. Server ignores it silently. The raw text 'ping' (without JSON) is also accepted.",
+          "roles": ["user", "driver", "admin"],
+          "schema": {
+            "type": "PING",
+            "payload": {}
+          },
+          "sample_message": "ping",
+          "notes": "Both JSON {\"type\":\"PING\"} and raw text 'ping' are accepted. This is separate from WebSocket protocol-level Ping/Pong frames."
+        }
+      ],
+      "server_messages": [
+        {
+          "type": "RIDE_REQUESTED",
+          "description": "Sent to a specific driver when they are offered a new ride. Contains full ride details for the driver to accept or decline.",
+          "target": "driver (specific, matched by dispatcher)",
+          "schema": {
+            "type": "RIDE_REQUESTED",
+            "payload": {
+              "ride_id": "668a1b2c3d4e5f6a7b8c9d0e",
+              "user_id": "668a0a1b2c3d4e5f6a7b8c9d",
+              "pickup_lat": 17.385044,
+              "pickup_lng": 78.486671,
+              "pickup_address": "Charminar, Hyderabad",
+              "dropoff_lat": 17.445045,
+              "dropoff_lng": 78.348671,
+              "drop_address": "KIMS Hospital, Secunderabad",
+              "eta_seconds": 480,
+              "distance_km": 12.5,
+              "pickup_distance_km": 2.3,
+              "fare": 750.50,
+              "cost": 600.40,
+              "payment_mode": "cash",
+              "is_sos": false
+            }
+          },
+          "sample_message": "{\"type\":\"RIDE_REQUESTED\",\"payload\":{\"ride_id\":\"668a1b2c3d4e5f6a7b8c9d0e\",\"user_id\":\"668a0a1b2c3d4e5f6a7b8c9d\",\"pickup_lat\":17.385044,\"pickup_lng\":78.486671,\"pickup_address\":\"Charminar, Hyderabad\",\"dropoff_lat\":17.445045,\"dropoff_lng\":78.348671,\"drop_address\":\"KIMS Hospital, Secunderabad\",\"eta_seconds\":480,\"distance_km\":12.5,\"pickup_distance_km\":2.3,\"fare\":750.50,\"cost\":600.40,\"payment_mode\":\"cash\",\"is_sos\":false}}"
+        },
+        {
+          "type": "RIDE_UPDATE",
+          "description": "Sent to ride watchers when a ride's status changes. Status transitions: SEARCHING → ASSIGNED → ARRIVED → IN_PROGRESS → COMPLETED/CANCELLED.",
+          "target": "ride watchers (user, admin)",
+          "schema": {
+            "type": "RIDE_UPDATE",
+            "payload": {
+              "ride_id": "668a1b2c3d4e5f6a7b8c9d0e",
+              "status": "ARRIVED",
+              "driver_id": "668b1c2d3e4f5a6b7c8d9e0f"
+            }
+          },
+          "variants": [
+            {
+              "name": "Ride Accepted",
+              "payload": { "ride_id": "...", "driver_id": "...", "status": "ASSIGNED" }
+            },
+            {
+              "name": "Driver Arrived",
+              "payload": { "ride_id": "...", "status": "ARRIVED" }
+            },
+            {
+              "name": "Ride Started",
+              "payload": { "ride_id": "...", "status": "IN_PROGRESS" }
+            },
+            {
+              "name": "Ride Completed",
+              "payload": { "ride_id": "...", "status": "COMPLETED", "amount": 750.50 }
+            },
+            {
+              "name": "Ride Cancelled",
+              "payload": { "ride_id": "...", "status": "CANCELLED" }
+            },
+            {
+              "name": "Ride Cancelled (No Drivers)",
+              "payload": { "ride_id": "...", "status": "CANCELLED", "available_types": ["BLS", "ALS"] }
+            }
+          ]
+        },
+        {
+          "type": "LOCATION_UPDATE",
+          "description": "Relayed to ride watchers containing the assigned driver's current GPS coordinates.",
+          "target": "ride watchers",
+          "schema": {
+            "type": "LOCATION_UPDATE",
+            "payload": {
+              "lat": 17.390012,
+              "lng": 78.490134
+            }
+          },
+          "sample_message": "{\"type\":\"LOCATION_UPDATE\",\"payload\":{\"lat\":17.390012,\"lng\":78.490134}}"
+        },
+        {
+          "type": "ERROR",
+          "description": "Sent to a user when an error occurs, such as no drivers available.",
+          "target": "user (specific)",
+          "schema": {
+            "type": "ERROR",
+            "payload": {
+              "message": "All nearby drivers are busy. Please try again.",
+              "available_types": ["BLS", "ALS"]
+            }
+          },
+          "sample_message": "{\"type\":\"ERROR\",\"payload\":{\"message\":\"All nearby drivers are busy. Please try again.\",\"available_types\":[\"BLS\",\"ALS\"]}}"
+        },
+        {
+          "type": "SESSION_REPLACED",
+          "description": "Sent to an existing client when a new client with the same role+ID connects. The old connection is then immediately closed.",
+          "target": "old client being replaced",
+          "schema": {},
+          "sample_message": "{\"type\":\"SESSION_REPLACED\"}",
+          "notes": "This is a raw JSON string sent before the connection is force-closed."
+        }
+      ],
+      "testing_scenarios": [
+        {
+          "name": "Driver Connection Flow",
+          "steps": [
+            "1. Login as driver via /api/v2/auth/driver/verify-otp",
+            "2. Connect to ws://<host>/ws?token=<driver_token>&api_key=<key>",
+            "3. Send LOCATION_UPDATE every 3-5 seconds",
+            "4. Wait for RIDE_REQUESTED events",
+            "5. Accept via HTTP POST /api/v2/rides/{id}/accept or decline via WS RIDE_DECLINED",
+            "6. Continue sending LOCATION_UPDATE during ride"
+          ]
+        },
+        {
+          "name": "User Ride Monitoring Flow",
+          "steps": [
+            "1. Login as user via /api/v2/auth/user/verify-otp",
+            "2. Request ride via HTTP POST /api/v2/rides/request",
+            "3. Connect to ws://<host>/ws?token=<user_token>&api_key=<key>",
+            "4. Send WATCH_RIDE with the ride_id",
+            "5. Receive RIDE_UPDATE events as status changes",
+            "6. Receive LOCATION_UPDATE events with driver GPS"
+          ]
+        },
+        {
+          "name": "Session Replacement Test",
+          "steps": [
+            "1. Connect client A as driver D1",
+            "2. Connect client B as driver D1 (same role+id)",
+            "3. Client A should receive SESSION_REPLACED and be disconnected",
+            "4. Client B should function normally"
+          ]
+        },
+        {
+          "name": "Ping/Pong Keepalive Test",
+          "steps": [
+            "1. Connect and stay idle for > 54 seconds",
+            "2. Observe server sending WebSocket Ping frames",
+            "3. Client must respond with Pong (browser WebSocket API handles this automatically)",
+            "4. If no Pong received within 60 seconds, server closes connection"
+          ]
+        },
+        {
+          "name": "Error Cases",
+          "steps": [
+            "1. Connect without token → 401 Unauthorized",
+            "2. Connect without api_key → 401 Unauthorized",
+            "3. Connect with expired token → 401 Unauthorized",
+            "4. Send invalid JSON → logged as error, no response",
+            "5. Send unknown event type → logged as warning, no response"
+          ]
+        }
+      ]
+    }
+  ]
+}

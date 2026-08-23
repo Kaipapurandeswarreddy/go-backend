@@ -1,0 +1,289 @@
+<mxfile host="app.diagrams.net" version="21.8.0">
+  <diagram id="p1" name="System Overview">
+    <mxGraphModel dx="1680" dy="1800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="1700" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <!-- BIG DARK CANVAS -->
+        <mxCell id="bg" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#0B1220;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="0" y="0" width="1400" height="1700" as="geometry"/>
+        </mxCell>
+
+        <!-- HEADER -->
+        <mxCell id="hdrTitle" value="Ambigo Backend — System Overview" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=20;fontStyle=1;fontColor=#F1F5F9;" vertex="1" parent="1">
+          <mxGeometry x="30" y="20" width="700" height="26" as="geometry"/>
+        </mxCell>
+        <mxCell id="hdrSub" value="Go 1.26 · Modular Monolith · 23 internal packages · ~45 routes · 4 MongoDB databases · In-Memory EventBus &amp; LocationStore" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=10;fontColor=#94A3B8;" vertex="1" parent="1">
+          <mxGeometry x="30" y="46" width="780" height="16" as="geometry"/>
+        </mxCell>
+        <mxCell id="hdrTag" value="PRODUCTION  ·  :8080  ·  Render  ·  cmd/server/main.go  ·  graceful 20s drain" style="rounded=1;arcSize=8;fillColor=none;strokeColor=#334155;fontColor=#94A3B8;fontSize=8;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="26" width="350" height="20" as="geometry"/>
+        </mxCell>
+
+        <!-- LANE 1 -->
+        <mxCell id="lane1Bg" value="" style="rounded=1;arcSize=16;fillColor=#151D2F;strokeColor=#1E293B;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="18" y="78" width="1364" height="118" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane1Label" value="01 — CLIENT  &amp;  EDGE" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=9;fontStyle=1;fontColor=#64748B;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="30" y="82" width="180" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="bUser" value="User App&#xa;(React Native)" style="rounded=1;arcSize=10;fillColor=#2A1F0F;strokeColor=#A16207;strokeWidth=1.3;fontColor=#FDE68A;fontSize=11;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="30" y="106" width="220" height="74" as="geometry"/>
+        </mxCell>
+        <mxCell id="bDriver" value="Driver App&#xa;(React Native)" style="rounded=1;arcSize=10;fillColor=#2A1F0F;strokeColor=#A16207;strokeWidth=1.3;fontColor=#FDE68A;fontSize=11;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="270" y="106" width="220" height="74" as="geometry"/>
+        </mxCell>
+        <mxCell id="bAdmin" value="Admin Portal&#xa;(Next.js  ·  admin-app)" style="rounded=1;arcSize=10;fillColor=#2A1F0F;strokeColor=#A16207;strokeWidth=1.3;fontColor=#FDE68A;fontSize=11;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="510" y="106" width="220" height="74" as="geometry"/>
+        </mxCell>
+        <mxCell id="bGateway" value="Load Balancer / API Gateway&#xa;Render  ·  TLS  ·  :8080  ·  CORS  ·  BodyLimit 1MB" style="rounded=1;arcSize=10;fillColor=#451A03;strokeColor=#F59E0B;strokeWidth=1.6;fontColor=#FFFBEB;fontSize=10;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="770" y="106" width="592" height="74" as="geometry"/>
+        </mxCell>
+
+        <!-- LANE 2 -->
+        <mxCell id="lane2Bg" value="" style="rounded=1;arcSize=16;fillColor=#0F1A2E;strokeColor=#1E3A5F;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="18" y="212" width="1364" height="154" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane2Label" value="02 — API LAYER  —  HTTP · WebSocket · Middleware Pipeline" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=9;fontStyle=1;fontColor=#64748B;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="30" y="216" width="380" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="bRouter" value="Mux Router  ·  http.NewServeMux  ·  45 routes  ·  /api/v2/*  ·  role guards (user / driver / admin)  ·  Admin sub-roles" style="rounded=1;arcSize=6;fillColor=#1E293B;strokeColor=#3B82F6;fontColor=#BFDBFE;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="30" y="234" width="1340" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="bMW" value="Middleware Pipeline&#xa;APIKeyAuth → JWTAuth (aud/iss) → RequireRole&#xa;RateLimit (IP + Mobile) → RequestID · Metrics" style="rounded=1;arcSize=10;fillColor=#1E3A5F;strokeColor=#60A5FA;strokeWidth=1.3;fontColor=#DBEAFE;fontSize=9.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="30" y="268" width="380" height="86" as="geometry"/>
+        </mxCell>
+        <mxCell id="bHandlers" value="HTTP Handlers  (12)&#xa;auth · ride · payment · wallet · admin · profile&#xa;verification · offer · referral · feedback · shared · ws" style="rounded=1;arcSize=10;fillColor=#1E3A5F;strokeColor=#60A5FA;strokeWidth=1.3;fontColor=#DBEAFE;fontSize=9.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="430" y="268" width="520" height="86" as="geometry"/>
+        </mxCell>
+        <mxCell id="bWS" value="WebSocket Hub&#xa;GET /ws · Manager.Run()&#xa;SeedCurrentSessions()" style="rounded=1;arcSize=10;fillColor=#1E3A5F;strokeColor=#93C5FD;strokeWidth=1.3;fontColor=#EFF6FF;fontSize=9.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="268" width="200" height="86" as="geometry"/>
+        </mxCell>
+        <mxCell id="bObs" value="Ops&#xa;/metrics&#xa;/health" style="rounded=1;arcSize=10;fillColor=#0F172A;strokeColor=#475569;fontColor=#94A3B8;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1190" y="268" width="180" height="86" as="geometry"/>
+        </mxCell>
+
+        <!-- LANE 3 - BIG, CLEAN -->
+        <mxCell id="lane3Bg" value="" style="rounded=1;arcSize=16;fillColor=#0F1F1A;strokeColor=#14532D;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="18" y="382" width="1364" height="420" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane3Label" value="03 — BUSINESS LOGIC  —  Domain Services  ·  internal/*  (23 packages)" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=9;fontStyle=1;fontColor=#64748B;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="30" y="386" width="520" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane3Note" value="Services own rules · Stores own persistence · No direct service→service calls — all via EventBus" style="text;html=1;align=right;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=8;fontColor=#4ADE80;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="780" y="386" width="580" height="14" as="geometry"/>
+        </mxCell>
+
+        <!-- Inner grouping for Core vs Support -->
+        <mxCell id="grpCore" value="" style="rounded=1;arcSize=10;fillColor=none;strokeColor=#1F4D2B;strokeWidth=1;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="26" y="408" width="1050" height="150" as="geometry"/>
+        </mxCell>
+        <mxCell id="grpCoreLabel" value="CORE DOMAINS" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=7;fontStyle=1;fontColor=#4ADE80;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="26" y="408" width="1050" height="12" as="geometry"/>
+        </mxCell>
+        <mxCell id="bAuth" value="Auth Service&#xa;internal/auth&#xa;OTP · JWT · RefreshToken · Sessions" style="rounded=1;arcSize=10;fillColor=#102A1B;strokeColor=#22C55E;fontColor=#BBF7D0;fontSize=10;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="426" width="250" height="118" as="geometry"/>
+        </mxCell>
+        <mxCell id="bRide" value="Ride + Dispatch  ★&#xa;internal/ride · dispatch&#xa;Matcher · RouteClient · Dispatcher&#xa;StaleRideCleanup" style="rounded=1;arcSize=10;fillColor=#14532D;strokeColor=#4ADE80;strokeWidth=1.6;fontColor=#F0FDF4;fontStyle=1;fontSize=11;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="310" y="426" width="430" height="118" as="geometry"/>
+        </mxCell>
+        <mxCell id="bPay" value="Payment&#xa;internal/payment&#xa;Razorpay · Zwitch · Wallet&#xa;WalletStore" style="rounded=1;arcSize=10;fillColor=#102A1B;strokeColor=#22C55E;fontColor=#BBF7D0;fontSize=10;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="760" y="426" width="300" height="118" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="grpSupport" value="" style="rounded=1;arcSize=10;fillColor=none;strokeColor=#1F4D2B;strokeWidth=1;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="26" y="568" width="900" height="150" as="geometry"/>
+        </mxCell>
+        <mxCell id="grpSupportLabel" value="SUPPORTING DOMAINS" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=7;fontStyle=1;fontColor=#4ADE80;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="26" y="568" width="900" height="12" as="geometry"/>
+        </mxCell>
+        <mxCell id="bHospital" value="Hospital · Places · H3&#xa;internal/hospital · places&#xa;Google Places → H3 Cells · Seeder (30d)" style="rounded=1;arcSize=10;fillColor=#102A1B;strokeColor=#22C55E;fontColor=#BBF7D0;fontSize=9.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="586" width="300" height="118" as="geometry"/>
+        </mxCell>
+        <mxCell id="bLocation" value="Location · Pricing&#xa;internal/location · pricing&#xa;MemoryStore + CleanupWorker&#xa;No Redis — in-proc" style="rounded=1;arcSize=10;fillColor=#102A1B;strokeColor=#4ADE80;strokeWidth=1.3;fontColor=#BBF7D0;fontSize=9.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="360" y="586" width="300" height="118" as="geometry"/>
+        </mxCell>
+        <mxCell id="bGrowth" value="Referral · Offer · Notification&#xa;internal/referral · offer · notification&#xa;FCM push · referral rewards · offers" style="rounded=1;arcSize=10;fillColor=#102A1B;strokeColor=#22C55E;fontColor=#BBF7D0;fontSize=9.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="680" y="586" width="230" height="118" as="geometry"/>
+        </mxCell>
+
+        <!-- PLATFORM / EVENTBUS - SEPARATED, NOT OVERLAPPING -->
+        <mxCell id="grpPlatform" value="" style="rounded=1;arcSize=10;fillColor=#0A1F14;strokeColor=#22C55E;strokeWidth=1;dashed=0;" vertex="1" parent="1">
+          <mxGeometry x="950" y="568" width="416" height="150" as="geometry"/>
+        </mxCell>
+        <mxCell id="grpPlatformLabel" value="PLATFORM — EVENT BUS" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=7;fontStyle=1;fontColor=#4ADE80;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="950" y="568" width="416" height="12" as="geometry"/>
+        </mxCell>
+        <mxCell id="bEventBus" value="EventBus — InMemoryBus (Pub/Sub)  ★ Central" style="rounded=1;arcSize=10;fillColor=#14532D;strokeColor=#4ADE80;strokeWidth=1.6;fontColor=#ECFDF5;fontStyle=1;fontSize=11;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="586" width="376" height="54" as="geometry"/>
+        </mxCell>
+        <mxCell id="bSubs" value="WSNotifier · FCMNotifier · MetricsCollector&#xa;AuditLogger · CacheInvalidator · AnalyticsTracker" style="rounded=1;arcSize=8;fillColor=#0F2E1F;strokeColor=#22C55E;fontColor=#86EFAC;fontSize=7.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="646" width="376" height="36" as="geometry"/>
+        </mxCell>
+        <mxCell id="bOtherSmall" value="driver · user · admin&#xa;telephony (Cloudshope) · translation" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=8;fontColor=#6EE7B7;" vertex="1" parent="1">
+          <mxGeometry x="970" y="686" width="376" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- GAP NOTES -->
+        <mxCell id="archNote" value="Modular Monolith — DDD-ish — pragmatic layered, not strict Clean/Hexagonal" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=8;fontColor=#4ADE80;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="30" y="732" width="900" height="12" as="geometry"/>
+        </mxCell>
+        <mxCell id="platformNote" value="All side-effects via events — no direct service→service calls" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=8;fontColor=#86EFAC;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="950" y="732" width="416" height="12" as="geometry"/>
+        </mxCell>
+
+        <!-- LANE 4 -->
+        <mxCell id="lane4Bg" value="" style="rounded=1;arcSize=16;fillColor=#151425;strokeColor=#2D1B4E;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="18" y="820" width="1364" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane4Label" value="04 — DATA &amp; PERSISTENCE" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=9;fontStyle=1;fontColor=#64748B;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="30" y="824" width="220" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="bStores" value="Mongo Stores  (9 collections)&#xa;authStore · rideStore · paymentStore · adminStore&#xa;counter · hospital · offer · wallet · referral · audit" style="rounded=1;arcSize=10;fillColor=#1E1B3A;strokeColor=#8B5CF6;fontColor=#DDD6FE;fontSize=9.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="30" y="844" width="460" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="bLive" value="Live State  (Ephemeral)&#xa;location.NewMemoryStore&#xa;+ StartCleanupWorker · No Redis" style="rounded=1;arcSize=10;fillColor=#2E1A6B;strokeColor=#A78BFA;strokeWidth=1.4;fontColor=#EDE9FE;fontStyle=1;fontSize=10;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="510" y="844" width="300" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="bAbs" value="Abstractions&#xa;interfaces/eventbus.go&#xa;interfaces/locationstore.go" style="rounded=1;arcSize=10;fillColor=#1E1B3A;strokeColor=#8B5CF6;fontColor=#DDD6FE;fontSize=9.5;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="830" y="844" width="240" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="bIdx" value="Indexes&#xa;config/mongodb.go · EnsureIndexes()&#xa;unique mobile · TTL 300s · H3 multikey" style="rounded=1;arcSize=10;fillColor=#1E1B3A;strokeColor=#6D28D9;strokeWidth=1;dashed=1;fontColor=#C4B5FD;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="844" width="272" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- CYLINDER - CENTERED WITH CLEAR SPACE -->
+        <mxCell id="cylinder" value="MongoDB Atlas&#xa;Users  |  Rides  |  Records  |  Data" style="shape=cylinder3;boundedLbl=1;fillColor=#1A2E0D;strokeColor=#84CC16;strokeWidth=1.6;fontColor=#ECFCCB;fontSize=13;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="440" y="982" width="520" height="92" as="geometry"/>
+        </mxCell>
+        <mxCell id="cylSub" value="Indexes: mobile unique · place_id unique · h3_cells multikey · TTL auth_otp 5m" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=8;fontColor=#86EFAC;" vertex="1" parent="1">
+          <mxGeometry x="440" y="1076" width="520" height="14" as="geometry"/>
+        </mxCell>
+
+        <!-- LANE 5 -->
+        <mxCell id="lane5Bg" value="" style="rounded=1;arcSize=16;fillColor=#1A1520;strokeColor=#3F1D2E;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="18" y="1110" width="1364" height="200" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane5Label" value="05 — EXTERNAL INFRASTRUCTURE" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=9;fontStyle=1;fontColor=#64748B;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="30" y="1114" width="260" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="bFCM" value="Firebase FCM&#xa;+ SMSCountry OTP&#xa;FCMNotifier" style="rounded=1;arcSize=10;fillColor=#2A0F1A;strokeColor=#F43F5E;fontColor=#FECDD3;fontSize=10;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="30" y="1136" width="260" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="bPayExt" value="Razorpay · Zwitch&#xa;payouts · webhooks · wallet credits" style="rounded=1;arcSize=10;fillColor=#2A0F1A;strokeColor=#F43F5E;fontColor=#FECDD3;fontSize=10;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="310" y="1136" width="260" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="bGoogle" value="Google APIs&#xa;Routes · Places · Translate&#xa;RouteClient · PlacesClient" style="rounded=1;arcSize=10;fillColor=#2A0F1A;strokeColor=#F43F5E;fontColor=#FECDD3;fontSize=10;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="590" y="1136" width="260" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="bTel" value="Cloudshope&#xa;Call masking&#xa;telephony" style="rounded=1;arcSize=10;fillColor=#2A0F1A;strokeColor=#F43F5E;fontColor=#FECDD3;fontSize=10;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="870" y="1136" width="210" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="bObs2" value="Prometheus · zerolog&#xa;H3-go · /metrics" style="rounded=1;arcSize=10;fillColor=#0F172A;strokeColor=#475569;fontColor=#94A3B8;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="1136" width="262" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="configBar" value="Config: godotenv → config/config.go · Secrets: JWT_SECRET · API_KEY · MONGODB_URI · FIREBASE_CREDENTIALS_PATH · RAZORPAY_* · ZWITCH_* · GOOGLE_MAPS_API_KEY" style="rounded=1;arcSize=6;fillColor=#1E293B;strokeColor=#334155;fontColor=#94A3B8;fontSize=8;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="30" y="1242" width="1340" height="20" as="geometry"/>
+        </mxCell>
+
+        <!-- PIPELINE -->
+        <mxCell id="pipeBg" value="" style="rounded=1;arcSize=12;fillColor=#0F172A;strokeColor=#334155;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="18" y="1334" width="1364" height="152" as="geometry"/>
+        </mxCell>
+        <mxCell id="pipeTitle" value="PLATFORM PIPELINE  —  Boot · Indexes · Seeding · Workers  (Offline / Async)" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=9;fontStyle=1;fontColor=#E2E8F0;letterSpacing=80;" vertex="1" parent="1">
+          <mxGeometry x="400" y="1342" width="600" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="pipe1" value="AppConfig&#xa;(env · .env)" style="rounded=1;arcSize=8;fillColor=#1E293B;strokeColor=#60A5FA;fontColor=#BFDBFE;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1368" width="220" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="pipe2" value="Init MongoDB&#xa;+ EnsureIndexes" style="rounded=1;arcSize=8;fillColor=#1E293B;strokeColor=#60A5FA;fontColor=#BFDBFE;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1368" width="220" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="pipe3" value="Seed &amp; Workers&#xa;CurrentSessions · CleanupWorker&#xa;StaleRideCleanup" style="rounded=1;arcSize=8;fillColor=#1E293B;strokeColor=#60A5FA;fontColor=#BFDBFE;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="520" y="1368" width="260" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="pipe4" value="Hospital Seeder&#xa;Google Places → H3  (30d refresh)" style="rounded=1;arcSize=8;fillColor=#0F1F1A;strokeColor=#4ADE80;fontColor=#BBF7D0;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="800" y="1368" width="260" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="pipe5" value="EventBus Wiring&#xa;6 subscribers · 20s graceful drain" style="rounded=1;arcSize=8;fillColor=#1E1B3A;strokeColor=#A78BFA;fontColor=#DDD6FE;fontSize=9;whiteSpace=wrap;html=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="1368" width="262" height="64" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== CLEAN WIRES - ONLY ESSENTIAL, VIA GAPS ===== -->
+        <!-- Gateway -> Router -->
+        <mxCell id="eGW" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#F59E0B;strokeWidth=1.6;flowAnimation=1;exitX=0.5;exitY=1;entryX=0.85;entryY=0;" edge="1" parent="1" source="bGateway" target="bRouter">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <!-- Handlers -> Ride (core) -->
+        <mxCell id="eHCore" value="request flow" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#E2E8F0;strokeWidth=1.6;flowAnimation=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;fontSize=8;fontColor=#E2E8F0;labelBackgroundColor=#0B1220;" edge="1" parent="1" source="bHandlers" target="bRide">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="690" y="376"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- WS -> EventBus (isolated right side, not crossing center) -->
+        <mxCell id="eWSEB" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#93C5FD;strokeWidth=1.4;dashed=1;dashPattern=6 4;flowAnimation=1;exitX=0.5;exitY=1;entryX=0.9;entryY=0;" edge="1" parent="1" source="bWS" target="bEventBus">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="1158" y="380"/><mxPoint x="1158" y="570"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Ride -> Stores (left side) -->
+        <mxCell id="eRideStores" value="persist" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#E2E8F0;strokeWidth=1.4;flowAnimation=1;exitX=0.2;exitY=1;entryX=0.5;entryY=0;fontSize=8;fontColor=#E2E8F0;labelBackgroundColor=#0B1220;" edge="1" parent="1" source="bRide" target="bStores">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="400" y="580"/><mxPoint x="400" y="810"/><mxPoint x="260" y="810"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Location -> LiveState (short) -->
+        <mxCell id="eLocLive" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#4ADE80;strokeWidth=1.4;flowAnimation=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="bLocation" target="bLive">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="510" y="760"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- EventBus -> FCM (via right perimeter, not through center) -->
+        <mxCell id="eEBFCM" value="async push" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#C4B5FD;strokeWidth=1.3;dashed=1;dashPattern=6 4;flowAnimation=1;exitX=0.1;exitY=1;entryX=0.5;entryY=0;fontSize=8;fontColor=#C4B5FD;labelBackgroundColor=#0B1220;" edge="1" parent="1" source="bEventBus" target="bFCM">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="1020" y="760"/><mxPoint x="1020" y="1060"/><mxPoint x="160" y="1060"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Stores -> Cylinder -->
+        <mxCell id="eStoresCyl" value="Vector Search" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#E2E8F0;strokeWidth=1.4;flowAnimation=1;exitX=0.5;exitY=1;entryX=0.3;entryY=0;fontSize=8;fontColor=#E2E8F0;labelBackgroundColor=#0B1220;" edge="1" parent="1" source="bStores" target="cylinder">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="260" y="968"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Pipeline internal -->
+        <mxCell id="pA1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#60A5FA;strokeWidth=1.4;flowAnimation=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="pipe1" target="pipe2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="pA2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#60A5FA;strokeWidth=1.4;flowAnimation=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="pipe2" target="pipe3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="pA3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#60A5FA;strokeWidth=1.4;flowAnimation=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="pipe3" target="pipe4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="pA4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#60A5FA;strokeWidth=1.4;flowAnimation=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="pipe4" target="pipe5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- LEGEND -->
+        <mxCell id="legBg" value="" style="rounded=1;arcSize=8;fillColor=#0F172A;strokeColor=#1E293B;" vertex="1" parent="1">
+          <mxGeometry x="18" y="1504" width="1364" height="32" as="geometry"/>
+        </mxCell>
+        <mxCell id="legL1" value="" style="shape=line;strokeColor=#E2E8F0;strokeWidth=1.4;flowAnimation=1;" vertex="1" parent="1">
+          <mxGeometry x="30" y="1520" width="36" height="4" as="geometry"/>
+        </mxCell>
+        <mxCell id="legT1" value="sync request" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=8;fontColor=#E2E8F0;" vertex="1" parent="1">
+          <mxGeometry x="72" y="1514" width="110" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="legL2" value="" style="shape=line;strokeColor=#C4B5FD;strokeWidth=1.3;dashed=1;dashPattern=6 4;flowAnimation=1;" vertex="1" parent="1">
+          <mxGeometry x="190" y="1520" width="36" height="4" as="geometry"/>
+        </mxCell>
+        <mxCell id="legT2" value="async / event · external I/O" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=8;fontColor=#C4B5FD;" vertex="1" parent="1">
+          <mxGeometry x="232" y="1514" width="180" height="14" as="geometry"/>
+        </mxCell>
+        <mxCell id="legT3" value="Big page 1400×1700 · No overlaps · Grouped Core/Support/Platform · Cylinder = MongoDB Atlas" style="text;html=1;align=right;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=8;fontColor=#64748B;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="780" y="1514" width="572" height="14" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
