@@ -146,6 +146,8 @@ func main() {
 	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, hospitalCityStore, pendingHospitalStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg)
 	hospitalAuthHandler := handlers.NewHospitalAuthHandler(authStore, pendingHospitalStore, hospitalStore, appConfig.JWTSecret, smsCfg)
 	receptionistHandler := handlers.NewHospitalReceptionistHandler(authStore, appConfig.JWTSecret)
+	attendantAuthHandler := handlers.NewAttendantAuthHandler(authStore, appConfig.JWTSecret, smsCfg)
+	driverAttendantHandler := handlers.NewDriverAttendantHandler(authStore)
 	hospitalDashboardHandler := handlers.NewHospitalDashboardHandler(rideStore, hospitalStore, adminStore, authStore, wsManager)
 	offerHandler := handlers.NewOfferHandler(offerStore, eventBus)
 	sharedHandler := handlers.NewSharedHandler(cloudshopeService, counterStore, adminStore, hospitalStore, hospitalSeeder)
@@ -180,6 +182,8 @@ func main() {
 	requireAdmin := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("admin", next)) }
 	requireHospitalMD := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("hospital_md", next)) }
 	requireAnyHospital := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireAnyRole([]string{"hospital_md", "hospital_receptionist"}, next)) }
+	requireUserOrAttendant := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireAnyRole([]string{"user", "attendant"}, next)) }
+	requireAttendant := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("attendant", next)) }
 	// A6: Admin sub-role enforcement (backward compat — empty role = full access)
 	adminAllowedRoles := []string{"super_admin", "admin", ""}
 	requireAdminRole := func(allowedRoles []string, next http.HandlerFunc) http.Handler {
@@ -259,6 +263,10 @@ func main() {
 	mux.Handle("POST /api/v2/driver/wallet/update", requireDriver(http.HandlerFunc(walletHandler.HandleUpdateWallet)))
 	mux.Handle("POST /api/v2/driver/wallet/withdraw", requireDriver(http.HandlerFunc(walletHandler.HandleWithdraw)))
 	mux.Handle("POST /api/v2/driver/wallet/transactions/list", requireDriver(http.HandlerFunc(walletHandler.HandleListTransactions)))
+	// Driver attendant (one per ambulance, driver creates)
+	mux.Handle("POST /api/v2/driver/attendant/create", requireDriver(http.HandlerFunc(driverAttendantHandler.HandleDriverCreateAttendant)))
+	mux.Handle("POST /api/v2/driver/attendant/list", requireDriver(http.HandlerFunc(driverAttendantHandler.HandleDriverListAttendants)))
+	mux.Handle("POST /api/v2/driver/attendant/delete", requireDriver(http.HandlerFunc(driverAttendantHandler.HandleDriverDeleteAttendant)))
 
 	// Ride Endpoints (Protected)
 	mux.Handle("POST /api/v2/rides/request", requireUser(http.HandlerFunc(rideHandler.HandleRequestRide)))
@@ -353,11 +361,15 @@ func main() {
 	mux.Handle("POST /api/v2/admin/hospital/cities/sync", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitals)))
 	// Hospital MD (public signup + OTP)
 	mux.HandleFunc("POST /api/v2/hospital/md/request-otp", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDRequestOTP, otpIPLimiter))
+	mux.HandleFunc("POST /api/v2/hospital/md/login/request-otp", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDLoginRequestOTP, otpIPLimiter))
 	mux.HandleFunc("POST /api/v2/hospital/md/signup", middleware.RateLimitMobile(hospitalAuthHandler.HandleHospitalMDSignup, verifyMobileLimiter))
 	mux.HandleFunc("POST /api/v2/hospital/md/login/mobile/verify", middleware.RateLimitMobile(hospitalAuthHandler.HandleHospitalMDVerifyOTP, verifyMobileLimiter))
 	mux.HandleFunc("POST /api/v2/hospital/md/login/password", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDLoginPassword, adminLoginLimiter))
 	mux.Handle("POST /api/v2/hospital/md/setup-password", requireHospitalMD(http.HandlerFunc(hospitalAuthHandler.HandleHospitalMDSetupPassword)))
 	mux.Handle("POST /api/v2/hospital/auth/me", requireHospitalMD(http.HandlerFunc(hospitalAuthHandler.HandleHospitalMDMe)))
+	// Attendant (public, inside driver app)
+	mux.HandleFunc("POST /api/v2/attendant/request-otp", middleware.RateLimit(attendantAuthHandler.HandleAttendantRequestOTP, otpIPLimiter))
+	mux.HandleFunc("POST /api/v2/attendant/verify-otp", middleware.RateLimitMobile(attendantAuthHandler.HandleAttendantVerifyOTP, verifyMobileLimiter))
 	// Admin pending hospitals queue
 	mux.Handle("POST /api/v2/admin/hospitals/pending/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListPendingHospitals)))
 	mux.Handle("POST /api/v2/admin/hospitals/pending/fetch", requireAdmin(http.HandlerFunc(adminHandler.HandleFetchPendingHospital)))
@@ -378,9 +390,12 @@ func main() {
 	mux.Handle("POST /api/v2/hospital/profile", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalProfile)))
 	mux.Handle("POST /api/v2/hospital/profile/update", requireHospitalMD(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateHospitalProfile)))
 	mux.Handle("POST /api/v2/hospital/analytics", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalAnalytics)))
-	// In-ride patient condition update (ALS/BLS/Emergency/SOS)
-	mux.Handle("POST /api/v2/rides/condition", requireUser(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateRideCondition)))
-	mux.Handle("POST /api/v2/rides/{id}/condition", requireUser(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateRideCondition)))
+	// In-ride patient condition update (ALS/BLS/Emergency/SOS) — user or attendant
+	mux.Handle("POST /api/v2/rides/condition", requireUserOrAttendant(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateRideCondition)))
+	mux.Handle("POST /api/v2/rides/{id}/condition", requireUserOrAttendant(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateRideCondition)))
+	// Attendant: get hospital contact for a ride
+	mux.Handle("POST /api/v2/attendant/hospital/contact", requireAttendant(http.HandlerFunc(hospitalDashboardHandler.HandleAttendantHospitalContact)))
+	mux.Handle("POST /api/v2/attendant/rides/current", requireAttendant(http.HandlerFunc(hospitalDashboardHandler.HandleAttendantCurrentRide)))
 	mux.Handle("POST /api/v2/admin/offers", requireAdmin(http.HandlerFunc(offerHandler.HandleCreate)))
 	mux.Handle("GET /api/v2/admin/offers", requireAdmin(http.HandlerFunc(offerHandler.HandleList)))
 	mux.Handle("DELETE /api/v2/admin/offers/{id}", requireAdmin(http.HandlerFunc(offerHandler.HandleDelete)))

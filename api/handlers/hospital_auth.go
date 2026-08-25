@@ -65,6 +65,56 @@ func (h *HospitalAuthHandler) HandleHospitalMDRequestOTP(w http.ResponseWriter, 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "OTP sent"})
 }
 
+// HandleHospitalMDLoginRequestOTP checks admin verification before sending OTP for login
+func (h *HospitalAuthHandler) HandleHospitalMDLoginRequestOTP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mobile       string `json:"mobile"`
+		AppSignature string `json:"app_signature"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !hospitalMDSignupMobileRegex.MatchString(req.Mobile) {
+		response.Error(w, "Invalid mobile number", http.StatusBadRequest)
+		return
+	}
+	locked, err := h.AuthStore.IsOTPLocked(r.Context(), req.Mobile)
+	if err == nil && locked {
+		response.Error(w, "Too many attempts. Try again later.", http.StatusTooManyRequests)
+		return
+	}
+	md, err := h.AuthStore.FindHospitalMDByMobile(r.Context(), req.Mobile)
+	if err != nil {
+		response.Error(w, "Failed to verify account", http.StatusInternalServerError)
+		return
+	}
+	if md == nil {
+		response.Error(w, "MD not found. Please signup first.", http.StatusNotFound)
+		return
+	}
+	if md.Status != "active" {
+		if md.Status == "pending" {
+			response.Error(w, "Account pending admin approval", http.StatusForbidden)
+			return
+		}
+		if md.Status == "rejected" {
+			response.Error(w, "Account has been rejected", http.StatusForbidden)
+			return
+		}
+		response.Error(w, "Account not active", http.StatusForbidden)
+		return
+	}
+	otp, err := h.AuthStore.GenerateAndStoreOTP(r.Context(), req.Mobile)
+	if err != nil {
+		response.Error(w, "Failed to generate OTP", http.StatusInternalServerError)
+		return
+	}
+	_ = auth.SendSMS(h.SMSCfg, req.Mobile, otp, req.AppSignature)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"detail": "OTP sent"})
+}
+
 // HandleHospitalMDSignup creates a pending hospital + pending MD after OTP verification
 func (h *HospitalAuthHandler) HandleHospitalMDSignup(w http.ResponseWriter, r *http.Request) {
 	var req struct {

@@ -39,6 +39,7 @@ type Store struct {
 	otpAttempts           *mongo.Collection
 	hospitalMDs           *mongo.Collection
 	hospitalReceptionists *mongo.Collection
+	ambulanceAttendants   *mongo.Collection
 }
 
 func NewStore(usersDB, recordsDB *mongo.Database) *Store {
@@ -52,6 +53,7 @@ func NewStore(usersDB, recordsDB *mongo.Database) *Store {
 		otpAttempts:           usersDB.Collection("otp_attempts"),
 		hospitalMDs:           usersDB.Collection("hospital_mds"),
 		hospitalReceptionists: usersDB.Collection("hospital_receptionists"),
+		ambulanceAttendants:   usersDB.Collection("ambulance_attendants"),
 	}
 }
 
@@ -850,6 +852,18 @@ func (s *Store) FindHospitalMDByID(ctx context.Context, id primitive.ObjectID) (
 	return &md, nil
 }
 
+func (s *Store) FindHospitalMDByHospitalID(ctx context.Context, hospitalID primitive.ObjectID) (*HospitalMD, error) {
+	var md HospitalMD
+	err := s.hospitalMDs.FindOne(ctx, bson.M{"hospital_id": hospitalID}).Decode(&md)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &md, nil
+}
+
 func (s *Store) UpdateHospitalMD(ctx context.Context, md *HospitalMD) error {
 	_, err := s.hospitalMDs.ReplaceOne(ctx, bson.M{"_id": md.ID}, md)
 	return err
@@ -932,5 +946,80 @@ func (s *Store) UpdateHospitalReceptionistJWT(ctx context.Context, id primitive.
 
 func (s *Store) ClearHospitalReceptionistJWT(ctx context.Context, id primitive.ObjectID) error {
 	_, err := s.hospitalReceptionists.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+	return err
+}
+
+// ---- Ambulance Attendant (chat) ----
+
+func (s *Store) CreateAmbulanceAttendant(ctx context.Context, a *AmbulanceAttendant) error {
+	a.ID = primitive.NewObjectID()
+	a.CreatedAt = time.Now()
+	a.Active = true
+	_, err := s.ambulanceAttendants.InsertOne(ctx, a)
+	return err
+}
+
+func (s *Store) FindAmbulanceAttendantByMobile(ctx context.Context, mobile string) (*AmbulanceAttendant, error) {
+	var a AmbulanceAttendant
+	err := s.ambulanceAttendants.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&a)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (s *Store) FindAmbulanceAttendantByID(ctx context.Context, id primitive.ObjectID) (*AmbulanceAttendant, error) {
+	var a AmbulanceAttendant
+	err := s.ambulanceAttendants.FindOne(ctx, bson.M{"_id": id}).Decode(&a)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (s *Store) UpdateAmbulanceAttendantJWT(ctx context.Context, id primitive.ObjectID, token string) error {
+	_, err := s.ambulanceAttendants.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"jwt_token": token}})
+	return err
+}
+
+func (s *Store) ClearAmbulanceAttendantJWT(ctx context.Context, id primitive.ObjectID) error {
+	_, err := s.ambulanceAttendants.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+	return err
+}
+
+func (s *Store) ListAttendantsByDriver(ctx context.Context, driverID primitive.ObjectID) ([]AmbulanceAttendant, error) {
+	cursor, err := s.ambulanceAttendants.Find(ctx, bson.M{"assigned_driver_id": driverID, "active": true})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	var list []AmbulanceAttendant
+	if err = cursor.All(ctx, &list); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []AmbulanceAttendant{}
+	}
+	return list, nil
+}
+
+func (s *Store) DeactivateAttendantsForDriver(ctx context.Context, driverID primitive.ObjectID) error {
+	_, err := s.ambulanceAttendants.UpdateMany(ctx, bson.M{"assigned_driver_id": driverID, "active": true}, bson.M{"$set": bson.M{"active": false}})
+	return err
+}
+
+func (s *Store) DeleteAttendantForDriver(ctx context.Context, driverID, attendantID primitive.ObjectID) error {
+	_, err := s.ambulanceAttendants.DeleteOne(ctx, bson.M{"_id": attendantID, "assigned_driver_id": driverID})
+	return err
+}
+
+func (s *Store) UpdateAmbulanceAttendant(ctx context.Context, a *AmbulanceAttendant) error {
+	_, err := s.ambulanceAttendants.ReplaceOne(ctx, bson.M{"_id": a.ID}, a)
 	return err
 }

@@ -271,36 +271,29 @@ func (h *HospitalDashboardHandler) HandleUpdateRideCondition(w http.ResponseWrit
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	role, _ := r.Context().Value(middleware.UserRoleKey).(string)
 	// ride id from path
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	rideID := ""
 	for i, p := range parts {
-		if p == "rides" && i+1 < len(parts) {
+		if p == "rides" && i+1 < len(parts) && parts[i+1] != "condition" {
 			rideID = parts[i+1]
 			break
 		}
 	}
-	if rideID == "" {
-		var body struct {
-			RideID string `json:"ride_id"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		rideID = body.RideID
+	var req struct {
+		Level  string `json:"level"`
+		Note   string `json:"note"`
+		RideID string `json:"ride_id"`
 	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.RideID != "" {
+		rideID = req.RideID
+	}
+	// Fallback: if rideID still empty, try to get from already decoded req (above)
 	if rideID == "" {
 		response.Error(w, "ride_id required", http.StatusBadRequest)
 		return
-	}
-	var req struct {
-		Level string `json:"level"`
-		Note  string `json:"note"`
-		RideID string `json:"ride_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// try path-based rideID was already extracted, allow empty body level
-	}
-	if req.RideID != "" {
-		rideID = req.RideID
 	}
 	level := strings.ToLower(req.Level)
 	if level == "" {
@@ -316,7 +309,18 @@ func (h *HospitalDashboardHandler) HandleUpdateRideCondition(w http.ResponseWrit
 		response.Error(w, "Ride not found", http.StatusNotFound)
 		return
 	}
-	if rideDoc.UserID != userID {
+	source := "user"
+	if role == "attendant" {
+		source = "attendant"
+		if oid, err := primitive.ObjectIDFromHex(userID); err == nil {
+			if att, _ := h.AuthStore.FindAmbulanceAttendantByID(r.Context(), oid); att != nil && att.AssignedDriverID != nil && rideDoc.DriverID != nil {
+				if att.AssignedDriverID.Hex() != *rideDoc.DriverID {
+					response.Error(w, "Forbidden: not assigned to this ride's driver", http.StatusForbidden)
+					return
+				}
+			}
+		}
+	} else if rideDoc.UserID != userID {
 		response.Error(w, "Forbidden: not ride owner", http.StatusForbidden)
 		return
 	}
@@ -328,7 +332,7 @@ func (h *HospitalDashboardHandler) HandleUpdateRideCondition(w http.ResponseWrit
 		Level:     level,
 		Severity:  ride.ConditionSeverity(level),
 		Note:      req.Note,
-		Source:    "user",
+		Source:    source,
 		CreatedAt: time.Now(),
 	}
 	if err := h.RideStore.AppendConditionUpdate(r.Context(), rideID, upd); err != nil {
@@ -355,4 +359,72 @@ func (h *HospitalDashboardHandler) HandleUpdateRideCondition(w http.ResponseWrit
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"detail": "Condition updated", "level": level})
+}
+
+func (h *HospitalDashboardHandler) HandleAttendantHospitalContact(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RideID string `json:"ride_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RideID == "" {
+		response.Error(w, "ride_id required", http.StatusBadRequest)
+		return
+	}
+	rideDoc, err := h.RideStore.GetRideByID(r.Context(), req.RideID)
+	if err != nil || rideDoc == nil {
+		response.Error(w, "Ride not found", http.StatusNotFound)
+		return
+	}
+	if rideDoc.HospitalID == nil {
+		response.Error(w, "Ride has no hospital", http.StatusBadRequest)
+		return
+	}
+	hid, _ := primitive.ObjectIDFromHex(*rideDoc.HospitalID)
+	hospital, _ := h.HospitalStore.FindByID(r.Context(), hid)
+	md, _ := h.AuthStore.FindHospitalMDByHospitalID(r.Context(), hid)
+	var officialNumber, email, hospitalName string
+	if hospital != nil {
+		hospitalName = hospital.Name["en_US"]
+	}
+	if md != nil {
+		officialNumber = md.OfficialNumber
+		email = md.Email
+		if hospitalName == "" {
+			hospitalName = md.Name
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"hospital_id":     *rideDoc.HospitalID,
+		"hospital_name":   hospitalName,
+		"official_number": officialNumber,
+		"email":           email,
+		"address":         rideDoc.DropAddress,
+	})
+}
+
+func (h *HospitalDashboardHandler) HandleAttendantCurrentRide(w http.ResponseWriter, r *http.Request) {
+	attendantIDStr, _ := r.Context().Value(middleware.UserIDKey).(string)
+	if attendantIDStr != "" {
+		if oid, err := primitive.ObjectIDFromHex(attendantIDStr); err == nil {
+			if att, _ := h.AuthStore.FindAmbulanceAttendantByID(r.Context(), oid); att != nil && att.AssignedDriverID != nil {
+				// Find current ride for the assigned driver
+				ride, _ := h.RideStore.GetCurrentRide(r.Context(), att.AssignedDriverID.Hex(), "driver")
+				if ride != nil {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(map[string]interface{}{"found": true, "ride": ride})
+					return
+				}
+			}
+		}
+	}
+	// Fallback: most recent active ride (for demo / unassigned attendant)
+	statuses := []ride.RideStatus{ride.StatusInProgress, ride.StatusAssigned, ride.StatusArrived, ride.StatusSearching}
+	rides, err := h.RideStore.ListRidesByStatus(r.Context(), statuses, 1, 0)
+	if err != nil || len(rides) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"found": false})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"found": true, "ride": rides[0]})
 }

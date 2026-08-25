@@ -153,3 +153,14 @@ type HospitalReceptionist struct {
 	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
 	JWTToken      *string            `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
 }
+
+type AmbulanceAttendant struct {
+	ID               primitive.ObjectID  `bson:"_id,omitempty" json:"_id"`
+	Name             string              `bson:"name" json:"name"`
+	Mobile           string              `bson:"mobile" json:"mobile"`
+	AssignedDriverID *primitive.ObjectID `bson:"assigned_driver_id,omitempty" json:"assigned_driver_id,omitempty"`
+	JWTToken         *string             `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
+	FCMToken         *string             `bson:"fcm_token,omitempty" json:"fcm_token,omitempty"`
+	Active           bool                `bson:"active" json:"active"`
+	CreatedAt        time.Time           `bson:"created_at" json:"created_at"`
+}

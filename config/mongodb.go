@@ -163,6 +163,12 @@ func EnsureIndexes(client *mongo.Client) error {
 	}); err != nil {
 		return err
 	}
+	if _, err := users.Collection("ambulance_attendants").Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{"mobile", 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{"assigned_driver_id", 1}}},
+	}); err != nil {
+		return err
+	}
 
 	logger.Log.Info().Msg("MongoDB indexes ensured on all collections")
 	return nil
