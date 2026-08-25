@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/logger"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // handleLocationUpdate processes incoming continuous GPS pings from Drivers
@@ -29,12 +29,11 @@ func (m *Manager) handleLocationUpdate(client *Client, payload json.RawMessage) 
 		logger.Log.Error().Err(err).Str("driver_id", client.ID).Msg("Failed to update location store")
 	}
 
-	// Cache driver's vehicle type on first location ping
+	// Cache driver's vehicle type on first location ping (PG: IDs are UUID strings)
 	vType, err := m.LocStore.GetDriverVehicleType(client.ID)
 	if err != nil || vType == "" {
-		objID, convErr := primitive.ObjectIDFromHex(client.ID)
-		if convErr == nil {
-			driver, lookupErr := m.AuthStore.FindDriverByID(context.Background(), objID)
+		if ids.IsValid(client.ID) {
+			driver, lookupErr := m.AuthStore.FindDriverByID(context.Background(), client.ID)
 			if lookupErr == nil && driver != nil {
 				_ = m.LocStore.SetDriverVehicleType(client.ID, driver.VehicleType)
 			}

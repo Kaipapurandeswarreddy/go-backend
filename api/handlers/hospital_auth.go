@@ -10,7 +10,7 @@ import (
 	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"ambigo-backend/internal/ids"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -189,7 +189,7 @@ func (h *HospitalAuthHandler) HandleHospitalMDSignup(w http.ResponseWriter, r *h
 		City:           req.City,
 		Location:       &admin.GeoJSON{Type: "Point", Coordinates: []float64{req.Lng, req.Lat}},
 		Status:         "pending",
-		MDID:           md.ID.Hex(),
+		MDID:           md.ID,
 	}
 	if err := h.PendingStore.Create(r.Context(), pending); err != nil {
 		response.Error(w, "Failed to create pending hospital", http.StatusInternalServerError)
@@ -200,7 +200,7 @@ func (h *HospitalAuthHandler) HandleHospitalMDSignup(w http.ResponseWriter, r *h
 	_ = h.AuthStore.UpdateHospitalMD(r.Context(), md)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Signup submitted for verification", "pending_id": pending.ID.Hex()})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Signup submitted for verification", "pending_id": pending.ID})
 }
 
 // HandleHospitalMDVerifyOTP is mobile OTP login for MD (after approval, before password setup)
@@ -246,16 +246,16 @@ func (h *HospitalAuthHandler) HandleHospitalMDVerifyOTP(w http.ResponseWriter, r
 	needsSetup := md.PasswordHash == nil || *md.PasswordHash == ""
 	var accessToken string
 	if md.HospitalID != nil {
-		accessToken, err = auth.GenerateHospitalAccessToken(md.ID.Hex(), "hospital_md", md.HospitalID.Hex(), h.JWTSecret)
+		accessToken, err = auth.GenerateHospitalAccessToken(md.ID, "hospital_md", *md.HospitalID, h.JWTSecret)
 	} else {
-		accessToken, err = auth.GenerateAccessToken(md.ID.Hex(), "hospital_md", h.JWTSecret)
+		accessToken, err = auth.GenerateAccessToken(md.ID, "hospital_md", h.JWTSecret)
 	}
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 	sessionID := auth.NewSessionID()
-	refreshStr, _, err := h.AuthStore.CreateRefreshToken(r.Context(), md.ID.Hex(), "hospital_md", sessionID, req.DeviceID, req.DeviceName)
+	refreshStr, _, err := h.AuthStore.CreateRefreshToken(r.Context(), md.ID, "hospital_md", sessionID, req.DeviceID, req.DeviceName)
 	if err != nil {
 		response.Error(w, "Failed to create session", http.StatusInternalServerError)
 		return
@@ -305,7 +305,11 @@ func (h *HospitalAuthHandler) HandleHospitalMDSetupPassword(w http.ResponseWrite
 		response.Error(w, "Username already taken", http.StatusBadRequest)
 		return
 	}
-	mdID, _ := primitive.ObjectIDFromHex(mdIDStr)
+	if !ids.IsValid(mdIDStr) {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	mdID := mdIDStr
 	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
 	if err != nil || md == nil {
 		response.Error(w, "MD not found", http.StatusNotFound)
@@ -358,16 +362,16 @@ func (h *HospitalAuthHandler) HandleHospitalMDLoginPassword(w http.ResponseWrite
 	}
 	var accessToken string
 	if md.HospitalID != nil {
-		accessToken, err = auth.GenerateHospitalJWT(md.ID.Hex(), "hospital_md", md.HospitalID.Hex(), h.JWTSecret)
+		accessToken, err = auth.GenerateHospitalJWT(md.ID, "hospital_md", *md.HospitalID, h.JWTSecret)
 	} else {
-		accessToken, err = auth.GenerateJWT(md.ID.Hex(), "hospital_md", "", h.JWTSecret)
+		accessToken, err = auth.GenerateJWT(md.ID, "hospital_md", "", h.JWTSecret)
 	}
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 	sessionID := auth.NewSessionID()
-	refreshStr, _, err := h.AuthStore.CreateRefreshToken(r.Context(), md.ID.Hex(), "hospital_md", sessionID, req.DeviceID, req.DeviceName)
+	refreshStr, _, err := h.AuthStore.CreateRefreshToken(r.Context(), md.ID, "hospital_md", sessionID, req.DeviceID, req.DeviceName)
 	if err != nil {
 		response.Error(w, "Failed to create session", http.StatusInternalServerError)
 		return
@@ -390,7 +394,11 @@ func (h *HospitalAuthHandler) HandleHospitalMDMe(w http.ResponseWriter, r *http.
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	mdID, _ := primitive.ObjectIDFromHex(mdIDStr)
+	if !ids.IsValid(mdIDStr) {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	mdID := mdIDStr
 	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
 	if err != nil || md == nil {
 		response.Error(w, "MD not found", http.StatusNotFound)
@@ -398,7 +406,7 @@ func (h *HospitalAuthHandler) HandleHospitalMDMe(w http.ResponseWriter, r *http.
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":           md.ID.Hex(),
+		"id":           md.ID,
 		"name":         md.Name,
 		"email":        md.Email,
 		"mobile":       md.Mobile,

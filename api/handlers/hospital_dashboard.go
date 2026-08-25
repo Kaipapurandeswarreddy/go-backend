@@ -13,7 +13,7 @@ import (
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/websocket"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"ambigo-backend/internal/ids"
 )
 
 type HospitalDashboardHandler struct {
@@ -148,12 +148,11 @@ func (h *HospitalDashboardHandler) HandleHospitalProfile(w http.ResponseWriter, 
 		response.Error(w, "Hospital not linked", http.StatusBadRequest)
 		return
 	}
-	objID, err := primitive.ObjectIDFromHex(hid)
-	if err != nil {
+	if !ids.IsValid(hid) {
 		response.Error(w, "Invalid hospital ID", http.StatusBadRequest)
 		return
 	}
-	hospital, err := h.HospitalStore.FindByID(r.Context(), objID)
+	hospital, err := h.HospitalStore.FindByID(r.Context(), hid)
 	if err != nil || hospital == nil {
 		response.Error(w, "Hospital not found", http.StatusNotFound)
 		return
@@ -168,8 +167,7 @@ func (h *HospitalDashboardHandler) HandleUpdateHospitalProfile(w http.ResponseWr
 		response.Error(w, "Hospital not linked", http.StatusBadRequest)
 		return
 	}
-	objID, err := primitive.ObjectIDFromHex(hid)
-	if err != nil {
+	if !ids.IsValid(hid) {
 		response.Error(w, "Invalid hospital ID", http.StatusBadRequest)
 		return
 	}
@@ -182,7 +180,7 @@ func (h *HospitalDashboardHandler) HandleUpdateHospitalProfile(w http.ResponseWr
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	hospital, err := h.HospitalStore.FindByID(r.Context(), objID)
+	hospital, err := h.HospitalStore.FindByID(r.Context(), hid)
 	if err != nil || hospital == nil {
 		response.Error(w, "Hospital not found", http.StatusNotFound)
 		return
@@ -231,7 +229,7 @@ func (h *HospitalDashboardHandler) HandleHospitalAnalytics(w http.ResponseWriter
 	nameByID := map[string]string{}
 	if ambTypes, err := h.AdminStore.ListAmbulanceTypes(r.Context()); err == nil {
 		for _, t := range ambTypes {
-			nameByID[t.ID.Hex()] = t.Name
+			nameByID[t.ID] = t.Name
 		}
 	}
 	byCondition := map[string]int64{"stable": 0, "serious": 0, "critical": 0, "worsening": 0}
@@ -312,9 +310,9 @@ func (h *HospitalDashboardHandler) HandleUpdateRideCondition(w http.ResponseWrit
 	source := "user"
 	if role == "attendant" {
 		source = "attendant"
-		if oid, err := primitive.ObjectIDFromHex(userID); err == nil {
-			if att, _ := h.AuthStore.FindAmbulanceAttendantByID(r.Context(), oid); att != nil && att.AssignedDriverID != nil && rideDoc.DriverID != nil {
-				if att.AssignedDriverID.Hex() != *rideDoc.DriverID {
+		if ids.IsValid(userID) {
+			if att, _ := h.AuthStore.FindAmbulanceAttendantByID(r.Context(), userID); att != nil && att.AssignedDriverID != nil && rideDoc.DriverID != nil {
+				if *att.AssignedDriverID != *rideDoc.DriverID {
 					response.Error(w, "Forbidden: not assigned to this ride's driver", http.StatusForbidden)
 					return
 				}
@@ -378,7 +376,7 @@ func (h *HospitalDashboardHandler) HandleAttendantHospitalContact(w http.Respons
 		response.Error(w, "Ride has no hospital", http.StatusBadRequest)
 		return
 	}
-	hid, _ := primitive.ObjectIDFromHex(*rideDoc.HospitalID)
+	hid := *rideDoc.HospitalID
 	hospital, _ := h.HospitalStore.FindByID(r.Context(), hid)
 	md, _ := h.AuthStore.FindHospitalMDByHospitalID(r.Context(), hid)
 	var officialNumber, email, hospitalName string
@@ -405,10 +403,10 @@ func (h *HospitalDashboardHandler) HandleAttendantHospitalContact(w http.Respons
 func (h *HospitalDashboardHandler) HandleAttendantCurrentRide(w http.ResponseWriter, r *http.Request) {
 	attendantIDStr, _ := r.Context().Value(middleware.UserIDKey).(string)
 	if attendantIDStr != "" {
-		if oid, err := primitive.ObjectIDFromHex(attendantIDStr); err == nil {
-			if att, _ := h.AuthStore.FindAmbulanceAttendantByID(r.Context(), oid); att != nil && att.AssignedDriverID != nil {
+		if ids.IsValid(attendantIDStr) {
+			if att, _ := h.AuthStore.FindAmbulanceAttendantByID(r.Context(), attendantIDStr); att != nil && att.AssignedDriverID != nil {
 				// Find current ride for the assigned driver
-				ride, _ := h.RideStore.GetCurrentRide(r.Context(), att.AssignedDriverID.Hex(), "driver")
+				ride, _ := h.RideStore.GetCurrentRide(r.Context(), *att.AssignedDriverID, "driver")
 				if ride != nil {
 					w.Header().Set("Content-Type", "application/json")
 					json.NewEncoder(w).Encode(map[string]interface{}{"found": true, "ride": ride})

@@ -2,41 +2,44 @@ package admin
 
 import (
 	"context"
+	"errors"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// CounterStore persists monotonic integer counters in Postgres.
+//
+// Table: counters(id TEXT PRIMARY KEY, value INT NOT NULL)
+// Uses INSERT ... ON CONFLICT upsert to atomically increment.
 type CounterStore struct {
-	counters *mongo.Collection
+	pool *pgxpool.Pool
 }
 
-func NewCounterStore(db *mongo.Database) *CounterStore {
-	return &CounterStore{
-		counters: db.Collection("counters"),
-	}
+// NewCounterStore creates a CounterStore backed by a pgxpool.Pool.
+func NewCounterStore(pool *pgxpool.Pool) *CounterStore {
+	return &CounterStore{pool: pool}
 }
 
+// IncrementCounter atomically increments the counter identified by id.
+// If the row does not exist it is created with value 1.
 func (s *CounterStore) IncrementCounter(ctx context.Context, id string) error {
-	filter := bson.M{"_id": id}
-	update := bson.M{"$inc": bson.M{"value": 1}}
-	opts := options.Update().SetUpsert(true)
-	_, err := s.counters.UpdateOne(ctx, filter, update, opts)
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO counters(id, value) VALUES($1, 1) ON CONFLICT (id) DO UPDATE SET value = counters.value + 1`,
+		id,
+	)
 	return err
 }
 
+// GetCounter returns the current value for id, or 0 if no row exists.
 func (s *CounterStore) GetCounter(ctx context.Context, id string) (int, error) {
-	filter := bson.M{"_id": id}
-	var result struct {
-		Value int `bson:"value"`
-	}
-	err := s.counters.FindOne(ctx, filter).Decode(&result)
+	var value int
+	err := s.pool.QueryRow(ctx, `SELECT value FROM counters WHERE id=$1`, id).Scan(&value)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, nil
 		}
 		return 0, err
 	}
-	return result.Value, nil
+	return value, nil
 }

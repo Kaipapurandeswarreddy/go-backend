@@ -10,10 +10,10 @@ import (
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/referral"
 	"ambigo-backend/internal/requestid"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 var mobileRegex = regexp.MustCompile(`^[6-9]\d{9}$`)
@@ -177,29 +177,29 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		// Generate a personal referral code for this new user
 		if h.ReferralService != nil {
 			if _, err := h.ReferralService.GetOrCreateUserCode(r.Context(), user.ID); err != nil {
-				logger.Log.Error().Err(err).Str("user_id", user.ID.Hex()).Msg("Failed to generate referral code for new user")
+				logger.Log.Error().Err(err).Str("user_id", user.ID).Msg("Failed to generate referral code for new user")
 			}
 		}
 		h.EventBus.PublishEvent(eventbus.ChannelAuthUserRegistered, eventbus.AuthUserRegisteredPayload{
-			UserID: user.ID.Hex(), Mobile: payload.Mobile, Name: payload.Name, RequestID: reqID,
+			UserID: user.ID, Mobile: payload.Mobile, Name: payload.Name, RequestID: reqID,
 		})
 		// V20: Process referral after user creation
 		if payload.ReferralCode != "" && h.ReferralService != nil {
-			if err := h.ReferralService.ProcessSignupReferral(r.Context(), user.ID.Hex(), "user", payload.ReferralCode); err != nil {
-				logger.Log.Error().Err(err).Str("user_id", user.ID.Hex()).Str("code", payload.ReferralCode).Msg("Failed to process signup referral")
+			if err := h.ReferralService.ProcessSignupReferral(r.Context(), user.ID, "user", payload.ReferralCode); err != nil {
+				logger.Log.Error().Err(err).Str("user_id", user.ID).Str("code", payload.ReferralCode).Msg("Failed to process signup referral")
 			}
 		}
 	}
 
 	// V8: Generate access token + refresh token
-	accessToken, err := auth.GenerateAccessToken(user.ID.Hex(), "user", h.JWTSecret)
+	accessToken, err := auth.GenerateAccessToken(user.ID, "user", h.JWTSecret)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 
 	sessionID := auth.NewSessionID()
-	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), user.ID.Hex(), "user", sessionID, payload.DeviceID, payload.DeviceName)
+	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), user.ID, "user", sessionID, payload.DeviceID, payload.DeviceName)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
@@ -208,7 +208,7 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 	h.AuthStore.UpdateUserJWT(r.Context(), user.ID, accessToken)
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthUserLoggedIn, eventbus.AuthUserLoggedInPayload{
-		UserID: user.ID.Hex(), Mobile: payload.Mobile, RequestID: reqID,
+		UserID: user.ID, Mobile: payload.Mobile, RequestID: reqID,
 	})
 
 	response.Success(w, http.StatusOK, map[string]string{
@@ -304,7 +304,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	role := "driver"
-	driverID := primitive.NilObjectID
+	driverID := ""
 	reqID := requestid.FromContext(r.Context())
 
 	if driver != nil {
@@ -343,12 +343,12 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 				// only after approval, so we defer full referral processing.
 			}
 			h.EventBus.PublishEvent(eventbus.ChannelAuthDriverCreated, eventbus.AuthDriverCreatedPayload{
-				DriverID: unverifiedDriver.ID.Hex(), Mobile: payload.Mobile, Name: payload.Name, RequestID: reqID,
+				DriverID: unverifiedDriver.ID, Mobile: payload.Mobile, Name: payload.Name, RequestID: reqID,
 			})
 			// V20: Process referral after driver creation
 			if payload.ReferralCode != "" && h.ReferralService != nil {
-				if err := h.ReferralService.ProcessSignupReferral(r.Context(), unverifiedDriver.ID.Hex(), "driver", payload.ReferralCode); err != nil {
-					logger.Log.Error().Err(err).Str("driver_id", unverifiedDriver.ID.Hex()).Str("code", payload.ReferralCode).Msg("Failed to process driver signup referral")
+				if err := h.ReferralService.ProcessSignupReferral(r.Context(), unverifiedDriver.ID, "driver", payload.ReferralCode); err != nil {
+					logger.Log.Error().Err(err).Str("driver_id", unverifiedDriver.ID).Str("code", payload.ReferralCode).Msg("Failed to process driver signup referral")
 				}
 			}
 		}
@@ -356,19 +356,19 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Revoke all previous sessions so only this device stays logged in
-	revokedCount, err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID.Hex(), "session_replaced")
+	revokedCount, err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID, "session_replaced")
 	if err != nil {
-		logger.Log.Error().Err(err).Str("driver_id", driverID.Hex()).Msg("Failed to revoke old driver sessions")
+		logger.Log.Error().Err(err).Str("driver_id", driverID).Msg("Failed to revoke old driver sessions")
 	}
 
-	accessToken, err := auth.GenerateAccessToken(driverID.Hex(), role, h.JWTSecret)
+	accessToken, err := auth.GenerateAccessToken(driverID, role, h.JWTSecret)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 
 	sessionID := auth.NewSessionID()
-	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), driverID.Hex(), role, sessionID, payload.DeviceID, payload.DeviceName)
+	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), driverID, role, sessionID, payload.DeviceID, payload.DeviceName)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
@@ -381,14 +381,14 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthDriverLoggedIn, eventbus.AuthDriverLoggedInPayload{
-		DriverID: driverID.Hex(), Mobile: payload.Mobile, Role: role, RequestID: reqID,
+		DriverID: driverID, Mobile: payload.Mobile, Role: role, RequestID: reqID,
 	})
 
 	// A prior session was replaced by this login — notify all live connections
 	// instantly so the old device is kicked without waiting for token expiry.
 	if revokedCount > 0 {
 		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
-			UserID: driverID.Hex(), Role: role, SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
+			UserID: driverID, Role: role, SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
 		})
 	}
 
@@ -448,16 +448,16 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Attempt 2: Token is revoked — follow the superseded_by chain (only when gated)
-	if h.AllowStaleRefreshChain && tokenDoc.SupersededBy != primitive.NilObjectID {
+	if h.AllowStaleRefreshChain && tokenDoc.SupersededBy != nil && !ids.IsZero(*tokenDoc.SupersededBy) {
 		liveToken, err := h.AuthStore.FindLiveInChain(r.Context(), tokenDoc)
 		if err != nil {
 			if err == auth.ErrBrokenChain || err == auth.ErrCycleDetected {
-				logger.Log.Error().Err(err).Str("token_id", tokenDoc.ID.Hex()).Msg("Token chain corrupted")
+				logger.Log.Error().Err(err).Str("token_id", tokenDoc.ID).Msg("Token chain corrupted")
 				response.Error(w, "Internal error", http.StatusInternalServerError)
 				return
 			}
 			if err != auth.ErrNoLiveToken {
-				logger.Log.Error().Err(err).Str("token_id", tokenDoc.ID.Hex()).Msg("FindLiveInChain failed")
+				logger.Log.Error().Err(err).Str("token_id", tokenDoc.ID).Msg("FindLiveInChain failed")
 				response.Error(w, "Internal error", http.StatusInternalServerError)
 				return
 			}
@@ -506,16 +506,15 @@ func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		logger.Log.Error().Err(err).Str("user_id", userID).Msg("Failed to revoke all refresh tokens on logout")
 	}
 
-	// Clear stored JWT
-	objID, err := primitive.ObjectIDFromHex(userID)
-	if err == nil {
+	// Clear stored JWT (PG: ids are UUID strings; Clear*JWT now takes string)
+	if ids.IsValid(userID) {
 		switch role {
 		case "user":
-			_ = h.AuthStore.ClearUserJWT(r.Context(), objID)
+			_ = h.AuthStore.ClearUserJWT(r.Context(), userID)
 		case "driver":
-			_ = h.AuthStore.ClearDriverJWT(r.Context(), objID)
+			_ = h.AuthStore.ClearDriverJWT(r.Context(), userID)
 		case "unvrf_driver":
-			_ = h.AuthStore.ClearUnverifiedDriverJWT(r.Context(), objID)
+			_ = h.AuthStore.ClearUnverifiedDriverJWT(r.Context(), userID)
 		}
 	}
 

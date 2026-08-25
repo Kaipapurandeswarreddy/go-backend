@@ -16,7 +16,7 @@ import (
 	"ambigo-backend/internal/translation"
 	"golang.org/x/crypto/bcrypt"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"ambigo-backend/internal/ids"
 )
 
 type AdminHandler struct {
@@ -79,7 +79,7 @@ func (h *AdminHandler) HandleAdminLogin(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	token, err := auth.GenerateJWT(adminUser.ID.Hex(), "admin", adminUser.Role, h.JWTSecret)
+	token, err := auth.GenerateJWT(adminUser.ID, "admin", adminUser.Role, h.JWTSecret)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
@@ -171,13 +171,13 @@ func (h *AdminHandler) HandleAdminMobileVerifyOTP(w http.ResponseWriter, r *http
 		return
 	}
 
-	token, err := auth.GenerateJWT(adminUser.ID.Hex(), "admin", adminUser.Role, h.JWTSecret)
+	token, err := auth.GenerateJWT(adminUser.ID, "admin", adminUser.Role, h.JWTSecret)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 
-	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), adminUser.ID.Hex(), "admin", auth.NewSessionID(), "", "")
+	refreshToken, _, err := h.AuthStore.CreateRefreshToken(r.Context(), adminUser.ID, "admin", auth.NewSessionID(), "", "")
 	if err != nil {
 		logger.Log.Error().Err(err).Msg("Admin refresh token creation failed")
 	}
@@ -208,13 +208,12 @@ func (h *AdminHandler) HandleAdminPasswordChange(w http.ResponseWriter, r *http.
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(adminIDStr)
-	if err != nil {
+	if !ids.IsValid(adminIDStr) {
 		response.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}
 
-	adminUser, err := h.Store.FindAdminByID(r.Context(), objID)
+	adminUser, err := h.Store.FindAdminByID(r.Context(), adminIDStr)
 	if err != nil || adminUser == nil {
 		response.Error(w, "Admin not found", http.StatusNotFound)
 		return
@@ -231,7 +230,7 @@ func (h *AdminHandler) HandleAdminPasswordChange(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if err := h.Store.UpdateAdminPassword(r.Context(), objID, string(hashed)); err != nil {
+	if err := h.Store.UpdateAdminPassword(r.Context(), adminIDStr, string(hashed)); err != nil {
 		response.Error(w, "Failed to update password", http.StatusInternalServerError)
 		return
 	}
@@ -257,13 +256,13 @@ func (h *AdminHandler) HandleCreateAmbulanceType(w http.ResponseWriter, r *http.
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminAmbTypeCreated, eventbus.AdminAmbTypePayload{
-		AmbTypeID: amb.ID.Hex(), Name: amb.Name, RequestID: reqID,
+		AmbTypeID: amb.ID, Name: amb.Name, RequestID: reqID,
 	})
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"detail": "Created",
-		"id":     amb.ID.Hex(),
+		"id":     amb.ID,
 	})
 }
 
@@ -281,13 +280,12 @@ func (h *AdminHandler) HandleListAmbulanceTypes(w http.ResponseWriter, r *http.R
 func (h *AdminHandler) HandleDeleteAmbulanceType(w http.ResponseWriter, r *http.Request) {
 	reqID := requestid.FromContext(r.Context())
 	idStr := r.PathValue("id")
-	objID, err := primitive.ObjectIDFromHex(idStr)
-	if err != nil {
+	if !ids.IsValid(idStr) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	err = h.Store.DeleteAmbulanceType(r.Context(), objID)
+	err := h.Store.DeleteAmbulanceType(r.Context(), idStr)
 	if err != nil {
 		response.Error(w, "Failed to delete: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -336,13 +334,12 @@ func (h *AdminHandler) HandleGetDriverDetails(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	driver, err := h.AuthStore.FindDriverByID(r.Context(), objID)
+	driver, err := h.AuthStore.FindDriverByID(r.Context(), req.ID)
 	if err != nil {
 		response.Error(w, "Internal error", http.StatusInternalServerError)
 		return
@@ -374,7 +371,7 @@ func (h *AdminHandler) HandleAddDriver(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthDriverCreated, eventbus.AuthDriverCreatedPayload{
-		DriverID: driver.ID.Hex(), Name: driver.Name, Mobile: driver.Mobile, RequestID: reqID,
+		DriverID: driver.ID, Name: driver.Name, Mobile: driver.Mobile, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Driver added successfully"})
@@ -389,7 +386,7 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	if driver.ID.IsZero() {
+	if ids.IsZero(driver.ID) {
 		response.Error(w, "ID is required", http.StatusBadRequest)
 		return
 	}
@@ -400,7 +397,7 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthDriverLoggedIn, eventbus.AuthDriverLoggedInPayload{
-		DriverID: driver.ID.Hex(), Mobile: driver.Mobile, RequestID: reqID,
+		DriverID: driver.ID, Mobile: driver.Mobile, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Driver updated successfully"})
@@ -416,13 +413,12 @@ func (h *AdminHandler) HandleDeleteDriver(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.AuthStore.DeleteDriver(r.Context(), objID); err != nil {
+	if err := h.AuthStore.DeleteDriver(r.Context(), req.ID); err != nil {
 		response.Error(w, "Failed to delete driver", http.StatusInternalServerError)
 		return
 	}
@@ -466,13 +462,12 @@ func (h *AdminHandler) HandleFetchUnverifiedDriver(w http.ResponseWriter, r *htt
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	driver, err := h.AuthStore.FindUnverifiedDriverByID(r.Context(), objID)
+	driver, err := h.AuthStore.FindUnverifiedDriverByID(r.Context(), req.ID)
 	if err != nil {
 		response.Error(w, "Internal error", http.StatusInternalServerError)
 		return
@@ -494,7 +489,7 @@ func (h *AdminHandler) HandleAcceptDriver(w http.ResponseWriter, r *http.Request
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	if driver.ID.IsZero() {
+	if ids.IsZero(driver.ID) {
 		response.Error(w, "Driver ID is required", http.StatusBadRequest)
 		return
 	}
@@ -505,12 +500,12 @@ func (h *AdminHandler) HandleAcceptDriver(w http.ResponseWriter, r *http.Request
 	}
 
 	// Revoke old refresh tokens so the driver must re-login with role "driver"
-	if _, revokeErr := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driver.ID.Hex(), "driver_approved"); revokeErr != nil {
-		logger.Log.Error().Err(revokeErr).Str("driver_id", driver.ID.Hex()).Msg("Failed to revoke driver refresh tokens after approval")
+	if _, revokeErr := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driver.ID, "driver_approved"); revokeErr != nil {
+		logger.Log.Error().Err(revokeErr).Str("driver_id", driver.ID).Msg("Failed to revoke driver refresh tokens after approval")
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthDriverApproved, eventbus.AuthDriverApprovedPayload{
-		DriverID: driver.ID.Hex(), Name: driver.Name, Mobile: driver.Mobile, RequestID: reqID,
+		DriverID: driver.ID, Name: driver.Name, Mobile: driver.Mobile, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Driver Approved"})
@@ -529,13 +524,12 @@ func (h *AdminHandler) HandleRejectDriver(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.DriverID)
-	if err != nil {
+	if !ids.IsValid(req.DriverID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.AuthStore.RejectUnverifiedDriver(r.Context(), objID, req.ErrorMessage); err != nil {
+	if err := h.AuthStore.RejectUnverifiedDriver(r.Context(), req.DriverID, req.ErrorMessage); err != nil {
 		response.Error(w, "Failed to reject driver", http.StatusInternalServerError)
 		return
 	}
@@ -600,13 +594,12 @@ func (h *AdminHandler) HandleAdminFCMUpdate(w http.ResponseWriter, r *http.Reque
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	objID, err := primitive.ObjectIDFromHex(adminIDStr)
-	if err != nil {
+	if !ids.IsValid(adminIDStr) {
 		response.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}
 
-	if err := h.Store.UpdateAdminFCM(r.Context(), objID, req.FCMToken); err != nil {
+	if err := h.Store.UpdateAdminFCM(r.Context(), adminIDStr, req.FCMToken); err != nil {
 		response.Error(w, "Failed to update FCM token", http.StatusInternalServerError)
 		return
 	}
@@ -627,13 +620,12 @@ func (h *AdminHandler) HandleAdminLocationUpdate(w http.ResponseWriter, r *http.
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	objID, err := primitive.ObjectIDFromHex(adminIDStr)
-	if err != nil {
+	if !ids.IsValid(adminIDStr) {
 		response.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}
 
-	if err := h.Store.UpdateAdminLocation(r.Context(), objID, &loc); err != nil {
+	if err := h.Store.UpdateAdminLocation(r.Context(), adminIDStr, &loc); err != nil {
 		response.Error(w, "Failed to update location", http.StatusInternalServerError)
 		return
 	}
@@ -722,7 +714,7 @@ func (h *AdminHandler) HandleUpdateAmbulanceType(w http.ResponseWriter, r *http.
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	if amb.ID.IsZero() {
+	if ids.IsZero(amb.ID) {
 		response.Error(w, "ID is required", http.StatusBadRequest)
 		return
 	}
@@ -733,7 +725,7 @@ func (h *AdminHandler) HandleUpdateAmbulanceType(w http.ResponseWriter, r *http.
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminAmbTypeCreated, eventbus.AdminAmbTypePayload{
-		AmbTypeID: amb.ID.Hex(), Name: amb.Name, RequestID: reqID,
+		AmbTypeID: amb.ID, Name: amb.Name, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Ambulance type updated"})
@@ -812,7 +804,7 @@ func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminHospitalAdded, eventbus.AdminHospitalPayload{
-		HospitalID: hospital.ID.Hex(), Name: hospital.Name["en_US"], RequestID: reqID,
+		HospitalID: hospital.ID, Name: hospital.Name["en_US"], RequestID: reqID,
 	})
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital added successfully"})
 }
@@ -833,8 +825,7 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
@@ -845,7 +836,7 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 	}
 
 	hospital := admin.Hospital{
-		ID:      objID,
+		ID:      req.ID,
 		Name:    translation.Map{"en_US": req.Name},
 		Address: translation.Map{"en_US": req.Address},
 		City:    translation.Map{"en_US": req.City},
@@ -898,13 +889,12 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.HospitalID)
-	if err != nil {
+	if !ids.IsValid(req.HospitalID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.HospitalStore.DeleteHospital(r.Context(), objID); err != nil {
+	if err := h.HospitalStore.DeleteHospital(r.Context(), req.HospitalID); err != nil {
 		response.Error(w, "Hospital delete failed", http.StatusBadRequest)
 		return
 	}
@@ -959,7 +949,7 @@ func (h *AdminHandler) HandleAddHospitalCity(w http.ResponseWriter, r *http.Requ
 		response.Error(w, "City add failed", http.StatusBadRequest)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Service area added successfully", "_id": city.ID.Hex()})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Service area added successfully", "_id": city.ID})
 }
 
 func (h *AdminHandler) HandleUpdateHospitalCity(w http.ResponseWriter, r *http.Request) {
@@ -976,14 +966,13 @@ func (h *AdminHandler) HandleUpdateHospitalCity(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
 	city := &admin.HospitalCity{
-		ID:      objID,
+		ID:      req.ID,
 		Name:    req.Name,
 		Lat:     req.Lat,
 		Lng:     req.Lng,
@@ -1009,13 +998,12 @@ func (h *AdminHandler) HandleDeleteHospitalCity(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.HospitalCityStore.Delete(r.Context(), objID); err != nil {
+	if err := h.HospitalCityStore.Delete(r.Context(), req.ID); err != nil {
 		response.Error(w, "City delete failed", http.StatusBadRequest)
 		return
 	}
@@ -1047,12 +1035,11 @@ func (h *AdminHandler) HandleFetchPendingHospital(w http.ResponseWriter, r *http
 	if !response.Validate(w, &req) {
 		return
 	}
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
-	p, err := h.PendingHospitalStore.FindByID(r.Context(), objID)
+	p, err := h.PendingHospitalStore.FindByID(r.Context(), req.ID)
 	if err != nil || p == nil {
 		response.Error(w, "Pending hospital not found", http.StatusNotFound)
 		return
@@ -1072,12 +1059,11 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 	if !response.Validate(w, &req) {
 		return
 	}
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
-	pending, err := h.PendingHospitalStore.FindByID(r.Context(), objID)
+	pending, err := h.PendingHospitalStore.FindByID(r.Context(), req.ID)
 	if err != nil || pending == nil {
 		response.Error(w, "Pending hospital not found", http.StatusNotFound)
 		return
@@ -1111,12 +1097,12 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 	}
 	// Update pending status
 	reviewerID, _ := r.Context().Value(middleware.UserIDKey).(string)
-	_ = h.PendingHospitalStore.Approve(r.Context(), objID, reviewerID)
+	_ = h.PendingHospitalStore.Approve(r.Context(), req.ID, reviewerID)
 
 	// Link MD to hospital and activate
 	if pending.MDID != "" {
-		if mdID, err := primitive.ObjectIDFromHex(pending.MDID); err == nil {
-			md, _ := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
+		if ids.IsValid(pending.MDID) {
+			md, _ := h.AuthStore.FindHospitalMDByID(r.Context(), pending.MDID)
 			if md != nil {
 				md.HospitalID = &hospital.ID
 				md.Status = "active"
@@ -1126,7 +1112,7 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital approved", "hospital_id": hospital.ID.Hex()})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital approved", "hospital_id": hospital.ID})
 }
 
 func (h *AdminHandler) HandleRejectPendingHospital(w http.ResponseWriter, r *http.Request) {
@@ -1141,25 +1127,24 @@ func (h *AdminHandler) HandleRejectPendingHospital(w http.ResponseWriter, r *htt
 	if !response.Validate(w, &req) {
 		return
 	}
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
-	pending, err := h.PendingHospitalStore.FindByID(r.Context(), objID)
+	pending, err := h.PendingHospitalStore.FindByID(r.Context(), req.ID)
 	if err != nil || pending == nil {
 		response.Error(w, "Pending hospital not found", http.StatusNotFound)
 		return
 	}
 	reviewerID, _ := r.Context().Value(middleware.UserIDKey).(string)
-	if err := h.PendingHospitalStore.Reject(r.Context(), objID, reviewerID, req.ErrorMessage); err != nil {
+	if err := h.PendingHospitalStore.Reject(r.Context(), req.ID, reviewerID, req.ErrorMessage); err != nil {
 		response.Error(w, "Reject failed", http.StatusInternalServerError)
 		return
 	}
 	// Also mark MD as rejected
 	if pending.MDID != "" {
-		if mdID, err := primitive.ObjectIDFromHex(pending.MDID); err == nil {
-			md, _ := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
+		if ids.IsValid(pending.MDID) {
+			md, _ := h.AuthStore.FindHospitalMDByID(r.Context(), pending.MDID)
 			if md != nil {
 				md.Status = "rejected"
 				_ = h.AuthStore.UpdateHospitalMD(r.Context(), md)

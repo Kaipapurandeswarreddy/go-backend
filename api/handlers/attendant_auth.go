@@ -94,14 +94,14 @@ func (h *AttendantAuthHandler) HandleAttendantVerifyOTP(w http.ResponseWriter, r
 		}
 	}
 	// Single session like driver
-	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), att.ID.Hex(), "session_replaced")
-	accessToken, err := auth.GenerateAccessToken(att.ID.Hex(), "attendant", h.JWTSecret)
+	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), att.ID, "session_replaced")
+	accessToken, err := auth.GenerateAccessToken(att.ID, "attendant", h.JWTSecret)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 	sessionID := auth.NewSessionID()
-	refreshStr, _, err := h.AuthStore.CreateRefreshToken(r.Context(), att.ID.Hex(), "attendant", sessionID, req.DeviceID, req.DeviceName)
+	refreshStr, _, err := h.AuthStore.CreateRefreshToken(r.Context(), att.ID, "attendant", sessionID, req.DeviceID, req.DeviceName)
 	if err != nil {
 		response.Error(w, "Failed to create session", http.StatusInternalServerError)
 		return

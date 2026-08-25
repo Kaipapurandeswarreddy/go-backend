@@ -2,76 +2,75 @@ package auth
 
 import (
 	"time"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type GeoJSONPoint struct {
-	Type        string    `bson:"type" json:"type"`
-	Coordinates []float64 `bson:"coordinates" json:"coordinates"`
+	Type        string    `db:"type" json:"type"`
+	Coordinates []float64 `db:"coordinates" json:"coordinates"`
 }
 
 type User struct {
-	ID             primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	Name           string             `bson:"name" json:"name"`
-	Mobile         string             `bson:"mobile" json:"mobile"`
-	ReferralCode   string             `bson:"referral_code" json:"referral_code"`
-	MyReferralCode string             `bson:"my_referral_code,omitempty" json:"my_referral_code,omitempty"`
-	Location       *GeoJSONPoint      `bson:"location,omitempty" json:"location,omitempty"`
-	FCMToken       *string            `bson:"fcm_token,omitempty" json:"fcm_token,omitempty"`
-	JWTToken       *string            `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
+	ID             string        `db:"id" json:"_id"`
+	Name           string        `db:"name" json:"name"`
+	Mobile         string        `db:"mobile" json:"mobile"`
+	ReferralCode   string        `db:"referral_code" json:"referral_code"`
+	MyReferralCode string        `db:"my_referral_code" json:"my_referral_code,omitempty"`
+	Location       *GeoJSONPoint `db:"location" json:"location,omitempty"`
+	FCMToken       *string       `db:"fcm_token" json:"fcm_token,omitempty"`
+	JWTToken       *string       `db:"jwt_token" json:"jwt_token,omitempty"`
 }
 
 type DriverDetails struct {
-	POIImage  string `bson:"poi_image" json:"poi_image"`
-	RCNumber  string `bson:"rc_number" json:"rc_number"`
-	RCImage   string `bson:"rc_image" json:"rc_image"`
-	DLNumber  string `bson:"dl_number" json:"dl_number"`
-	DLImage   string `bson:"dl_image" json:"dl_image"`
-	AmbFront  string `bson:"amb_front,omitempty" json:"amb_front,omitempty"`
-	AmbInside string `bson:"amb_inside,omitempty" json:"amb_inside,omitempty"`
+	POIImage  string `db:"poi_image" json:"poi_image"`
+	RCNumber  string `db:"rc_number" json:"rc_number"`
+	RCImage   string `db:"rc_image" json:"rc_image"`
+	DLNumber  string `db:"dl_number" json:"dl_number"`
+	DLImage   string `db:"dl_image" json:"dl_image"`
+	AmbFront  string `db:"amb_front" json:"amb_front,omitempty"`
+	AmbInside string `db:"amb_inside" json:"amb_inside,omitempty"`
 }
 
 type WalletDetails struct {
-	AccountNo string `bson:"account_no" json:"account_no" validate:"required"`
-	BenfName  string `bson:"benf_name" json:"benf_name" validate:"required"`
-	IFSCCode  string `bson:"ifsc_code" json:"ifsc_code" validate:"required"`
-	BenfID    string `bson:"benf_id" json:"benf_id"`
+	AccountNo string `db:"account_no" json:"account_no" validate:"required"`
+	BenfName  string `db:"benf_name" json:"benf_name" validate:"required"`
+	IFSCCode  string `db:"ifsc_code" json:"ifsc_code" validate:"required"`
+	BenfID    string `db:"benf_id" json:"benf_id"`
 }
 
 type Driver struct {
-	ID                 primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	Name               string             `bson:"name" json:"name" validate:"required"`
-	Mobile             string             `bson:"mobile" json:"mobile" validate:"required"`
-	Photo              string             `bson:"photo" json:"photo"`
-	VehicleType        string             `bson:"vehicle_type" json:"vehicle_type" validate:"required"`
-	VehicleReg         string             `bson:"vehicle_registration" json:"vehicle_registration" validate:"required"`
-	WalletDetails      WalletDetails      `bson:"wallet_details" json:"wallet_details"`
-	WalletBalance      float64            `bson:"wallet_balance" json:"wallet_balance"`
-	ReferralCode       string             `bson:"referral_code" json:"referral_code"`
-	MyReferralCode     string             `bson:"my_referral_code,omitempty" json:"my_referral_code,omitempty"`
-	Location           *GeoJSONPoint      `bson:"location,omitempty" json:"location,omitempty"`
-	FCMToken           *string            `bson:"fcm_token,omitempty" json:"fcm_token,omitempty"`
-	JWTToken           *string            `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
-	LastLocationUpdate *time.Time         `bson:"last_location_update,omitempty" json:"last_location_update,omitempty"`
-	Details            *DriverDetails     `bson:"details,omitempty" json:"details,omitempty"`
+	ID                 string         `db:"id" json:"_id"`
+	Name               string         `db:"name" json:"name" validate:"required"`
+	Mobile             string         `db:"mobile" json:"mobile" validate:"required"`
+	Photo              string         `db:"photo" json:"photo"`
+	VehicleType        string         `db:"vehicle_type" json:"vehicle_type" validate:"required"`
+	VehicleReg         string         `db:"vehicle_registration" json:"vehicle_registration" validate:"required"`
+	WalletDetails      WalletDetails  `db:"wallet_details" json:"wallet_details"`
+	WalletBalance      float64        `db:"wallet_balance" json:"wallet_balance"`
+	ReferralCode       string         `db:"referral_code" json:"referral_code"`
+	MyReferralCode     string         `db:"my_referral_code" json:"my_referral_code,omitempty"`
+	Location           *GeoJSONPoint  `db:"location" json:"location,omitempty"`
+	FCMToken           *string        `db:"fcm_token" json:"fcm_token,omitempty"`
+	JWTToken           *string        `db:"jwt_token" json:"jwt_token,omitempty"`
+	LastLocationUpdate *time.Time     `db:"last_location_update" json:"last_location_update,omitempty"`
+	Details            *DriverDetails `db:"details" json:"details,omitempty"`
 }
 
 type UnverifiedDriver struct {
-	ID                 primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	Name               string             `bson:"name" json:"name" validate:"required"`
-	Mobile             string             `bson:"mobile" json:"mobile" validate:"required"`
-	PortraitImage      string             `bson:"portrait_image" json:"portrait_image"`
-	POIImage           string             `bson:"poi_image" json:"poi_image"`
-	DLImage            string             `bson:"dl_image" json:"dl_image"`
-	RCImage            string             `bson:"rc_image" json:"rc_image"`
-	AmbFront           string             `bson:"amb_front" json:"amb_front"`
-	AmbInside          string             `bson:"amb_inside" json:"amb_inside"`
-	VehicleType        string             `bson:"vehicle_type" json:"vehicle_type"`
-	UnderProgress      bool               `bson:"under_progress" json:"under_progress"`
-	ErrorMessage       *string            `bson:"error_message,omitempty" json:"error_message,omitempty"`
-	FCMToken           *string            `bson:"fcm_token,omitempty" json:"fcm_token,omitempty"`
-	JWTToken           *string            `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
-	Location           *GeoJSONPoint      `bson:"location,omitempty" json:"location,omitempty"`
+	ID            string        `db:"id" json:"_id"`
+	Name          string        `db:"name" json:"name" validate:"required"`
+	Mobile        string        `db:"mobile" json:"mobile" validate:"required"`
+	PortraitImage string        `db:"portrait_image" json:"portrait_image"`
+	POIImage      string        `db:"poi_image" json:"poi_image"`
+	DLImage       string        `db:"dl_image" json:"dl_image"`
+	RCImage       string        `db:"rc_image" json:"rc_image"`
+	AmbFront      string        `db:"amb_front" json:"amb_front"`
+	AmbInside     string        `db:"amb_inside" json:"amb_inside"`
+	VehicleType   string        `db:"vehicle_type" json:"vehicle_type"`
+	UnderProgress bool          `db:"under_progress" json:"under_progress"`
+	ErrorMessage  *string       `db:"error_message" json:"error_message,omitempty"`
+	FCMToken      *string       `db:"fcm_token" json:"fcm_token,omitempty"`
+	JWTToken      *string       `db:"jwt_token" json:"jwt_token,omitempty"`
+	Location      *GeoJSONPoint `db:"location" json:"location,omitempty"`
 }
 
 type VerificationUpdateRequest struct {
@@ -84,83 +83,83 @@ type VerificationUpdateRequest struct {
 }
 
 type AuthOTP struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	Number    string             `bson:"number" json:"number"`
-	OTP       string             `bson:"otp" json:"otp"`
-	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	ID        string    `db:"id" json:"_id"`
+	Number    string    `db:"number" json:"number"`
+	OTP       string    `db:"otp" json:"otp"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
 }
 
 type Referral struct {
-	ID             primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	UserType       string             `bson:"user_type" json:"user_type"`
-	RefFrom        string             `bson:"ref_from" json:"ref_from"`
-	RefTo          string             `bson:"ref_to" json:"ref_to"`
-	Value          string             `bson:"value" json:"value"`
-	RidesDone      int                `bson:"rides_done" json:"rides_done"`
-	AmountReceived bool               `bson:"amount_recievied" json:"amount_received"`
-	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
+	ID             string    `db:"id" json:"_id"`
+	UserType       string    `db:"user_type" json:"user_type"`
+	RefFrom        string    `db:"ref_from" json:"ref_from"`
+	RefTo          string    `db:"ref_to" json:"ref_to"`
+	Value          string    `db:"value" json:"value"`
+	RidesDone      int       `db:"rides_done" json:"rides_done"`
+	AmountReceived bool      `db:"amount_recieved" json:"amount_received"`
+	CreatedAt      time.Time `db:"created_at" json:"created_at"`
 }
 
 type RefreshToken struct {
-	ID           primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	UserID       string             `bson:"user_id" json:"user_id"`
-	Role         string             `bson:"role" json:"role"`
-	TokenHash    string             `bson:"token_hash" json:"-"`
-	SessionID    string             `bson:"session_id,omitempty" json:"session_id,omitempty"`
-	DeviceID     string             `bson:"device_id,omitempty" json:"device_id,omitempty"`
-	DeviceName   string             `bson:"device_name,omitempty" json:"device_name,omitempty"`
-	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`
-	ExpiresAt    time.Time          `bson:"expires_at" json:"expires_at"`
-	Revoked      bool               `bson:"revoked" json:"revoked"`
-	RevokedAt    *time.Time         `bson:"revoked_at,omitempty" json:"revoked_at,omitempty"`
-	RevokedReason string            `bson:"revoked_reason,omitempty" json:"revoked_reason,omitempty"`
-	SupersededBy primitive.ObjectID `bson:"superseded_by,omitempty" json:"superseded_by,omitempty"`
+	ID            string     `db:"id" json:"_id"`
+	UserID        string     `db:"user_id" json:"user_id"`
+	Role          string     `db:"role" json:"role"`
+	TokenHash     string     `db:"token_hash" json:"-"`
+	SessionID     string     `db:"session_id" json:"session_id,omitempty"`
+	DeviceID      string     `db:"device_id" json:"device_id,omitempty"`
+	DeviceName    string     `db:"device_name" json:"device_name,omitempty"`
+	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
+	ExpiresAt     time.Time  `db:"expires_at" json:"expires_at"`
+	Revoked       bool       `db:"revoked" json:"revoked"`
+	RevokedAt     *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
+	RevokedReason string     `db:"revoked_reason" json:"revoked_reason,omitempty"`
+	SupersededBy  *string    `db:"superseded_by" json:"superseded_by,omitempty"`
 }
 
 type OTPAttempt struct {
-	ID         primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	Mobile     string             `bson:"mobile" json:"mobile"`
-	Attempts   int                `bson:"attempts" json:"attempts"`
-	LockedUntil *time.Time         `bson:"locked_until,omitempty" json:"locked_until,omitempty"`
-	UpdatedAt  time.Time          `bson:"updated_at" json:"updated_at"`
+	ID          string     `db:"id" json:"_id"`
+	Mobile      string     `db:"mobile" json:"mobile"`
+	Attempts    int        `db:"attempts" json:"attempts"`
+	LockedUntil *time.Time `db:"locked_until" json:"locked_until,omitempty"`
+	UpdatedAt   time.Time  `db:"updated_at" json:"updated_at"`
 }
 
 type HospitalMD struct {
-	ID              primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	HospitalPendingID *primitive.ObjectID `bson:"hospital_pending_id,omitempty" json:"hospital_pending_id,omitempty"`
-	HospitalID      *primitive.ObjectID `bson:"hospital_id,omitempty" json:"hospital_id,omitempty"`
-	Name            string             `bson:"name" json:"name"`
-	Email           string             `bson:"email" json:"email"`
-	Mobile          string             `bson:"mobile" json:"mobile"`
-	OfficialNumber  string             `bson:"official_number" json:"official_number"`
-	Username        *string            `bson:"username,omitempty" json:"username,omitempty"`
-	PasswordHash    *string            `bson:"password_hash,omitempty" json:"-"`
-	Status          string             `bson:"status" json:"status"` // pending | active | rejected
-	JWTToken        *string            `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
-	FCMToken        *string            `bson:"fcm_token,omitempty" json:"fcm_token,omitempty"`
-	CreatedAt       time.Time          `bson:"created_at" json:"created_at"`
+	ID                string     `db:"id" json:"_id"`
+	HospitalPendingID *string    `db:"hospital_pending_id" json:"hospital_pending_id,omitempty"`
+	HospitalID        *string    `db:"hospital_id" json:"hospital_id,omitempty"`
+	Name              string     `db:"name" json:"name"`
+	Email             string     `db:"email" json:"email"`
+	Mobile            string     `db:"mobile" json:"mobile"`
+	OfficialNumber    string     `db:"official_number" json:"official_number"`
+	Username          *string    `db:"username" json:"username,omitempty"`
+	PasswordHash      *string    `db:"password_hash" json:"-"`
+	Status            string     `db:"status" json:"status"`
+	JWTToken          *string    `db:"jwt_token" json:"jwt_token,omitempty"`
+	FCMToken          *string    `db:"fcm_token" json:"fcm_token,omitempty"`
+	CreatedAt         time.Time  `db:"created_at" json:"created_at"`
 }
 
 type HospitalReceptionist struct {
-	ID            primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	HospitalID    primitive.ObjectID `bson:"hospital_id" json:"hospital_id"`
-	CreatedByMDID primitive.ObjectID `bson:"created_by_md_id" json:"created_by_md_id"`
-	Name          string             `bson:"name" json:"name"`
-	Username      string             `bson:"username" json:"username"`
-	PasswordHash  string             `bson:"password_hash" json:"-"`
-	Mobile        *string            `bson:"mobile,omitempty" json:"mobile,omitempty"`
-	Active        bool               `bson:"active" json:"active"`
-	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
-	JWTToken      *string            `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
+	ID            string    `db:"id" json:"_id"`
+	HospitalID    string    `db:"hospital_id" json:"hospital_id"`
+	CreatedByMDID string    `db:"created_by_md_id" json:"created_by_md_id"`
+	Name          string    `db:"name" json:"name"`
+	Username      string    `db:"username" json:"username"`
+	PasswordHash  string    `db:"password_hash" json:"-"`
+	Mobile        *string   `db:"mobile" json:"mobile,omitempty"`
+	Active        bool      `db:"active" json:"active"`
+	CreatedAt     time.Time `db:"created_at" json:"created_at"`
+	JWTToken      *string   `db:"jwt_token" json:"jwt_token,omitempty"`
 }
 
 type AmbulanceAttendant struct {
-	ID               primitive.ObjectID  `bson:"_id,omitempty" json:"_id"`
-	Name             string              `bson:"name" json:"name"`
-	Mobile           string              `bson:"mobile" json:"mobile"`
-	AssignedDriverID *primitive.ObjectID `bson:"assigned_driver_id,omitempty" json:"assigned_driver_id,omitempty"`
-	JWTToken         *string             `bson:"jwt_token,omitempty" json:"jwt_token,omitempty"`
-	FCMToken         *string             `bson:"fcm_token,omitempty" json:"fcm_token,omitempty"`
-	Active           bool                `bson:"active" json:"active"`
-	CreatedAt        time.Time           `bson:"created_at" json:"created_at"`
+	ID               string    `db:"id" json:"_id"`
+	Name             string    `db:"name" json:"name"`
+	Mobile           string    `db:"mobile" json:"mobile"`
+	AssignedDriverID *string   `db:"assigned_driver_id" json:"assigned_driver_id,omitempty"`
+	JWTToken         *string   `db:"jwt_token" json:"jwt_token,omitempty"`
+	FCMToken         *string   `db:"fcm_token" json:"fcm_token,omitempty"`
+	Active           bool      `db:"active" json:"active"`
+	CreatedAt        time.Time `db:"created_at" json:"created_at"`
 }

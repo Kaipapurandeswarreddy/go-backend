@@ -15,14 +15,13 @@ import (
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/dispatch"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/payment"
+	"ambigo-backend/internal/pricing"
 	"ambigo-backend/internal/referral"
 	"ambigo-backend/internal/requestid"
-	"ambigo-backend/internal/pricing"
 	"ambigo-backend/internal/ride"
-
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type RideHandler struct {
@@ -59,11 +58,10 @@ func (h *RideHandler) upgradeUnvrfDriverRole(uidStr, role string) string {
 	if role != "unvrf_driver" {
 		return role
 	}
-	objID, err := primitive.ObjectIDFromHex(uidStr)
-	if err != nil {
+	if !ids.IsValid(uidStr) {
 		return role
 	}
-	found, err := h.AuthStore.FindDriverByID(context.Background(), objID)
+	found, err := h.AuthStore.FindDriverByID(context.Background(), uidStr)
 	if err == nil && found != nil {
 		return "driver"
 	}
@@ -250,7 +248,7 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{
 		"message": "Ride requested successfully",
-		"ride_id": newRide.ID.Hex(),
+		"ride_id": newRide.ID,
 		"otp":     otp, // Returning OTP so the user's app can display it
 	})
 }
@@ -536,7 +534,7 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"detail":            "Ride Completed",
-		"payment_id":        pmt.ID.Hex(),
+		"payment_id":        pmt.ID,
 		"razorpay_order_id": pmt.RazorpayOrderID,
 		"take_cash":         req.PaymentMode != "online",
 		"amount":            userAmount,
@@ -714,13 +712,12 @@ func (h *RideHandler) HandleGetDriverDetails(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(*rideData.DriverID)
-	if err != nil {
+	if !ids.IsValid(*rideData.DriverID) {
 		response.Error(w, "Invalid driver ID", http.StatusBadRequest)
 		return
 	}
 
-	driver, err := h.AuthStore.FindDriverByID(r.Context(), objID)
+	driver, err := h.AuthStore.FindDriverByID(r.Context(), *rideData.DriverID)
 	if err != nil || driver == nil {
 		response.Error(w, "Driver not found", http.StatusNotFound)
 		return
@@ -765,13 +762,12 @@ func (h *RideHandler) HandleGetUserDetails(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(rideData.UserID)
-	if err != nil {
+	if !ids.IsValid(rideData.UserID) {
 		response.Error(w, "Invalid user ID", http.StatusBadRequest)
 		return
 	}
 
-	user, err := h.AuthStore.FindUserByID(r.Context(), objID)
+	user, err := h.AuthStore.FindUserByID(r.Context(), rideData.UserID)
 	if err != nil || user == nil {
 		response.Error(w, "User not found", http.StatusNotFound)
 		return
@@ -860,7 +856,7 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"estimates": []map[string]interface{}{
 				{
-					"amb_type_id":  ambType.ID.Hex(),
+					"amb_type_id":  ambType.ID,
 					"name":         ambType.Name,
 					"base_fare":    ambType.BaseFare,
 					"total":        total,
@@ -907,7 +903,7 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 		driverShare := float64(int((dBase+dEmergency+dNight)*100)) / 100
 
 		estimates = append(estimates, estimate{
-			AmbTypeID:   ambType.ID.Hex(),
+			AmbTypeID:   ambType.ID,
 			Name:        ambType.Name,
 			BaseFare:    ambType.BaseFare,
 			Total:       total,

@@ -2,81 +2,201 @@ package admin
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"ambigo-backend/internal/ids"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type PendingHospital struct {
-	ID              primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	Name            string             `bson:"name" json:"name"`
-	Address         string             `bson:"address" json:"address"`
-	Email           string             `bson:"email" json:"email"`
-	MDNumber        string             `bson:"md_number" json:"md_number"`
-	OfficialNumber  string             `bson:"official_number" json:"official_number"`
-	City            string             `bson:"city" json:"city"`
-	Location        *GeoJSON           `bson:"location,omitempty" json:"location,omitempty"`
-	Status          string             `bson:"status" json:"status"` // pending | approved | rejected
-	RejectionReason *string            `bson:"rejection_reason,omitempty" json:"rejection_reason,omitempty"`
-	MDID            string             `bson:"md_id,omitempty" json:"md_id,omitempty"`
-	CreatedAt       time.Time          `bson:"created_at" json:"created_at"`
-	ReviewedAt      *time.Time         `bson:"reviewed_at,omitempty" json:"reviewed_at,omitempty"`
-	ReviewedBy      *string            `bson:"reviewed_by,omitempty" json:"reviewed_by,omitempty"`
+	ID              string     `db:"id" json:"_id"`
+	Name            string     `db:"name" json:"name"`
+	Address         string     `db:"address" json:"address"`
+	Email           string     `db:"email" json:"email"`
+	MDNumber        string     `db:"md_number" json:"md_number"`
+	OfficialNumber  string     `db:"official_number" json:"official_number"`
+	City            string     `db:"city" json:"city"`
+	Location        *GeoJSON   `db:"location" json:"location,omitempty"`
+	Status          string     `db:"status" json:"status"`
+	RejectionReason *string    `db:"rejection_reason" json:"rejection_reason,omitempty"`
+	MDID            string     `db:"md_id" json:"md_id,omitempty"`
+	CreatedAt       time.Time  `db:"created_at" json:"created_at"`
+	ReviewedAt      *time.Time `db:"reviewed_at" json:"reviewed_at,omitempty"`
+	ReviewedBy      *string    `db:"reviewed_by" json:"reviewed_by,omitempty"`
 }
 
 type PendingHospitalStore struct {
-	pending *mongo.Collection
+	pool *pgxpool.Pool
 }
 
-func NewPendingHospitalStore(db *mongo.Database) *PendingHospitalStore {
-	return &PendingHospitalStore{pending: db.Collection("pending_hospitals")}
+func NewPendingHospitalStore(pool *pgxpool.Pool) *PendingHospitalStore {
+	return &PendingHospitalStore{pool: pool}
+}
+
+const pendingHospitalColumns = `id, name, address, email, md_number, official_number, city, location, status, rejection_reason, md_id, created_at, reviewed_at, reviewed_by`
+
+func scanPendingHospital(row pgx.Row) (*PendingHospital, error) {
+	var p PendingHospital
+	var (
+		locationBytes   []byte
+		rejectionReason sql.NullString
+		reviewedAt      sql.NullTime
+		reviewedBy      sql.NullString
+		mdID            sql.NullString
+	)
+	err := row.Scan(
+		&p.ID,
+		&p.Name,
+		&p.Address,
+		&p.Email,
+		&p.MDNumber,
+		&p.OfficialNumber,
+		&p.City,
+		&locationBytes,
+		&p.Status,
+		&rejectionReason,
+		&mdID,
+		&p.CreatedAt,
+		&reviewedAt,
+		&reviewedBy,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(locationBytes) > 0 && string(locationBytes) != "null" {
+		var loc GeoJSON
+		if err := json.Unmarshal(locationBytes, &loc); err != nil {
+			return nil, fmt.Errorf("unmarshal pending_hospital location: %w", err)
+		}
+		p.Location = &loc
+	}
+	if rejectionReason.Valid {
+		p.RejectionReason = &rejectionReason.String
+	}
+	if mdID.Valid {
+		p.MDID = mdID.String
+	}
+	if reviewedAt.Valid {
+		p.ReviewedAt = &reviewedAt.Time
+	}
+	if reviewedBy.Valid {
+		p.ReviewedBy = &reviewedBy.String
+	}
+	return &p, nil
 }
 
 func (s *PendingHospitalStore) Create(ctx context.Context, p *PendingHospital) error {
-	p.ID = primitive.NewObjectID()
-	p.CreatedAt = time.Now()
+	if ids.IsZero(p.ID) {
+		p.ID = ids.New()
+	}
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = time.Now()
+	}
 	if p.Status == "" {
 		p.Status = "pending"
 	}
-	_, err := s.pending.InsertOne(ctx, p)
+	var locationJSON []byte
+	var err error
+	if p.Location != nil {
+		locationJSON, err = json.Marshal(p.Location)
+		if err != nil {
+			return fmt.Errorf("marshal pending_hospital location: %w", err)
+		}
+	}
+	var rejectionReason interface{}
+	if p.RejectionReason != nil {
+		rejectionReason = *p.RejectionReason
+	} else {
+		rejectionReason = nil
+	}
+	var mdID interface{}
+	if p.MDID != "" {
+		mdID = p.MDID
+	} else {
+		mdID = nil
+	}
+	var reviewedAt interface{}
+	if p.ReviewedAt != nil {
+		reviewedAt = *p.ReviewedAt
+	} else {
+		reviewedAt = nil
+	}
+	var reviewedBy interface{}
+	if p.ReviewedBy != nil {
+		reviewedBy = *p.ReviewedBy
+	} else {
+		reviewedBy = nil
+	}
+	const q = `INSERT INTO pending_hospitals (id, name, address, email, md_number, official_number, city, location, status, rejection_reason, md_id, created_at, reviewed_at, reviewed_by)
+	           VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14)`
+	_, err = s.pool.Exec(ctx, q,
+		p.ID,
+		p.Name,
+		p.Address,
+		p.Email,
+		p.MDNumber,
+		p.OfficialNumber,
+		p.City,
+		locationJSON,
+		p.Status,
+		rejectionReason,
+		mdID,
+		p.CreatedAt,
+		reviewedAt,
+		reviewedBy,
+	)
 	return err
 }
 
-func (s *PendingHospitalStore) FindByID(ctx context.Context, id primitive.ObjectID) (*PendingHospital, error) {
-	var p PendingHospital
-	err := s.pending.FindOne(ctx, bson.M{"_id": id}).Decode(&p)
+func (s *PendingHospitalStore) FindByID(ctx context.Context, id string) (*PendingHospital, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid pending_hospital id: %s", id)
+	}
+	const q = `SELECT ` + pendingHospitalColumns + ` FROM pending_hospitals WHERE id=$1::uuid`
+	p, err := scanPendingHospital(s.pool.QueryRow(ctx, q, id))
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &p, nil
+	return p, nil
 }
 
 func (s *PendingHospitalStore) FindByMDNumber(ctx context.Context, mdNumber string) (*PendingHospital, error) {
-	var p PendingHospital
-	err := s.pending.FindOne(ctx, bson.M{"md_number": mdNumber, "status": "pending"}).Decode(&p)
+	const q = `SELECT ` + pendingHospitalColumns + ` FROM pending_hospitals WHERE md_number=$1 AND status='pending' LIMIT 1`
+	p, err := scanPendingHospital(s.pool.QueryRow(ctx, q, mdNumber))
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &p, nil
+	return p, nil
 }
 
 func (s *PendingHospitalStore) ListPending(ctx context.Context) ([]PendingHospital, error) {
-	cursor, err := s.pending.Find(ctx, bson.M{"status": "pending"}, options.Find().SetSort(bson.M{"created_at": -1}))
+	const q = `SELECT ` + pendingHospitalColumns + ` FROM pending_hospitals WHERE status='pending' ORDER BY created_at DESC`
+	rows, err := s.pool.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var list []PendingHospital
-	if err = cursor.All(ctx, &list); err != nil {
+	for rows.Next() {
+		p, err := scanPendingHospital(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, *p)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	if list == nil {
@@ -86,13 +206,21 @@ func (s *PendingHospitalStore) ListPending(ctx context.Context) ([]PendingHospit
 }
 
 func (s *PendingHospitalStore) ListAll(ctx context.Context) ([]PendingHospital, error) {
-	cursor, err := s.pending.Find(ctx, bson.M{}, options.Find().SetSort(bson.M{"created_at": -1}))
+	const q = `SELECT ` + pendingHospitalColumns + ` FROM pending_hospitals ORDER BY created_at DESC`
+	rows, err := s.pool.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var list []PendingHospital
-	if err = cursor.All(ctx, &list); err != nil {
+	for rows.Next() {
+		p, err := scanPendingHospital(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, *p)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	if list == nil {
@@ -101,27 +229,39 @@ func (s *PendingHospitalStore) ListAll(ctx context.Context) ([]PendingHospital, 
 	return list, nil
 }
 
-func (s *PendingHospitalStore) Approve(ctx context.Context, id primitive.ObjectID, reviewerID string) error {
-	now := time.Now()
-	_, err := s.pending.UpdateOne(ctx, bson.M{"_id": id, "status": "pending"}, bson.M{
-		"$set": bson.M{"status": "approved", "reviewed_at": now, "reviewed_by": reviewerID},
-	})
+func (s *PendingHospitalStore) Approve(ctx context.Context, id string, reviewerID string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid pending_hospital id: %s", id)
+	}
+	const q = `UPDATE pending_hospitals SET status='approved', reviewed_at=now(), reviewed_by=$2 WHERE id=$1::uuid AND status='pending'`
+	_, err := s.pool.Exec(ctx, q, id, reviewerID)
 	return err
 }
 
-func (s *PendingHospitalStore) Reject(ctx context.Context, id primitive.ObjectID, reviewerID, reason string) error {
-	now := time.Now()
-	_, err := s.pending.UpdateOne(ctx, bson.M{"_id": id, "status": "pending"}, bson.M{
-		"$set": bson.M{"status": "rejected", "rejection_reason": reason, "reviewed_at": now, "reviewed_by": reviewerID},
-	})
+func (s *PendingHospitalStore) Reject(ctx context.Context, id string, reviewerID, reason string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid pending_hospital id: %s", id)
+	}
+	const q = `UPDATE pending_hospitals SET status='rejected', rejection_reason=$3, reviewed_at=now(), reviewed_by=$2 WHERE id=$1::uuid AND status='pending'`
+	_, err := s.pool.Exec(ctx, q, id, reviewerID, reason)
 	return err
 }
 
-func (s *PendingHospitalStore) Delete(ctx context.Context, id primitive.ObjectID) error {
-	_, err := s.pending.DeleteOne(ctx, bson.M{"_id": id})
+func (s *PendingHospitalStore) Delete(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid pending_hospital id: %s", id)
+	}
+	const q = `DELETE FROM pending_hospitals WHERE id=$1::uuid`
+	_, err := s.pool.Exec(ctx, q, id)
 	return err
 }
 
 func (s *PendingHospitalStore) CountPending(ctx context.Context) (int64, error) {
-	return s.pending.CountDocuments(ctx, bson.M{"status": "pending"})
+	const q = `SELECT COUNT(*) FROM pending_hospitals WHERE status='pending'`
+	var count int64
+	err := s.pool.QueryRow(ctx, q).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }

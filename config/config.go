@@ -2,13 +2,20 @@ package config
 
 import (
 	"os"
+	"strconv"
+	"time"
 
 	"ambigo-backend/internal/logger"
 )
 
 // AppConfig holds all environment variables required by the application
 type AppConfig struct {
-	MongoURI          string
+	MongoURI          string // kept for dual-write transition; remove after PG cutover
+	DatabaseURL       string // Postgres DSN — primary after migration
+	PGMaxOpenConns    int32
+	PGMinOpenConns    int32
+	PGMaxConnLifetime time.Duration
+	PGMaxConnIdleTime time.Duration
 	JWTSecret         string
 	JWTAlgorithm      string
 	JWTValidityMs     int
@@ -58,12 +65,25 @@ func LoadConfig() *AppConfig {
 
 	mongoURI := os.Getenv("MONGODB_URI")
 	if mongoURI == "" {
-		// Default to local MongoDB for development
+		// Default to local MongoDB for development (dual-write transition)
 		mongoURI = "mongodb://localhost:27017/"
 	}
 
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = os.Getenv("POSTGRES_DSN")
+	}
+	if databaseURL == "" {
+		databaseURL = "postgres://ambigo:ambigo_dev_password@localhost:5432/ambigo?sslmode=disable"
+	}
+
 	cfg := &AppConfig{
-		MongoURI:          mongoURI,
+		MongoURI:    mongoURI,
+		DatabaseURL: databaseURL,
+		PGMaxOpenConns:    int32(envIntOrDefault("PG_MAX_OPEN_CONNS", 25)),
+		PGMinOpenConns:    int32(envIntOrDefault("PG_MIN_OPEN_CONNS", 5)),
+		PGMaxConnLifetime: envDurationOrDefault("PG_MAX_CONN_LIFETIME", 5*time.Minute),
+		PGMaxConnIdleTime: envDurationOrDefault("PG_MAX_CONN_IDLE_TIME", 2*time.Minute),
 		JWTSecret:         os.Getenv("JWT_SECRET"),
 		JWTAlgorithm:      os.Getenv("JWT_ALGORITHM"),
 		JWTAudience:       os.Getenv("JWT_AUDIENCE"),
@@ -111,6 +131,24 @@ func LoadConfig() *AppConfig {
 func envOrDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envIntOrDefault(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return fallback
 }

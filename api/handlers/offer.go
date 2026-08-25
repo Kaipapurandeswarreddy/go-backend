@@ -6,10 +6,9 @@ import (
 
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/offer"
 	"ambigo-backend/internal/requestid"
-
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type OfferHandler struct {
@@ -39,13 +38,13 @@ func (h *OfferHandler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminOfferCreated, eventbus.AdminOfferPayload{
-		OfferID: o.ID.Hex(), Description: o.Description, RequestID: reqID,
+		OfferID: o.ID, Description: o.Description, RequestID: reqID,
 	})
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"detail": "Created",
-		"id":     o.ID.Hex(),
+		"id":     o.ID,
 	})
 }
 
@@ -63,13 +62,12 @@ func (h *OfferHandler) HandleList(w http.ResponseWriter, r *http.Request) {
 func (h *OfferHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	reqID := requestid.FromContext(r.Context())
 	idStr := r.PathValue("id")
-	objID, err := primitive.ObjectIDFromHex(idStr)
-	if err != nil {
+	if !ids.IsValid(idStr) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.Store.Delete(r.Context(), objID); err != nil {
+	if err := h.Store.Delete(r.Context(), idStr); err != nil {
 		response.Error(w, "Failed to delete offer", http.StatusInternalServerError)
 		return
 	}

@@ -7,8 +7,7 @@ import (
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/auth"
-
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"ambigo-backend/internal/ids"
 )
 
 type VerificationHandler struct {
@@ -30,14 +29,13 @@ func (h *VerificationHandler) HandleCheckVerification(w http.ResponseWriter, r *
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(uidStr)
-	if err != nil {
+	if !ids.IsValid(uidStr) {
 		response.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}
 
 	// First, check the active drivers collection
-	driver, err := h.AuthStore.FindDriverByID(r.Context(), objID)
+	driver, err := h.AuthStore.FindDriverByID(r.Context(), uidStr)
 	if err != nil {
 		response.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -50,7 +48,7 @@ func (h *VerificationHandler) HandleCheckVerification(w http.ResponseWriter, r *
 	}
 
 	// Next, check the unverified drivers collection
-	unverified, err := h.AuthStore.FindUnverifiedDriverByID(r.Context(), objID)
+	unverified, err := h.AuthStore.FindUnverifiedDriverByID(r.Context(), uidStr)
 	if err != nil {
 		response.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -74,8 +72,7 @@ func (h *VerificationHandler) HandleUpdateVerification(w http.ResponseWriter, r 
 		return
 	}
 
-	objID, err := primitive.ObjectIDFromHex(uidStr)
-	if err != nil {
+	if !ids.IsValid(uidStr) {
 		response.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}
@@ -86,7 +83,7 @@ func (h *VerificationHandler) HandleUpdateVerification(w http.ResponseWriter, r 
 		return
 	}
 
-	driver, err := h.AuthStore.FindUnverifiedDriverByID(r.Context(), objID)
+	driver, err := h.AuthStore.FindUnverifiedDriverByID(r.Context(), uidStr)
 	if err != nil {
 		response.Error(w, "Internal error", http.StatusInternalServerError)
 		return
