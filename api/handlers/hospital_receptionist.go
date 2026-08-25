@@ -9,7 +9,7 @@ import (
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/auth"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"ambigo-backend/internal/ids"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -35,7 +35,7 @@ func (h *HospitalReceptionistHandler) HandleCreateReceptionist(w http.ResponseWr
 		response.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
-	mdID, _ := primitive.ObjectIDFromHex(mdIDStr)
+	mdID := mdIDStr
 	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
 	if err != nil || md == nil || md.HospitalID == nil {
 		response.Error(w, "MD not linked to hospital", http.StatusBadRequest)
@@ -92,7 +92,7 @@ func (h *HospitalReceptionistHandler) HandleCreateReceptionist(w http.ResponseWr
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Receptionist created", "id": recept.ID.Hex()})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Receptionist created", "id": recept.ID})
 }
 
 func (h *HospitalReceptionistHandler) HandleListReceptionists(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +101,7 @@ func (h *HospitalReceptionistHandler) HandleListReceptionists(w http.ResponseWri
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	mdID, _ := primitive.ObjectIDFromHex(mdIDStr)
+	mdID := mdIDStr
 	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
 	if err != nil || md == nil || md.HospitalID == nil {
 		response.Error(w, "MD not linked to hospital", http.StatusBadRequest)
@@ -122,7 +122,7 @@ func (h *HospitalReceptionistHandler) HandleDeleteReceptionist(w http.ResponseWr
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	mdID, _ := primitive.ObjectIDFromHex(mdIDStr)
+	mdID := mdIDStr
 	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), mdID)
 	if err != nil || md == nil || md.HospitalID == nil {
 		response.Error(w, "MD not linked to hospital", http.StatusBadRequest)
@@ -139,12 +139,11 @@ func (h *HospitalReceptionistHandler) HandleDeleteReceptionist(w http.ResponseWr
 		response.Error(w, "ID required", http.StatusBadRequest)
 		return
 	}
-	objID, err := primitive.ObjectIDFromHex(req.ID)
-	if err != nil {
+	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
-	recept, err := h.AuthStore.FindHospitalReceptionistByID(r.Context(), objID)
+	recept, err := h.AuthStore.FindHospitalReceptionistByID(r.Context(), req.ID)
 	if err != nil || recept == nil {
 		response.Error(w, "Receptionist not found", http.StatusNotFound)
 		return
@@ -153,7 +152,7 @@ func (h *HospitalReceptionistHandler) HandleDeleteReceptionist(w http.ResponseWr
 		response.Error(w, "Forbidden: different hospital", http.StatusForbidden)
 		return
 	}
-	if err := h.AuthStore.DeleteHospitalReceptionist(r.Context(), objID); err != nil {
+	if err := h.AuthStore.DeleteHospitalReceptionist(r.Context(), req.ID); err != nil {
 		response.Error(w, "Delete failed", http.StatusInternalServerError)
 		return
 	}
@@ -185,13 +184,13 @@ func (h *HospitalReceptionistHandler) HandleReceptionistLogin(w http.ResponseWri
 		response.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
-	accessToken, err := auth.GenerateHospitalJWT(recept.ID.Hex(), "hospital_receptionist", recept.HospitalID.Hex(), h.JWTSecret)
+	accessToken, err := auth.GenerateHospitalJWT(recept.ID, "hospital_receptionist", recept.HospitalID, h.JWTSecret)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 	sessionID := auth.NewSessionID()
-	refreshStr, _, err := h.AuthStore.CreateRefreshToken(r.Context(), recept.ID.Hex(), "hospital_receptionist", sessionID, req.DeviceID, req.DeviceName)
+	refreshStr, _, err := h.AuthStore.CreateRefreshToken(r.Context(), recept.ID, "hospital_receptionist", sessionID, req.DeviceID, req.DeviceName)
 	if err != nil {
 		response.Error(w, "Failed to create session", http.StatusInternalServerError)
 		return
@@ -203,7 +202,7 @@ func (h *HospitalReceptionistHandler) HandleReceptionistLogin(w http.ResponseWri
 		"refresh_token": refreshStr,
 		"session_id":    sessionID,
 		"role":          "hospital_receptionist",
-		"hospital_id":   recept.HospitalID.Hex(),
+		"hospital_id":   recept.HospitalID,
 	})
 }
 
@@ -220,31 +219,31 @@ func (h *HospitalReceptionistHandler) HandleReceptionistMe(w http.ResponseWriter
 	}
 	// Try receptionist first
 	if role == "hospital_receptionist" {
-		oid, _ := primitive.ObjectIDFromHex(uid)
+		oid := uid
 		recept, err := h.AuthStore.FindHospitalReceptionistByID(r.Context(), oid)
 		if err == nil && recept != nil {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":          recept.ID.Hex(),
+				"id":          recept.ID,
 				"username":    recept.Username,
 				"name":        recept.Name,
-				"hospital_id": recept.HospitalID.Hex(),
+				"hospital_id": recept.HospitalID,
 				"role":        "hospital_receptionist",
 			})
 			return
 		}
 	}
 	// Fallback: hospital_md also can call me
-	oid, _ := primitive.ObjectIDFromHex(uid)
+	oid := uid
 	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), oid)
 	if err == nil && md != nil {
 		var hid interface{}
 		if md.HospitalID != nil {
-			hid = md.HospitalID.Hex()
+			hid = *md.HospitalID
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"id":          md.ID.Hex(),
+			"id":          md.ID,
 			"username":    md.Username,
 			"name":        md.Name,
 			"hospital_id": hid,

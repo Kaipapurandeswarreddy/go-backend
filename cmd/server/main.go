@@ -29,12 +29,14 @@ import (
 	"ambigo-backend/internal/telephony"
 	"ambigo-backend/internal/translation"
 	"ambigo-backend/internal/websocket"
+	migrations "ambigo-backend/migrations"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
+	"github.com/pressly/goose/v3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
 var log zerolog.Logger
@@ -47,19 +49,36 @@ func main() {
 		log.Warn().Err(err).Msg("No .env file found, relying on system environment variables")
 	}
 
-	log.Info().Msg("Starting Ambigo Backend V2...")
+	log.Info().Msg("Starting Ambigo Backend V2 (Postgres)...")
 
 	// 1. Load Configuration
 	appConfig := config.LoadConfig()
 
-	// 2. Initialize MongoDB (Business Truth)
-	client, err := config.InitMongoDB(appConfig.MongoURI)
+	// 2. Initialize PostgreSQL (primary) — replaces MongoDB
+	pgCfg := config.PostgresConfig{
+		DatabaseURL:       appConfig.DatabaseURL,
+		MaxOpenConns:      appConfig.PGMaxOpenConns,
+		MinOpenConns:      appConfig.PGMinOpenConns,
+		MaxConnLifetime:   appConfig.PGMaxConnLifetime,
+		MaxConnIdleTime:   appConfig.PGMaxConnIdleTime,
+		HealthCheckPeriod: 30 * time.Second,
+	}
+	pool, err := config.InitPostgres(context.Background(), pgCfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to connect to MongoDB")
+		log.Fatal().Err(err).Msg("Failed to connect to PostgreSQL")
 	}
-	if err := config.EnsureIndexes(client); err != nil {
-		log.Fatal().Err(err).Msg("Failed to ensure MongoDB indexes")
+
+	// Run goose migrations (embedded via migrations/embed.go)
+	goose.SetBaseFS(migrations.FS)
+	if err := goose.SetDialect("postgres"); err != nil {
+		log.Fatal().Err(err).Msg("Failed to set goose dialect")
 	}
+	sqlDB := stdlib.OpenDBFromPool(pool)
+	if err := goose.Up(sqlDB, "."); err != nil {
+		log.Fatal().Err(err).Msg("Failed to run Postgres migrations")
+	}
+	_ = sqlDB.Close()
+	log.Info().Msg("Postgres migrations applied")
 
 	// 3. Setup EventBus (Pub/Sub for internal messaging)
 	eventBus := eventbus.NewInMemoryBus()
@@ -68,28 +87,19 @@ func main() {
 	locationStore := location.NewMemoryStore()
 	locationStore.StartCleanupWorker() // Start background sweeper
 
-	// Initialize Stores — mapped to V1 Python multi-database layout:
-	// V1: Users DB → users, drivers, unverified_drivers, auth_otp, admins
-	// V1: Rides DB → searching_rides, accepted_rides, ongoing_rides, completed_rides (V2 uses single "rides" collection with status field)
-	// V1: Records DB → payments, wallet_transactions, feedback, referrals, offers
-	// V1: Data DB → ambulance_types, hospitals, counters
-	usersDB := client.Database("Users")
-	ridesDB := client.Database("Rides")
-	recordsDB := client.Database("Records")
-	dataDB := client.Database("Data")
-
-	authStore := auth.NewStore(usersDB, recordsDB)
-	rideStore := ride.NewStore(ridesDB.Collection("rides"))
-	paymentStore := payment.NewStore(recordsDB)
-	adminStore := admin.NewStore(dataDB, usersDB)
-	counterStore := admin.NewCounterStore(dataDB)
-	hospitalStore := admin.NewHospitalStore(dataDB)
-	hospitalCityStore := admin.NewHospitalCityStore(dataDB)
-	pendingHospitalStore := admin.NewPendingHospitalStore(dataDB)
-	offerStore := offer.NewStore(recordsDB)
-	walletStore := payment.NewWalletStore(recordsDB, usersDB)
-	feedbackStore := ride.NewFeedbackStore(recordsDB)
-	referralStore := referral.NewStore(dataDB, recordsDB)
+	// Initialize Stores — single Postgres pool (replaces 4 Mongo DBs)
+	authStore := auth.NewStore(pool)
+	rideStore := ride.NewStore(pool)
+	paymentStore := payment.NewStore(pool)
+	adminStore := admin.NewStore(pool)
+	counterStore := admin.NewCounterStore(pool)
+	hospitalStore := admin.NewHospitalStore(pool)
+	hospitalCityStore := admin.NewHospitalCityStore(pool)
+	pendingHospitalStore := admin.NewPendingHospitalStore(pool)
+	offerStore := offer.NewStore(pool)
+	walletStore := payment.NewWalletStore(pool)
+	feedbackStore := ride.NewFeedbackStore(pool)
+	referralStore := referral.NewStore(pool)
 
 	// Initialize Services & Dispatcher
 	referralService := referral.NewService(referralStore, authStore, offerStore, walletStore, eventBus)
@@ -104,7 +114,7 @@ func main() {
 		wsManager.SeedCurrentSessions(seed)
 		log.Info().Int("sessions", len(seed)).Msg("Seeded current sessions from database")
 	}
-	
+
 	routeClient := dispatch.NewRouteClient(appConfig.GoogleMapsAPIKey, appConfig.GoogleRoutesAPIURL)
 	fcmClient := notification.NewFCMClient(context.Background(), appConfig.FirebaseCredentialsPath)
 
@@ -117,7 +127,7 @@ func main() {
 	ambTypes, _ := adminStore.ListAmbulanceTypes(context.Background())
 	ambTypeNames := make(map[string]string, len(ambTypes))
 	for _, t := range ambTypes {
-		ambTypeNames[t.ID.Hex()] = t.Name
+		ambTypeNames[t.ID] = t.Name
 	}
 	matcher := dispatch.NewMatcher(locationStore, routeClient, ambTypeNames)
 	dispatcher := dispatch.NewDispatcher(matcher, rideStore, eventBus, wsManager)
@@ -155,8 +165,8 @@ func main() {
 	feedbackHandler := handlers.NewFeedbackHandler(feedbackStore)
 	referralHandler := handlers.NewReferralHandler(referralStore, referralService)
 
-	// V16: Audit persistence
-	auditStore := admin.NewAuditStore(recordsDB)
+	// V16: Audit persistence (Postgres, TTL 30d via periodic DELETE)
+	auditStore := admin.NewAuditStore(pool)
 
 	// Subscribe EventBus Subscribers
 	websocket.NewWSNotifier(wsManager).SubscribeTo(eventBus)
@@ -197,7 +207,7 @@ func main() {
 	globalRateLimiter := middleware.NewIPLimiter(100, 200)            // A5: Global per-IP limit for all authenticated routes
 
 	mux := http.NewServeMux()
-	
+
 	apiKeyAuth := middleware.APIKeyAuth(appConfig.APIKey)
 
 	// Metrics endpoint for Prometheus scraping (no API key needed)
@@ -208,10 +218,12 @@ func main() {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 
-		mongoOK := "ok"
-		if err := client.Ping(ctx, readpref.Primary()); err != nil {
-			mongoOK = "unreachable"
+		postgresOK := "ok"
+		if err := pool.Ping(ctx); err != nil {
+			postgresOK = "unreachable"
 		}
+		// Also report pool stats for observability
+		_ = pool.Stat()
 
 		googleOK := "ok"
 		if appConfig.GoogleMapsAPIKey == "" {
@@ -220,7 +232,7 @@ func main() {
 
 		status := http.StatusOK
 		overall := "ok"
-		if mongoOK != "ok" {
+		if postgresOK != "ok" {
 			overall = "degraded"
 			status = http.StatusServiceUnavailable
 		}
@@ -229,9 +241,9 @@ func main() {
 		w.WriteHeader(status)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  overall,
-			"version": "v2",
+			"version": "v2-pg",
 			"checks": map[string]string{
-				"mongodb":  mongoOK,
+				"postgres": postgresOK,
 				"googleap": googleOK,
 			},
 		})
@@ -298,7 +310,7 @@ func main() {
 	// Profile Endpoints (Protected)
 	mux.Handle("POST /api/v2/user/profile", requireUser(profileHandler.HandleGetUserProfile))
 	mux.Handle("POST /api/v2/user/fcm", requireUser(profileHandler.HandleUpdateUserFCM))
-	
+
 	// Referral Endpoints (Protected)
 	mux.Handle("POST /api/v2/referral/rewards", jwtAuth(http.HandlerFunc(referralHandler.HandleGetRewards)))
 
@@ -403,6 +415,26 @@ func main() {
 	mux.Handle("GET /api/v2/admin/referral/config", requireAdmin(http.HandlerFunc(referralHandler.HandleGetConfig)))
 	mux.Handle("POST /api/v2/admin/referral/config", requireAdmin(http.HandlerFunc(referralHandler.HandleSaveConfig)))
 
+	// Housekeeping: audit_log TTL 30d + auth_otp 5m cleanup (replaces Mongo TTL indexes)
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if _, err := pool.Exec(ctx, `DELETE FROM auth_otp WHERE created_at < now() - interval '5 minutes'`); err != nil {
+				log.Error().Err(err).Msg("auth_otp cleanup failed")
+			}
+			if _, err := pool.Exec(ctx, `DELETE FROM audit_log WHERE created_at < now() - interval '30 days'`); err != nil {
+				log.Error().Err(err).Msg("audit_log cleanup failed")
+			}
+			// refresh_tokens are naturally expired via expires_at check; optional hard delete:
+			if _, err := pool.Exec(ctx, `DELETE FROM refresh_tokens WHERE expires_at < now() - interval '7 days' AND revoked = true`); err != nil {
+				log.Error().Err(err).Msg("refresh_tokens cleanup failed")
+			}
+			cancel()
+		}
+	}()
+
 	// Apply API key auth + global rate limiter to all routes except /metrics, /health, and /ws
 	protected := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -412,6 +444,7 @@ func main() {
 		}
 		middleware.RateLimitMiddleware(globalRateLimiter, apiKeyAuth(mux)).ServeHTTP(w, r)
 	})
+	// sql is used via stdlib.OpenDBFromPool for goose
 	server := &http.Server{
 		Addr:              ":" + appConfig.Port,
 		Handler:           middleware.CORS(middleware.RequestID(middleware.Metrics(middleware.BodyLimit(protected)))),
@@ -426,7 +459,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Info().Str("port", appConfig.Port).Msg("Server listening")
+		log.Info().Str("port", appConfig.Port).Msg("Server listening (Postgres)")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal().Err(err).Msg("Server stopped")
 		}
@@ -442,9 +475,8 @@ func main() {
 		log.Error().Err(err).Msg("HTTP server forced shutdown")
 	}
 
-		if err := client.Disconnect(ctx); err != nil {
-		log.Error().Err(err).Msg("MongoDB disconnect error")
-	}
+	// pgxpool.Close() is deferred via pool.Close() above (no context needed)
+	pool.Close()
 
 	log.Info().Msg("Server exited cleanly")
 }

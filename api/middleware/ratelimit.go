@@ -5,12 +5,33 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"ambigo-backend/api/response"
 	"golang.org/x/time/rate"
 )
+
+// clientIP extracts the real client IP, respecting X-Forwarded-For / X-Real-IP
+// set by Render / Cloud Run / nginx. Falls back to RemoteAddr host.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	host := r.RemoteAddr
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+	host = strings.Trim(host, "[]")
+	return host
+}
 
 type clientLimiter struct {
 	limiter  *rate.Limiter
@@ -66,7 +87,7 @@ func (l *ipLimiter) getLimiter(ip string) *rate.Limiter {
 
 func RateLimit(next http.HandlerFunc, limiter *ipLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := r.RemoteAddr
+		ip := clientIP(r)
 		if !limiter.getLimiter(ip).Allow() {
 			response.Error(w, "Too many requests. Please try again later.", http.StatusTooManyRequests)
 			return
@@ -108,7 +129,7 @@ func (l *MobileRateLimiter) getLimiter(mobile string) *rate.Limiter {
 // RateLimitMiddleware wraps an http.Handler with per-IP rate limiting
 func RateLimitMiddleware(limiter *ipLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := r.RemoteAddr
+		ip := clientIP(r)
 		if !limiter.getLimiter(ip).Allow() {
 			response.Error(w, "Too many requests. Please try again later.", http.StatusTooManyRequests)
 			return

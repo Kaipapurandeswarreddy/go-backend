@@ -2,37 +2,95 @@ package offer
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
+	"ambigo-backend/internal/ids"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Store provides CRUD for offers backed by Postgres.
+//
+// Table: offers(id UUID PK, description TEXT, user_id TEXT, offer_percentage NUMERIC, offer_amount NUMERIC, max_discount NUMERIC)
 type Store struct {
-	collection *mongo.Collection
+	pool *pgxpool.Pool
 }
 
-func NewStore(db *mongo.Database) *Store {
-	return &Store{
-		collection: db.Collection("offers"),
-	}
+// NewStore creates a Store backed by the given pgxpool.Pool.
+func NewStore(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool}
 }
 
+// Create inserts a new offer. If o.ID is empty a UUID v4 is generated via ids.New().
 func (s *Store) Create(ctx context.Context, o *Offer) error {
-	o.ID = primitive.NewObjectID()
-	_, err := s.collection.InsertOne(ctx, o)
+	if o.ID == "" {
+		o.ID = ids.New()
+	}
+	// pgx handles *string/*float64 nil correctly (encodes as NULL), but we
+	// explicitly handle typed-nil to avoid driver type confusion: passing a
+	// typed nil *string as interface{} is not the same as untyped nil.
+	var userID any = o.UserID
+	if o.UserID == nil {
+		userID = nil
+	}
+	var offerPerc any = o.OfferPercentage
+	if o.OfferPercentage == nil {
+		offerPerc = nil
+	}
+	var offerAmt any = o.OfferAmount
+	if o.OfferAmount == nil {
+		offerAmt = nil
+	}
+	var maxDisc any = o.MaxDiscount
+	if o.MaxDiscount == nil {
+		maxDisc = nil
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO offers(id, description, user_id, offer_percentage, offer_amount, max_discount) VALUES($1::uuid,$2,$3,$4,$5,$6)`,
+		o.ID, o.Description, userID, offerPerc, offerAmt, maxDisc,
+	)
 	return err
 }
 
+// List returns all offers. Returns an empty slice (non-nil) when no rows exist.
 func (s *Store) List(ctx context.Context) ([]Offer, error) {
-	cursor, err := s.collection.Find(ctx, bson.M{})
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers`,
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 
 	var list []Offer
-	if err = cursor.All(ctx, &list); err != nil {
+	for rows.Next() {
+		var o Offer
+		var userID sql.NullString
+		var offerPerc, offerAmount, maxDiscount sql.NullFloat64
+		if err := rows.Scan(&o.ID, &o.Description, &userID, &offerPerc, &offerAmount, &maxDiscount); err != nil {
+			return nil, err
+		}
+		if userID.Valid {
+			v := userID.String
+			o.UserID = &v
+		}
+		if offerPerc.Valid {
+			v := offerPerc.Float64
+			o.OfferPercentage = &v
+		}
+		if offerAmount.Valid {
+			v := offerAmount.Float64
+			o.OfferAmount = &v
+		}
+		if maxDiscount.Valid {
+			v := maxDiscount.Float64
+			o.MaxDiscount = &v
+		}
+		list = append(list, o)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	if list == nil {
@@ -41,32 +99,85 @@ func (s *Store) List(ctx context.Context) ([]Offer, error) {
 	return list, nil
 }
 
-func (s *Store) GetByID(ctx context.Context, id primitive.ObjectID) (*Offer, error) {
+// GetByID returns the offer with the given UUID string, or (nil, nil) if not found.
+// The id param is a UUID string (ids.IsValid). Callers should pass string directly.
+func (s *Store) GetByID(ctx context.Context, id string) (*Offer, error) {
 	var o Offer
-	err := s.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&o)
+	var userID sql.NullString
+	var offerPerc, offerAmount, maxDiscount sql.NullFloat64
+	err := s.pool.QueryRow(ctx,
+		`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers WHERE id=$1::uuid`,
+		id,
+	).Scan(&o.ID, &o.Description, &userID, &offerPerc, &offerAmount, &maxDiscount)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
+	if userID.Valid {
+		v := userID.String
+		o.UserID = &v
+	}
+	if offerPerc.Valid {
+		v := offerPerc.Float64
+		o.OfferPercentage = &v
+	}
+	if offerAmount.Valid {
+		v := offerAmount.Float64
+		o.OfferAmount = &v
+	}
+	if maxDiscount.Valid {
+		v := maxDiscount.Float64
+		o.MaxDiscount = &v
+	}
 	return &o, nil
 }
 
-func (s *Store) Delete(ctx context.Context, id primitive.ObjectID) error {
-	_, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
+// Delete removes the offer with the given UUID string. No error if the row does not exist.
+func (s *Store) Delete(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM offers WHERE id=$1::uuid`, id)
 	return err
 }
 
+// FindByUserID returns all offers for a given user_id (TEXT). Returns empty slice when none.
 func (s *Store) FindByUserID(ctx context.Context, userID string) ([]Offer, error) {
-	cursor, err := s.collection.Find(ctx, bson.M{"user_id": userID})
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers WHERE user_id=$1`,
+		userID,
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 
 	var list []Offer
-	if err = cursor.All(ctx, &list); err != nil {
+	for rows.Next() {
+		var o Offer
+		var uid sql.NullString
+		var offerPerc, offerAmount, maxDiscount sql.NullFloat64
+		if err := rows.Scan(&o.ID, &o.Description, &uid, &offerPerc, &offerAmount, &maxDiscount); err != nil {
+			return nil, err
+		}
+		if uid.Valid {
+			v := uid.String
+			o.UserID = &v
+		}
+		if offerPerc.Valid {
+			v := offerPerc.Float64
+			o.OfferPercentage = &v
+		}
+		if offerAmount.Valid {
+			v := offerAmount.Float64
+			o.OfferAmount = &v
+		}
+		if maxDiscount.Valid {
+			v := maxDiscount.Float64
+			o.MaxDiscount = &v
+		}
+		list = append(list, o)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	if list == nil {

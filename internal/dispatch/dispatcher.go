@@ -63,7 +63,7 @@ func (d *Dispatcher) RequestRide(ctx context.Context, r *ride.Ride) error {
 		return err
 	}
 
-	rideID := r.ID.Hex()
+	rideID := r.ID
 
 	d.mu.Lock()
 	d.acceptChannels[rideID] = make(chan string)
@@ -166,7 +166,7 @@ func (d *Dispatcher) persistDispatchMetadata(rideID string, meta *ride.DispatchM
 }
 
 func (d *Dispatcher) startMatchingLoop(r *ride.Ride, reqID string) {
-	rideIDStr := r.ID.Hex()
+	rideIDStr := r.ID
 	logger.Log.Info().Str("ride_id", rideIDStr).Str("request_id", reqID).Msg("Starting matching loop")
 
 	defer func() {

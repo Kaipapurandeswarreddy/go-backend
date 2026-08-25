@@ -8,8 +8,7 @@ import (
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/auth"
-
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"ambigo-backend/internal/ids"
 )
 
 type DriverAttendantHandler struct {
@@ -28,7 +27,11 @@ func (h *DriverAttendantHandler) HandleDriverCreateAttendant(w http.ResponseWrit
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	driverID, _ := primitive.ObjectIDFromHex(driverIDStr)
+	if !ids.IsValid(driverIDStr) {
+		response.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+	driverID := driverIDStr
 	var req struct {
 		Name   string `json:"name"`
 		Mobile string `json:"mobile"`
@@ -58,7 +61,7 @@ func (h *DriverAttendantHandler) HandleDriverCreateAttendant(w http.ResponseWrit
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"detail": "Attendant updated", "id": existing.ID.Hex()})
+		json.NewEncoder(w).Encode(map[string]string{"detail": "Attendant updated", "id": existing.ID})
 		return
 	}
 	att := &auth.AmbulanceAttendant{
@@ -71,7 +74,7 @@ func (h *DriverAttendantHandler) HandleDriverCreateAttendant(w http.ResponseWrit
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Attendant added", "id": att.ID.Hex()})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Attendant added", "id": att.ID})
 }
 
 func (h *DriverAttendantHandler) HandleDriverListAttendants(w http.ResponseWriter, r *http.Request) {
@@ -80,7 +83,11 @@ func (h *DriverAttendantHandler) HandleDriverListAttendants(w http.ResponseWrite
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	driverID, _ := primitive.ObjectIDFromHex(driverIDStr)
+	if !ids.IsValid(driverIDStr) {
+		response.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+	driverID := driverIDStr
 	list, err := h.AuthStore.ListAttendantsByDriver(r.Context(), driverID)
 	if err != nil {
 		response.Error(w, "Failed to fetch", http.StatusInternalServerError)
@@ -96,7 +103,11 @@ func (h *DriverAttendantHandler) HandleDriverDeleteAttendant(w http.ResponseWrit
 		response.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	driverID, _ := primitive.ObjectIDFromHex(driverIDStr)
+	if !ids.IsValid(driverIDStr) {
+		response.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+	driverID := driverIDStr
 	var req struct {
 		ID string `json:"id"`
 	}
@@ -104,7 +115,11 @@ func (h *DriverAttendantHandler) HandleDriverDeleteAttendant(w http.ResponseWrit
 		response.Error(w, "ID required", http.StatusBadRequest)
 		return
 	}
-	attID, _ := primitive.ObjectIDFromHex(req.ID)
+	if !ids.IsValid(req.ID) {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	attID := req.ID
 	if err := h.AuthStore.DeleteAttendantForDriver(r.Context(), driverID, attID); err != nil {
 		response.Error(w, "Delete failed", http.StatusInternalServerError)
 		return

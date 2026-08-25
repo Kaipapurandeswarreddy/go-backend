@@ -5,14 +5,16 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"ambigo-backend/internal/ids"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
@@ -23,38 +25,227 @@ var (
 )
 
 const (
-	otpExpiry          = 5 * time.Minute
-	maxOTPAttempts     = 5
+	otpExpiry           = 5 * time.Minute
+	maxOTPAttempts      = 5
 	otpLockoutDuration  = 1 * time.Hour
 	refreshTokenExpiry  = 30 * 24 * time.Hour
 )
 
 type Store struct {
-	authOTP               *mongo.Collection
-	users                 *mongo.Collection
-	drivers               *mongo.Collection
-	referrals             *mongo.Collection
-	unverifiedDrivers     *mongo.Collection
-	refreshTokens         *mongo.Collection
-	otpAttempts           *mongo.Collection
-	hospitalMDs           *mongo.Collection
-	hospitalReceptionists *mongo.Collection
-	ambulanceAttendants   *mongo.Collection
+	pool *pgxpool.Pool
 }
 
-func NewStore(usersDB, recordsDB *mongo.Database) *Store {
-	return &Store{
-		authOTP:               usersDB.Collection("auth_otp"),
-		users:                 usersDB.Collection("users"),
-		drivers:               usersDB.Collection("drivers"),
-		referrals:             recordsDB.Collection("referrals"),
-		unverifiedDrivers:     usersDB.Collection("unverified_drivers"),
-		refreshTokens:         recordsDB.Collection("refresh_tokens"),
-		otpAttempts:           usersDB.Collection("otp_attempts"),
-		hospitalMDs:           usersDB.Collection("hospital_mds"),
-		hospitalReceptionists: usersDB.Collection("hospital_receptionists"),
-		ambulanceAttendants:   usersDB.Collection("ambulance_attendants"),
+func NewStore(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool}
+}
+
+// ---- helpers ----
+
+func marshalJSONB(v interface{}) []byte {
+	if v == nil {
+		return nil
 	}
+	b, err := json.Marshal(v)
+	if err != nil || string(b) == "null" {
+		return nil
+	}
+	return b
+}
+
+func scanUserRow(row pgx.Row) (*User, error) {
+	var u User
+	var myReferralCode *string
+	var locationData []byte
+	var fcmToken, jwtToken *string
+	var id string
+	err := row.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken)
+	if err != nil {
+		return nil, err
+	}
+	u.ID = id
+	if myReferralCode != nil {
+		u.MyReferralCode = *myReferralCode
+	}
+	if len(locationData) > 0 && string(locationData) != "null" {
+		var loc GeoJSONPoint
+		if err := json.Unmarshal(locationData, &loc); err == nil {
+			u.Location = &loc
+		}
+	}
+	u.FCMToken = fcmToken
+	u.JWTToken = jwtToken
+	return &u, nil
+}
+
+func scanDriverRow(row pgx.Row) (*Driver, error) {
+	var d Driver
+	var walletDetailsData []byte
+	var locationData []byte
+	var detailsData []byte
+	var myReferralCode *string
+	var fcmToken, jwtToken *string
+	var lastLocationUpdate *time.Time
+	var id string
+	err := row.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData)
+	if err != nil {
+		return nil, err
+	}
+	d.ID = id
+	if myReferralCode != nil {
+		d.MyReferralCode = *myReferralCode
+	}
+	if len(walletDetailsData) > 0 && string(walletDetailsData) != "null" {
+		_ = json.Unmarshal(walletDetailsData, &d.WalletDetails)
+	}
+	if len(locationData) > 0 && string(locationData) != "null" {
+		var loc GeoJSONPoint
+		if err := json.Unmarshal(locationData, &loc); err == nil {
+			d.Location = &loc
+		}
+	}
+	if len(detailsData) > 0 && string(detailsData) != "null" {
+		var det DriverDetails
+		if err := json.Unmarshal(detailsData, &det); err == nil {
+			d.Details = &det
+		}
+	}
+	d.FCMToken = fcmToken
+	d.JWTToken = jwtToken
+	d.LastLocationUpdate = lastLocationUpdate
+	return &d, nil
+}
+
+func scanUnverifiedDriverRow(row pgx.Row) (*UnverifiedDriver, error) {
+	var d UnverifiedDriver
+	var locationData []byte
+	var errorMessage *string
+	var fcmToken, jwtToken *string
+	var id string
+	err := row.Scan(&id, &d.Name, &d.Mobile, &d.PortraitImage, &d.POIImage, &d.DLImage, &d.RCImage, &d.AmbFront, &d.AmbInside, &d.VehicleType, &d.UnderProgress, &errorMessage, &fcmToken, &jwtToken, &locationData)
+	if err != nil {
+		return nil, err
+	}
+	d.ID = id
+	d.ErrorMessage = errorMessage
+	d.FCMToken = fcmToken
+	d.JWTToken = jwtToken
+	if len(locationData) > 0 && string(locationData) != "null" {
+		var loc GeoJSONPoint
+		if err := json.Unmarshal(locationData, &loc); err == nil {
+			d.Location = &loc
+		}
+	}
+	return &d, nil
+}
+
+func scanAuthOTPRow(row pgx.Row) (*AuthOTP, error) {
+	var o AuthOTP
+	var id string
+	err := row.Scan(&id, &o.Number, &o.OTP, &o.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	o.ID = id
+	return &o, nil
+}
+
+func scanRefreshTokenRow(row pgx.Row) (*RefreshToken, error) {
+	var rt RefreshToken
+	var sessionID, deviceID, deviceName *string
+	var revokedAt *time.Time
+	var revokedReason *string
+	var supersededBy *string
+	var id string
+	err := row.Scan(&id, &rt.UserID, &rt.Role, &rt.TokenHash, &sessionID, &deviceID, &deviceName, &rt.CreatedAt, &rt.ExpiresAt, &rt.Revoked, &revokedAt, &revokedReason, &supersededBy)
+	if err != nil {
+		return nil, err
+	}
+	rt.ID = id
+	if sessionID != nil {
+		rt.SessionID = *sessionID
+	}
+	if deviceID != nil {
+		rt.DeviceID = *deviceID
+	}
+	if deviceName != nil {
+		rt.DeviceName = *deviceName
+	}
+	rt.RevokedAt = revokedAt
+	if revokedReason != nil {
+		rt.RevokedReason = *revokedReason
+	}
+	if supersededBy != nil && *supersededBy != "" && !ids.IsZero(*supersededBy) {
+		rt.SupersededBy = supersededBy
+	}
+	return &rt, nil
+}
+
+func scanOTPAttemptRow(row pgx.Row) (*OTPAttempt, error) {
+	var a OTPAttempt
+	err := row.Scan(&a.Mobile, &a.Attempts, &a.LockedUntil, &a.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func scanHospitalMDRow(row pgx.Row) (*HospitalMD, error) {
+	var md HospitalMD
+	var hospitalPendingID, hospitalID *string
+	var username, passwordHash *string
+	var jwtToken, fcmToken *string
+	var id string
+	err := row.Scan(&id, &hospitalPendingID, &hospitalID, &md.Name, &md.Email, &md.Mobile, &md.OfficialNumber, &username, &passwordHash, &md.Status, &jwtToken, &fcmToken, &md.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	md.ID = id
+	if hospitalPendingID != nil && *hospitalPendingID != "" {
+		md.HospitalPendingID = hospitalPendingID
+	}
+	if hospitalID != nil && *hospitalID != "" {
+		md.HospitalID = hospitalID
+	}
+	md.Username = username
+	md.PasswordHash = passwordHash
+	md.JWTToken = jwtToken
+	md.FCMToken = fcmToken
+	return &md, nil
+}
+
+func scanHospitalReceptionistRow(row pgx.Row) (*HospitalReceptionist, error) {
+	var r HospitalReceptionist
+	var mobile *string
+	var jwtToken *string
+	var id, hospitalID, createdByMDID string
+	err := row.Scan(&id, &hospitalID, &createdByMDID, &r.Name, &r.Username, &r.PasswordHash, &mobile, &r.Active, &r.CreatedAt, &jwtToken)
+	if err != nil {
+		return nil, err
+	}
+	r.ID = id
+	r.HospitalID = hospitalID
+	r.CreatedByMDID = createdByMDID
+	r.Mobile = mobile
+	r.JWTToken = jwtToken
+	return &r, nil
+}
+
+func scanAmbulanceAttendantRow(row pgx.Row) (*AmbulanceAttendant, error) {
+	var a AmbulanceAttendant
+	var assignedDriverID *string
+	var jwtToken, fcmToken *string
+	var id string
+	err := row.Scan(&id, &a.Name, &a.Mobile, &assignedDriverID, &jwtToken, &fcmToken, &a.Active, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	a.ID = id
+	if assignedDriverID != nil && *assignedDriverID != "" {
+		a.AssignedDriverID = assignedDriverID
+	}
+	a.JWTToken = jwtToken
+	a.FCMToken = fcmToken
+	return &a, nil
 }
 
 // ---- OTP ----
@@ -67,78 +258,60 @@ func (s *Store) GenerateAndStoreOTP(ctx context.Context, mobile string) (string,
 	}
 	otpStr := fmt.Sprintf("%06d", n.Int64())
 
-	filter := bson.M{"number": mobile}
-	update := bson.M{
-		"$set": bson.M{
-			"otp":        otpStr,
-			"created_at": time.Now(),
-		},
+	tag, err := s.pool.Exec(ctx, `UPDATE auth_otp SET otp=$2, created_at=now() WHERE number=$1`, mobile, otpStr)
+	if err != nil {
+		return "", err
 	}
-	opts := options.Update().SetUpsert(true)
-	_, err = s.authOTP.UpdateOne(ctx, filter, update, opts)
-	return otpStr, err
+	if tag.RowsAffected() == 0 {
+		_, err = s.pool.Exec(ctx, `INSERT INTO auth_otp (id, number, otp, created_at) VALUES ($1::uuid, $2, $3, now())`, ids.New(), mobile, otpStr)
+		if err != nil {
+			return "", err
+		}
+	}
+	return otpStr, nil
 }
 
 func (s *Store) VerifyOTP(ctx context.Context, mobile string, providedOTP string) (bool, error) {
-	filter := bson.M{"number": mobile}
-	var record AuthOTP
-	err := s.authOTP.FindOne(ctx, filter).Decode(&record)
+	var otp string
+	var createdAt time.Time
+	err := s.pool.QueryRow(ctx, `SELECT otp, created_at FROM auth_otp WHERE number=$1 ORDER BY created_at DESC LIMIT 1`, mobile).Scan(&otp, &createdAt)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
 		return false, err
 	}
-
-	// V2: Check OTP expiry in application code
-	if time.Since(record.CreatedAt) > otpExpiry {
+	if time.Since(createdAt) > otpExpiry {
 		return false, nil
 	}
-
-	return record.OTP == providedOTP, nil
+	return otp == providedOTP, nil
 }
 
 // ---- OTP Account Lockout (V13) ----
 
 func (s *Store) IncrementFailedOTP(ctx context.Context, mobile string) error {
-	now := time.Now()
-	filter := bson.M{"mobile": mobile}
-	update := bson.M{
-		"$inc":  bson.M{"attempts": 1},
-		"$set":  bson.M{"updated_at": now},
-		"$setOnInsert": bson.M{"mobile": mobile},
-	}
-	opts := options.Update().SetUpsert(true)
-
-	res, err := s.otpAttempts.UpdateOne(ctx, filter, update, opts)
+	var attempts int
+	err := s.pool.QueryRow(ctx, `INSERT INTO otp_attempts (mobile, attempts, updated_at) VALUES ($1, 1, now()) ON CONFLICT (mobile) DO UPDATE SET attempts = otp_attempts.attempts + 1, updated_at = now() RETURNING attempts`, mobile).Scan(&attempts)
 	if err != nil {
 		return err
 	}
-
-	// After update, fetch to check if we need to lock
-	if res.ModifiedCount > 0 || res.UpsertedCount > 0 {
-		var attempt OTPAttempt
-		_ = s.otpAttempts.FindOne(ctx, filter).Decode(&attempt)
-		if attempt.Attempts >= maxOTPAttempts {
-			lockedUntil := now.Add(otpLockoutDuration)
-			_, _ = s.otpAttempts.UpdateOne(ctx, filter, bson.M{
-				"$set": bson.M{"locked_until": lockedUntil, "attempts": 0, "updated_at": now},
-			})
-		}
+	if attempts >= maxOTPAttempts {
+		lockedUntil := time.Now().Add(otpLockoutDuration)
+		_, _ = s.pool.Exec(ctx, `UPDATE otp_attempts SET locked_until=$2, attempts=0, updated_at=now() WHERE mobile=$1`, mobile, lockedUntil)
 	}
 	return nil
 }
 
 func (s *Store) ResetFailedOTP(ctx context.Context, mobile string) error {
-	_, err := s.otpAttempts.DeleteOne(ctx, bson.M{"mobile": mobile})
+	_, err := s.pool.Exec(ctx, `DELETE FROM otp_attempts WHERE mobile=$1`, mobile)
 	return err
 }
 
 func (s *Store) IsOTPLocked(ctx context.Context, mobile string) (bool, error) {
 	var attempt OTPAttempt
-	err := s.otpAttempts.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&attempt)
+	err := s.pool.QueryRow(ctx, `SELECT mobile, attempts, locked_until, updated_at FROM otp_attempts WHERE mobile=$1`, mobile).Scan(&attempt.Mobile, &attempt.Attempts, &attempt.LockedUntil, &attempt.UpdatedAt)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
 		return false, err
@@ -146,9 +319,8 @@ func (s *Store) IsOTPLocked(ctx context.Context, mobile string) (bool, error) {
 	if attempt.LockedUntil != nil && time.Now().Before(*attempt.LockedUntil) {
 		return true, nil
 	}
-	// Lock expired, reset
 	if attempt.LockedUntil != nil && time.Now().After(*attempt.LockedUntil) {
-		_, _ = s.otpAttempts.DeleteOne(ctx, bson.M{"mobile": mobile})
+		_, _ = s.pool.Exec(ctx, `DELETE FROM otp_attempts WHERE mobile=$1`, mobile)
 		return false, nil
 	}
 	return false, nil
@@ -156,9 +328,6 @@ func (s *Store) IsOTPLocked(ctx context.Context, mobile string) (bool, error) {
 
 // ---- Refresh Tokens (V5, V8, V18) ----
 
-// NewSessionID generates a unique identifier for a single login session.
-// It is minted once at login and inherited by every refresh rotation so the
-// whole chain belongs to the same session.
 func NewSessionID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -178,18 +347,18 @@ func (s *Store) CreateRefreshToken(ctx context.Context, userID, role, sessionID,
 
 	now := time.Now()
 	rt := &RefreshToken{
-		ID:         primitive.NewObjectID(),
-		UserID:     userID,
-		Role:       role,
-		TokenHash:  tokenHash,
-		SessionID:  sessionID,
-		DeviceID:   deviceID,
+		ID:        ids.New(),
+		UserID:    userID,
+		Role:      role,
+		TokenHash: tokenHash,
+		SessionID: sessionID,
+		DeviceID:  deviceID,
 		DeviceName: deviceName,
-		CreatedAt:  now,
-		ExpiresAt:  now.Add(refreshTokenExpiry),
-		Revoked:    false,
+		CreatedAt: now,
+		ExpiresAt: now.Add(refreshTokenExpiry),
+		Revoked:   false,
 	}
-	_, err := s.refreshTokens.InsertOne(ctx, rt)
+	_, err := s.pool.Exec(ctx, `INSERT INTO refresh_tokens (id, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, false)`, rt.ID, rt.UserID, rt.Role, rt.TokenHash, rt.SessionID, rt.DeviceID, rt.DeviceName, rt.CreatedAt, rt.ExpiresAt)
 	if err != nil {
 		return "", nil, err
 	}
@@ -204,10 +373,10 @@ func (s *Store) ValidateRefreshToken(ctx context.Context, tokenStr string) (*Ref
 	hash := sha256.Sum256(raw)
 	tokenHash := hex.EncodeToString(hash[:])
 
-	var rt RefreshToken
-	err = s.refreshTokens.FindOne(ctx, bson.M{"token_hash": tokenHash}).Decode(&rt)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked, revoked_at, revoked_reason, superseded_by::text FROM refresh_tokens WHERE token_hash=$1`, tokenHash)
+	rt, err := scanRefreshTokenRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -218,11 +387,9 @@ func (s *Store) ValidateRefreshToken(ctx context.Context, tokenStr string) (*Ref
 	if time.Now().After(rt.ExpiresAt) {
 		return nil, nil
 	}
-	return &rt, nil
+	return rt, nil
 }
 
-// LookupRefreshTokenByHash finds a refresh token by its hash, returning the document
-// regardless of whether it is revoked or expired. Returns nil if not found.
 func (s *Store) LookupRefreshTokenByHash(ctx context.Context, tokenStr string) (*RefreshToken, error) {
 	raw, err := hex.DecodeString(tokenStr)
 	if err != nil {
@@ -231,20 +398,17 @@ func (s *Store) LookupRefreshTokenByHash(ctx context.Context, tokenStr string) (
 	hash := sha256.Sum256(raw)
 	tokenHash := hex.EncodeToString(hash[:])
 
-	var rt RefreshToken
-	err = s.refreshTokens.FindOne(ctx, bson.M{"token_hash": tokenHash}).Decode(&rt)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked, revoked_at, revoked_reason, superseded_by::text FROM refresh_tokens WHERE token_hash=$1`, tokenHash)
+	rt, err := scanRefreshTokenRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &rt, nil
+	return rt, nil
 }
 
-// RotateById atomically revokes an existing (non-revoked, non-expired) refresh token
-// by its _id and creates a new token linked via superseded_by.
-// Returns the new token and its raw string, or an error if the old token was already revoked.
 func (s *Store) RotateById(ctx context.Context, oldToken *RefreshToken, deviceID, deviceName string) (*RefreshToken, string, error) {
 	if oldToken.Revoked {
 		return nil, "", ErrTokenAlreadyRevoked
@@ -253,63 +417,59 @@ func (s *Store) RotateById(ctx context.Context, oldToken *RefreshToken, deviceID
 		return nil, "", ErrTokenAlreadyRevoked
 	}
 
-	// Create new token first — the session must be inherited from the old
-	// token so a refresh never mints a brand-new session.
 	newTokenStr, newToken, err := s.CreateRefreshToken(ctx, oldToken.UserID, oldToken.Role, oldToken.SessionID, deviceID, deviceName)
 	if err != nil {
 		return nil, "", err
 	}
 
-	// Atomically revoke old token and link to new one
 	now := time.Now()
-	result, err := s.refreshTokens.UpdateOne(
-		ctx,
-		bson.M{"_id": oldToken.ID, "revoked": false},
-		bson.M{"$set": bson.M{"revoked": true, "revoked_at": now, "revoked_reason": "rotated", "superseded_by": newToken.ID}},
-	)
+	tag, err := s.pool.Exec(ctx, `UPDATE refresh_tokens SET revoked=true, revoked_at=$2, revoked_reason='rotated', superseded_by=$3::uuid WHERE id=$1::uuid AND revoked=false`, oldToken.ID, now, newToken.ID)
 	if err != nil {
-		// Clean up orphaned new token
-		_, _ = s.refreshTokens.DeleteOne(ctx, bson.M{"_id": newToken.ID})
+		_, _ = s.pool.Exec(ctx, `DELETE FROM refresh_tokens WHERE id=$1::uuid`, newToken.ID)
 		return nil, "", err
 	}
-	if result.ModifiedCount == 0 {
-		// Old token was already revoked by a concurrent request
-		_, _ = s.refreshTokens.DeleteOne(ctx, bson.M{"_id": newToken.ID})
+	if tag.RowsAffected() == 0 {
+		_, _ = s.pool.Exec(ctx, `DELETE FROM refresh_tokens WHERE id=$1::uuid`, newToken.ID)
 		return nil, "", ErrTokenAlreadyRevoked
 	}
 
 	return newToken, newTokenStr, nil
 }
 
-// FindLiveInChain follows the superseded_by chain starting from a revoked token
-// to find the current live (non-revoked, non-expired) token at the end of the chain.
+func (s *Store) findRefreshTokenByID(ctx context.Context, id string) (*RefreshToken, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid id: %s", id)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked, revoked_at, revoked_reason, superseded_by::text FROM refresh_tokens WHERE id=$1::uuid`, id)
+	return scanRefreshTokenRow(row)
+}
+
 func (s *Store) FindLiveInChain(ctx context.Context, startingFrom *RefreshToken) (*RefreshToken, error) {
 	if startingFrom == nil {
 		return nil, fmt.Errorf("FindLiveInChain: startingFrom is nil")
 	}
 	current := startingFrom
-	visited := make(map[primitive.ObjectID]bool)
+	visited := make(map[string]bool)
 
-	for current.SupersededBy != primitive.NilObjectID {
-		if visited[current.SupersededBy] {
+	for current.SupersededBy != nil && !ids.IsZero(*current.SupersededBy) {
+		if visited[*current.SupersededBy] {
 			return nil, ErrCycleDetected
 		}
-		visited[current.SupersededBy] = true
+		visited[*current.SupersededBy] = true
 
-		var next RefreshToken
-		err := s.refreshTokens.FindOne(ctx, bson.M{"_id": current.SupersededBy}).Decode(&next)
+		next, err := s.findRefreshTokenByID(ctx, *current.SupersededBy)
 		if err != nil {
-			if err == mongo.ErrNoDocuments {
+			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, ErrBrokenChain
 			}
 			return nil, err
 		}
 
 		if !next.Revoked && time.Now().Before(next.ExpiresAt) {
-			return &next, nil
+			return next, nil
 		}
 
-		current = &next
+		current = next
 	}
 
 	return nil, ErrNoLiveToken
@@ -323,93 +483,114 @@ func (s *Store) RevokeRefreshToken(ctx context.Context, tokenStr, reason string)
 	hash := sha256.Sum256(raw)
 	tokenHash := hex.EncodeToString(hash[:])
 
-	_, err = s.refreshTokens.UpdateOne(ctx, bson.M{"token_hash": tokenHash}, bson.M{
-		"$set": bson.M{"revoked": true, "revoked_at": time.Now(), "revoked_reason": reason},
-	})
+	_, err = s.pool.Exec(ctx, `UPDATE refresh_tokens SET revoked=true, revoked_at=now(), revoked_reason=$2 WHERE token_hash=$1`, tokenHash, reason)
 	return err
 }
 
-// RevokeAllUserRefreshTokens revokes every live refresh token for a user and
-// returns the number of tokens that were actually revoked.
 func (s *Store) RevokeAllUserRefreshTokens(ctx context.Context, userID, reason string) (int64, error) {
-	res, err := s.refreshTokens.UpdateMany(ctx, bson.M{"user_id": userID, "revoked": false}, bson.M{
-		"$set": bson.M{"revoked": true, "revoked_at": time.Now(), "revoked_reason": reason},
-	})
+	tag, err := s.pool.Exec(ctx, `UPDATE refresh_tokens SET revoked=true, revoked_at=now(), revoked_reason=$2 WHERE user_id=$1 AND revoked=false`, userID, reason)
 	if err != nil {
 		return 0, err
 	}
-	return res.ModifiedCount, nil
+	return tag.RowsAffected(), nil
 }
 
 func (s *Store) ListUserSessions(ctx context.Context, userID string) ([]RefreshToken, error) {
-	cursor, err := s.refreshTokens.Find(ctx, bson.M{"user_id": userID, "revoked": false})
+	rows, err := s.pool.Query(ctx, `SELECT id::text, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked, revoked_at, revoked_reason, superseded_by::text FROM refresh_tokens WHERE user_id=$1 AND revoked=false`, userID)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var tokens []RefreshToken
-	if err = cursor.All(ctx, &tokens); err != nil {
-		return nil, err
+	for rows.Next() {
+		var rt RefreshToken
+		var sessionID, deviceID, deviceName *string
+		var revokedAt *time.Time
+		var revokedReason *string
+		var supersededBy *string
+		var id string
+		if err := rows.Scan(&id, &rt.UserID, &rt.Role, &rt.TokenHash, &sessionID, &deviceID, &deviceName, &rt.CreatedAt, &rt.ExpiresAt, &rt.Revoked, &revokedAt, &revokedReason, &supersededBy); err != nil {
+			return nil, err
+		}
+		rt.ID = id
+		if sessionID != nil {
+			rt.SessionID = *sessionID
+		}
+		if deviceID != nil {
+			rt.DeviceID = *deviceID
+		}
+		if deviceName != nil {
+			rt.DeviceName = *deviceName
+		}
+		rt.RevokedAt = revokedAt
+		if revokedReason != nil {
+			rt.RevokedReason = *revokedReason
+		}
+		if supersededBy != nil && *supersededBy != "" && !ids.IsZero(*supersededBy) {
+			rt.SupersededBy = supersededBy
+		}
+		tokens = append(tokens, rt)
 	}
 	if tokens == nil {
 		tokens = []RefreshToken{}
 	}
-	return tokens, nil
+	return tokens, rows.Err()
 }
 
-// CurrentSessions returns the latest live session_id per (role, user) so the
-// WebSocket manager can re-arm its session gate after a backend restart.
-// Without this, a backend restart would let a stale-session device reconnect
-// and ride out its JWT's remaining life.
 func (s *Store) CurrentSessions(ctx context.Context) (map[string]string, error) {
-	cursor, err := s.refreshTokens.Find(
-		ctx,
-		bson.M{"revoked": false, "user_id": bson.M{"$ne": ""}},
-		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}),
-	)
+	rows, err := s.pool.Query(ctx, `SELECT session_id, role, user_id FROM refresh_tokens WHERE revoked=false AND user_id <> '' ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 
 	result := make(map[string]string)
-	for cursor.Next(ctx) {
-		var rt RefreshToken
-		if err := cursor.Decode(&rt); err != nil {
+	for rows.Next() {
+		var sidPtr *string
+		var r, uid string
+		if err := rows.Scan(&sidPtr, &r, &uid); err != nil {
 			continue
 		}
-		if rt.SessionID == "" {
+		if sidPtr == nil || *sidPtr == "" {
 			continue
 		}
-		key := rt.Role + ":" + rt.UserID
+		sid := *sidPtr
+		key := r + ":" + uid
 		if _, seen := result[key]; !seen {
-			result[key] = rt.SessionID
+			result[key] = sid
 		}
 	}
-	return result, cursor.Err()
+	return result, rows.Err()
 }
 
 func (s *Store) RevokeSessionByDeviceID(ctx context.Context, userID, deviceID, reason string) error {
-	_, err := s.refreshTokens.UpdateMany(ctx, bson.M{"user_id": userID, "device_id": deviceID, "revoked": false}, bson.M{
-		"$set": bson.M{"revoked": true, "revoked_at": time.Now(), "revoked_reason": reason},
-	})
+	_, err := s.pool.Exec(ctx, `UPDATE refresh_tokens SET revoked=true, revoked_at=now(), revoked_reason=$3 WHERE user_id=$1 AND device_id=$2 AND revoked=false`, userID, deviceID, reason)
 	return err
 }
 
 // ---- Logout (V4) ----
 
-func (s *Store) ClearUserJWT(ctx context.Context, userID primitive.ObjectID) error {
-	_, err := s.users.UpdateOne(ctx, bson.M{"_id": userID}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+func (s *Store) ClearUserJWT(ctx context.Context, userID string) error {
+	if !ids.IsValid(userID) {
+		return fmt.Errorf("invalid id: %s", userID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE users SET jwt_token=NULL WHERE id=$1::uuid`, userID)
 	return err
 }
 
-func (s *Store) ClearDriverJWT(ctx context.Context, driverID primitive.ObjectID) error {
-	_, err := s.drivers.UpdateOne(ctx, bson.M{"_id": driverID}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+func (s *Store) ClearDriverJWT(ctx context.Context, driverID string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET jwt_token=NULL WHERE id=$1::uuid`, driverID)
 	return err
 }
 
-func (s *Store) ClearUnverifiedDriverJWT(ctx context.Context, driverID primitive.ObjectID) error {
-	_, err := s.unverifiedDrivers.UpdateOne(ctx, bson.M{"_id": driverID}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+func (s *Store) ClearUnverifiedDriverJWT(ctx context.Context, driverID string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE unverified_drivers SET jwt_token=NULL WHERE id=$1::uuid`, driverID)
 	return err
 }
 
@@ -419,7 +600,8 @@ func (s *Store) ValidateReferralCode(ctx context.Context, code string) (bool, er
 	if code == "" {
 		return false, nil
 	}
-	count, err := s.referrals.CountDocuments(ctx, bson.M{"value": code})
+	var count int64
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM referrals_legacy WHERE value=$1`, code).Scan(&count)
 	if err != nil {
 		return false, err
 	}
@@ -440,586 +622,775 @@ func IsValidIndianMobile(mobile string) bool {
 	return mobile[0] >= '6' && mobile[0] <= '9'
 }
 
-// ---- Existing methods below (unchanged) ----
+// ---- Existing methods below ----
 
 func (s *Store) FindUserByMobile(ctx context.Context, mobile string) (*User, error) {
-	var user User
-	err := s.users.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&user)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users WHERE mobile=$1`, mobile)
+	u, err := scanUserRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &user, nil
+	return u, nil
 }
 
 func (s *Store) FindDriverByMobile(ctx context.Context, mobile string) (*Driver, error) {
-	var driver Driver
-	err := s.drivers.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&driver)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE mobile=$1`, mobile)
+	d, err := scanDriverRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &driver, nil
+	return d, nil
 }
 
 func (s *Store) FindUnverifiedDriverByMobile(ctx context.Context, mobile string) (*UnverifiedDriver, error) {
-	var driver UnverifiedDriver
-	err := s.unverifiedDrivers.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&driver)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers WHERE mobile=$1`, mobile)
+	d, err := scanUnverifiedDriverRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &driver, nil
+	return d, nil
 }
 
 func (s *Store) CreateUser(ctx context.Context, name, mobile, referralCode string) (*User, error) {
 	user := &User{
-		ID:           primitive.NewObjectID(),
+		ID:           ids.New(),
 		Name:         name,
 		Mobile:       mobile,
 		ReferralCode: referralCode,
 	}
-	_, err := s.users.InsertOne(ctx, user)
+	_, err := s.pool.Exec(ctx, `INSERT INTO users (id, name, mobile, referral_code) VALUES ($1::uuid, $2, $3, $4)`, user.ID, user.Name, user.Mobile, user.ReferralCode)
 	return user, err
 }
 
 func (s *Store) CreateUnverifiedDriver(ctx context.Context, name, mobile string) (*UnverifiedDriver, error) {
 	driver := &UnverifiedDriver{
-		ID:            primitive.NewObjectID(),
+		ID:            ids.New(),
 		Name:          name,
 		Mobile:        mobile,
 		UnderProgress: false,
 	}
-	_, err := s.unverifiedDrivers.InsertOne(ctx, driver)
+	_, err := s.pool.Exec(ctx, `INSERT INTO unverified_drivers (id, name, mobile, under_progress) VALUES ($1::uuid, $2, $3, $4)`, driver.ID, driver.Name, driver.Mobile, driver.UnderProgress)
 	return driver, err
 }
 
-func (s *Store) UpdateUserJWT(ctx context.Context, userID primitive.ObjectID, token string) error {
-	filter := bson.M{"_id": userID}
-	update := bson.M{"$set": bson.M{"jwt_token": token}}
-	_, err := s.users.UpdateOne(ctx, filter, update)
+func (s *Store) UpdateUserJWT(ctx context.Context, userID string, token string) error {
+	if !ids.IsValid(userID) {
+		return fmt.Errorf("invalid id: %s", userID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE users SET jwt_token=$2 WHERE id=$1::uuid`, userID, token)
 	return err
 }
 
-func (s *Store) UpdateDriverJWT(ctx context.Context, driverID primitive.ObjectID, token string) error {
-	filter := bson.M{"_id": driverID}
-	update := bson.M{"$set": bson.M{"jwt_token": token}}
-	_, err := s.drivers.UpdateOne(ctx, filter, update)
+func (s *Store) UpdateDriverJWT(ctx context.Context, driverID string, token string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET jwt_token=$2 WHERE id=$1::uuid`, driverID, token)
 	return err
 }
 
-func (s *Store) UpdateUnverifiedDriverJWT(ctx context.Context, driverID primitive.ObjectID, token string) error {
-	filter := bson.M{"_id": driverID}
-	update := bson.M{"$set": bson.M{"jwt_token": token}}
-	_, err := s.unverifiedDrivers.UpdateOne(ctx, filter, update)
+func (s *Store) UpdateUnverifiedDriverJWT(ctx context.Context, driverID string, token string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE unverified_drivers SET jwt_token=$2 WHERE id=$1::uuid`, driverID, token)
 	return err
 }
 
-func (s *Store) FindUserByID(ctx context.Context, id primitive.ObjectID) (*User, error) {
-	var user User
-	err := s.users.FindOne(ctx, bson.M{"_id": id}).Decode(&user)
+func (s *Store) FindUserByID(ctx context.Context, id string) (*User, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid id: %s", id)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users WHERE id=$1::uuid`, id)
+	u, err := scanUserRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &user, nil
+	return u, nil
 }
 
-func (s *Store) FindDriverByID(ctx context.Context, id primitive.ObjectID) (*Driver, error) {
-	var driver Driver
-	err := s.drivers.FindOne(ctx, bson.M{"_id": id}).Decode(&driver)
+func (s *Store) FindDriverByID(ctx context.Context, id string) (*Driver, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid id: %s", id)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE id=$1::uuid`, id)
+	d, err := scanDriverRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &driver, nil
+	return d, nil
 }
 
 func (s *Store) GetDriverFCMToken(ctx context.Context, driverID string) (*string, error) {
-	objID, err := primitive.ObjectIDFromHex(driverID)
-	if err != nil {
-		return nil, err
+	if !ids.IsValid(driverID) {
+		return nil, fmt.Errorf("invalid id: %s", driverID)
 	}
-	var driver Driver
-	err = s.drivers.FindOne(ctx, bson.M{"_id": objID}).Decode(&driver)
+	var fcmToken *string
+	err := s.pool.QueryRow(ctx, `SELECT fcm_token FROM drivers WHERE id=$1::uuid`, driverID).Scan(&fcmToken)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return driver.FCMToken, nil
+	return fcmToken, nil
 }
 
-func (s *Store) FindUnverifiedDriverByID(ctx context.Context, id primitive.ObjectID) (*UnverifiedDriver, error) {
-	var driver UnverifiedDriver
-	err := s.unverifiedDrivers.FindOne(ctx, bson.M{"_id": id}).Decode(&driver)
+func (s *Store) FindUnverifiedDriverByID(ctx context.Context, id string) (*UnverifiedDriver, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid id: %s", id)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers WHERE id=$1::uuid`, id)
+	d, err := scanUnverifiedDriverRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &driver, nil
+	return d, nil
 }
 
-func (s *Store) UpdateUserFCM(ctx context.Context, id primitive.ObjectID, token string) error {
-	filter := bson.M{"_id": id}
-	update := bson.M{"$set": bson.M{"fcm_token": token}}
-	_, err := s.users.UpdateOne(ctx, filter, update)
+func (s *Store) UpdateUserFCM(ctx context.Context, id string, token string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE users SET fcm_token=$2 WHERE id=$1::uuid`, id, token)
 	return err
 }
 
-func (s *Store) UpdateDriverFCM(ctx context.Context, id primitive.ObjectID, token string) error {
-	filter := bson.M{"_id": id}
-	update := bson.M{"$set": bson.M{"fcm_token": token}}
-	_, err := s.drivers.UpdateOne(ctx, filter, update)
+func (s *Store) UpdateDriverFCM(ctx context.Context, id string, token string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET fcm_token=$2 WHERE id=$1::uuid`, id, token)
 	return err
 }
 
-func (s *Store) UpdateUnverifiedDriverFCM(ctx context.Context, id primitive.ObjectID, token string) error {
-	filter := bson.M{"_id": id}
-	update := bson.M{"$set": bson.M{"fcm_token": token}}
-	_, err := s.unverifiedDrivers.UpdateOne(ctx, filter, update)
+func (s *Store) UpdateUnverifiedDriverFCM(ctx context.Context, id string, token string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE unverified_drivers SET fcm_token=$2 WHERE id=$1::uuid`, id, token)
 	return err
 }
 
 func (s *Store) UpdateUnverifiedDriver(ctx context.Context, driver *UnverifiedDriver) error {
-	filter := bson.M{"_id": driver.ID}
-	setFields := bson.M{
-		"under_progress": true,
-		"error_message":  nil,
+	if !ids.IsValid(driver.ID) {
+		return fmt.Errorf("invalid id: %s", driver.ID)
 	}
-	if driver.PortraitImage != "" {
-		setFields["portrait_image"] = driver.PortraitImage
-	}
-	if driver.POIImage != "" {
-		setFields["poi_image"] = driver.POIImage
-	}
-	if driver.DLImage != "" {
-		setFields["dl_image"] = driver.DLImage
-	}
-	if driver.RCImage != "" {
-		setFields["rc_image"] = driver.RCImage
-	}
-	if driver.AmbFront != "" {
-		setFields["amb_front"] = driver.AmbFront
-	}
-	if driver.AmbInside != "" {
-		setFields["amb_inside"] = driver.AmbInside
-	}
-	update := bson.M{"$set": setFields}
-	_, err := s.unverifiedDrivers.UpdateOne(ctx, filter, update)
+	// Build dynamic update preserving original behavior: set under_progress true, error_message NULL, and only overwrite image fields if non-empty
+	locationData := marshalJSONB(driver.Location)
+	_, err := s.pool.Exec(ctx, `
+		UPDATE unverified_drivers SET
+			under_progress = true,
+			error_message = NULL,
+			portrait_image = CASE WHEN $2 <> '' THEN $2 ELSE portrait_image END,
+			poi_image = CASE WHEN $3 <> '' THEN $3 ELSE poi_image END,
+			dl_image = CASE WHEN $4 <> '' THEN $4 ELSE dl_image END,
+			rc_image = CASE WHEN $5 <> '' THEN $5 ELSE rc_image END,
+			amb_front = CASE WHEN $6 <> '' THEN $6 ELSE amb_front END,
+			amb_inside = CASE WHEN $7 <> '' THEN $7 ELSE amb_inside END,
+			location = COALESCE($8::jsonb, location)
+		WHERE id=$1::uuid`, driver.ID, driver.PortraitImage, driver.POIImage, driver.DLImage, driver.RCImage, driver.AmbFront, driver.AmbInside, locationData)
 	return err
 }
 
 func (s *Store) ApproveDriver(ctx context.Context, driver *Driver) error {
-	_, err := s.drivers.InsertOne(ctx, driver)
+	walletDetailsData := marshalJSONB(driver.WalletDetails)
+	locationData := marshalJSONB(driver.Location)
+	detailsData := marshalJSONB(driver.Details)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = s.unverifiedDrivers.DeleteOne(ctx, bson.M{"_id": driver.ID})
-	return err
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb)`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM unverified_drivers WHERE id=$1::uuid`, driver.ID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ListDrivers(ctx context.Context, skip int64) ([]Driver, int64, error) {
-	total, err := s.drivers.CountDocuments(ctx, bson.M{})
+	var total int64
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM drivers`).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
-	projection := bson.D{{Key: "details", Value: 0}}
-	opts := options.Find().SetSkip(skip).SetLimit(20).SetSort(bson.M{"_id": -1}).SetProjection(projection)
-	cursor, err := s.drivers.Find(ctx, bson.M{}, opts)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers ORDER BY created_at DESC, id DESC OFFSET $1 LIMIT 20`, skip)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var drivers []Driver
-	if err = cursor.All(ctx, &drivers); err != nil {
-		return nil, 0, err
+	for rows.Next() {
+		var d Driver
+		var walletDetailsData []byte
+		var locationData []byte
+		var detailsData []byte
+		var myReferralCode *string
+		var fcmToken, jwtToken *string
+		var lastLocationUpdate *time.Time
+		var id string
+		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData); err != nil {
+			return nil, 0, err
+		}
+		d.ID = id
+		if myReferralCode != nil {
+			d.MyReferralCode = *myReferralCode
+		}
+		if len(walletDetailsData) > 0 && string(walletDetailsData) != "null" {
+			_ = json.Unmarshal(walletDetailsData, &d.WalletDetails)
+		}
+		if len(locationData) > 0 && string(locationData) != "null" {
+			var loc GeoJSONPoint
+			if err := json.Unmarshal(locationData, &loc); err == nil {
+				d.Location = &loc
+			}
+		}
+		if len(detailsData) > 0 && string(detailsData) != "null" {
+			var det DriverDetails
+			if err := json.Unmarshal(detailsData, &det); err == nil {
+				d.Details = &det
+			}
+		}
+		d.FCMToken = fcmToken
+		d.JWTToken = jwtToken
+		d.LastLocationUpdate = lastLocationUpdate
+		drivers = append(drivers, d)
 	}
 	if drivers == nil {
 		drivers = []Driver{}
 	}
-	return drivers, total, nil
+	return drivers, total, rows.Err()
 }
 
 func (s *Store) InsertDriver(ctx context.Context, driver *Driver) error {
-	driver.ID = primitive.NewObjectID()
-	_, err := s.drivers.InsertOne(ctx, driver)
+	driver.ID = ids.New()
+	walletDetailsData := marshalJSONB(driver.WalletDetails)
+	locationData := marshalJSONB(driver.Location)
+	detailsData := marshalJSONB(driver.Details)
+	_, err := s.pool.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb)`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
 	return err
 }
 
 func (s *Store) UpdateDriver(ctx context.Context, driver *Driver) error {
-	_, err := s.drivers.ReplaceOne(ctx, bson.M{"_id": driver.ID}, driver)
+	if !ids.IsValid(driver.ID) {
+		return fmt.Errorf("invalid id: %s", driver.ID)
+	}
+	walletDetailsData := marshalJSONB(driver.WalletDetails)
+	locationData := marshalJSONB(driver.Location)
+	detailsData := marshalJSONB(driver.Details)
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET name=$2, mobile=$3, photo=$4, vehicle_type=$5, vehicle_registration=$6, wallet_details=$7::jsonb, wallet_balance=$8, referral_code=$9, my_referral_code=$10, location=$11::jsonb, fcm_token=$12, jwt_token=$13, last_location_update=$14, details=$15::jsonb WHERE id=$1::uuid`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
 	return err
 }
 
-func (s *Store) DeleteDriver(ctx context.Context, id primitive.ObjectID) error {
-	_, err := s.drivers.DeleteOne(ctx, bson.M{"_id": id})
+func (s *Store) DeleteDriver(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM drivers WHERE id=$1::uuid`, id)
 	return err
 }
 
 func (s *Store) ListUnverifiedDrivers(ctx context.Context) ([]UnverifiedDriver, error) {
-	projection := bson.D{
-		{Key: "portrait_image", Value: 0},
-		{Key: "poi_image", Value: 0},
-		{Key: "dl_image", Value: 0},
-		{Key: "rc_image", Value: 0},
-		{Key: "amb_front", Value: 0},
-		{Key: "amb_inside", Value: 0},
-	}
-	opts := options.Find().SetProjection(projection)
-	cursor, err := s.unverifiedDrivers.Find(ctx, bson.M{"under_progress": true}, opts)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers WHERE under_progress=true`)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var drivers []UnverifiedDriver
-	if err = cursor.All(ctx, &drivers); err != nil {
-		return nil, err
+	for rows.Next() {
+		var d UnverifiedDriver
+		var locationData []byte
+		var errorMessage *string
+		var fcmToken, jwtToken *string
+		var id string
+		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.PortraitImage, &d.POIImage, &d.DLImage, &d.RCImage, &d.AmbFront, &d.AmbInside, &d.VehicleType, &d.UnderProgress, &errorMessage, &fcmToken, &jwtToken, &locationData); err != nil {
+			return nil, err
+		}
+		d.ID = id
+		d.ErrorMessage = errorMessage
+		d.FCMToken = fcmToken
+		d.JWTToken = jwtToken
+		if len(locationData) > 0 && string(locationData) != "null" {
+			var loc GeoJSONPoint
+			if err := json.Unmarshal(locationData, &loc); err == nil {
+				d.Location = &loc
+			}
+		}
+		drivers = append(drivers, d)
 	}
 	if drivers == nil {
 		drivers = []UnverifiedDriver{}
 	}
-	return drivers, nil
+	return drivers, rows.Err()
 }
 
 func (s *Store) ListAllUnverifiedDrivers(ctx context.Context) ([]UnverifiedDriver, error) {
-	projection := bson.D{
-		{Key: "portrait_image", Value: 0},
-		{Key: "poi_image", Value: 0},
-		{Key: "dl_image", Value: 0},
-		{Key: "rc_image", Value: 0},
-		{Key: "amb_front", Value: 0},
-		{Key: "amb_inside", Value: 0},
-	}
-	opts := options.Find().SetProjection(projection)
-	cursor, err := s.unverifiedDrivers.Find(ctx, bson.M{}, opts)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers`)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var drivers []UnverifiedDriver
-	if err = cursor.All(ctx, &drivers); err != nil {
-		return nil, err
+	for rows.Next() {
+		var d UnverifiedDriver
+		var locationData []byte
+		var errorMessage *string
+		var fcmToken, jwtToken *string
+		var id string
+		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.PortraitImage, &d.POIImage, &d.DLImage, &d.RCImage, &d.AmbFront, &d.AmbInside, &d.VehicleType, &d.UnderProgress, &errorMessage, &fcmToken, &jwtToken, &locationData); err != nil {
+			return nil, err
+		}
+		d.ID = id
+		d.ErrorMessage = errorMessage
+		d.FCMToken = fcmToken
+		d.JWTToken = jwtToken
+		if len(locationData) > 0 && string(locationData) != "null" {
+			var loc GeoJSONPoint
+			if err := json.Unmarshal(locationData, &loc); err == nil {
+				d.Location = &loc
+			}
+		}
+		drivers = append(drivers, d)
 	}
 	if drivers == nil {
 		drivers = []UnverifiedDriver{}
 	}
-	return drivers, nil
+	return drivers, rows.Err()
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
-	cursor, err := s.users.Find(ctx, bson.M{}, options.Find().SetSort(bson.M{"_id": -1}))
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var users []User
-	if err = cursor.All(ctx, &users); err != nil {
-		return nil, err
+	for rows.Next() {
+		var u User
+		var myReferralCode *string
+		var locationData []byte
+		var fcmToken, jwtToken *string
+		var id string
+		if err := rows.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken); err != nil {
+			return nil, err
+		}
+		u.ID = id
+		if myReferralCode != nil {
+			u.MyReferralCode = *myReferralCode
+		}
+		if len(locationData) > 0 && string(locationData) != "null" {
+			var loc GeoJSONPoint
+			if err := json.Unmarshal(locationData, &loc); err == nil {
+				u.Location = &loc
+			}
+		}
+		u.FCMToken = fcmToken
+		u.JWTToken = jwtToken
+		users = append(users, u)
 	}
 	if users == nil {
 		users = []User{}
 	}
-	return users, nil
+	return users, rows.Err()
 }
 
-func (s *Store) RejectUnverifiedDriver(ctx context.Context, id primitive.ObjectID, errorMessage string) error {
-	_, err := s.unverifiedDrivers.UpdateOne(ctx, bson.M{"_id": id}, bson.M{
-		"$set": bson.M{"under_progress": false, "error_message": errorMessage},
-	})
+func (s *Store) RejectUnverifiedDriver(ctx context.Context, id string, errorMessage string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE unverified_drivers SET under_progress=false, error_message=$2 WHERE id=$1::uuid`, id, errorMessage)
 	return err
 }
 
 // ---- Referral Code Management (V20) ----
 
-// SetUserReferralCode sets the user's own shareable referral code.
-func (s *Store) SetUserReferralCode(ctx context.Context, userID primitive.ObjectID, code string) error {
-	_, err := s.users.UpdateOne(ctx, bson.M{"_id": userID}, bson.M{
-		"$set": bson.M{"my_referral_code": code},
-	})
+func (s *Store) SetUserReferralCode(ctx context.Context, userID string, code string) error {
+	if !ids.IsValid(userID) {
+		return fmt.Errorf("invalid id: %s", userID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE users SET my_referral_code=$2 WHERE id=$1::uuid`, userID, code)
 	return err
 }
 
-// SetDriverReferralCode sets the driver's own shareable referral code.
-func (s *Store) SetDriverReferralCode(ctx context.Context, driverID primitive.ObjectID, code string) error {
-	_, err := s.drivers.UpdateOne(ctx, bson.M{"_id": driverID}, bson.M{
-		"$set": bson.M{"my_referral_code": code},
-	})
+func (s *Store) SetDriverReferralCode(ctx context.Context, driverID string, code string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET my_referral_code=$2 WHERE id=$1::uuid`, driverID, code)
 	return err
 }
 
-// FindUserByReferralCode finds a user by their personal referral code (my_referral_code).
 func (s *Store) FindUserByReferralCode(ctx context.Context, code string) (*User, error) {
-	var user User
-	err := s.users.FindOne(ctx, bson.M{"my_referral_code": code}).Decode(&user)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users WHERE my_referral_code=$1`, code)
+	u, err := scanUserRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &user, nil
+	return u, nil
 }
 
-// FindDriverByReferralCode finds a driver by their personal referral code (my_referral_code).
 func (s *Store) FindDriverByReferralCode(ctx context.Context, code string) (*Driver, error) {
-	var driver Driver
-	err := s.drivers.FindOne(ctx, bson.M{"my_referral_code": code}).Decode(&driver)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE my_referral_code=$1`, code)
+	d, err := scanDriverRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &driver, nil
+	return d, nil
 }
 
-// GetUserFCMToken retrieves a user's FCM token for push notifications.
 func (s *Store) GetUserFCMToken(ctx context.Context, userID string) (*string, error) {
-	objID, err := primitive.ObjectIDFromHex(userID)
-	if err != nil {
-		return nil, err
+	if !ids.IsValid(userID) {
+		return nil, fmt.Errorf("invalid id: %s", userID)
 	}
-	var user User
-	err = s.users.FindOne(ctx, bson.M{"_id": objID}).Decode(&user)
+	var fcmToken *string
+	err := s.pool.QueryRow(ctx, `SELECT fcm_token FROM users WHERE id=$1::uuid`, userID).Scan(&fcmToken)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return user.FCMToken, nil
+	return fcmToken, nil
 }
 
 // ---- Hospital MD (Phase 1) ----
 
 func (s *Store) CreateHospitalMD(ctx context.Context, md *HospitalMD) error {
-	md.ID = primitive.NewObjectID()
+	md.ID = ids.New()
 	md.CreatedAt = time.Now()
 	if md.Status == "" {
 		md.Status = "pending"
 	}
-	_, err := s.hospitalMDs.InsertOne(ctx, md)
+	_, err := s.pool.Exec(ctx, `INSERT INTO hospital_mds (id, hospital_pending_id, hospital_id, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		md.ID, md.HospitalPendingID, md.HospitalID, md.Name, md.Email, md.Mobile, md.OfficialNumber, md.Username, md.PasswordHash, md.Status, md.JWTToken, md.FCMToken, md.CreatedAt)
 	return err
 }
 
 func (s *Store) FindHospitalMDByMobile(ctx context.Context, mobile string) (*HospitalMD, error) {
-	var md HospitalMD
-	err := s.hospitalMDs.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&md)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds WHERE mobile=$1`, mobile)
+	md, err := scanHospitalMDRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &md, nil
+	return md, nil
 }
 
 func (s *Store) FindHospitalMDByUsername(ctx context.Context, username string) (*HospitalMD, error) {
-	var md HospitalMD
-	err := s.hospitalMDs.FindOne(ctx, bson.M{"username": username}).Decode(&md)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds WHERE username=$1`, username)
+	md, err := scanHospitalMDRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &md, nil
+	return md, nil
 }
 
-func (s *Store) FindHospitalMDByID(ctx context.Context, id primitive.ObjectID) (*HospitalMD, error) {
-	var md HospitalMD
-	err := s.hospitalMDs.FindOne(ctx, bson.M{"_id": id}).Decode(&md)
+func (s *Store) FindHospitalMDByID(ctx context.Context, id string) (*HospitalMD, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid id: %s", id)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds WHERE id=$1::uuid`, id)
+	md, err := scanHospitalMDRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &md, nil
+	return md, nil
 }
 
-func (s *Store) FindHospitalMDByHospitalID(ctx context.Context, hospitalID primitive.ObjectID) (*HospitalMD, error) {
-	var md HospitalMD
-	err := s.hospitalMDs.FindOne(ctx, bson.M{"hospital_id": hospitalID}).Decode(&md)
+func (s *Store) FindHospitalMDByHospitalID(ctx context.Context, hospitalID string) (*HospitalMD, error) {
+	if !ids.IsValid(hospitalID) {
+		return nil, fmt.Errorf("invalid id: %s", hospitalID)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds WHERE hospital_id=$1::uuid`, hospitalID)
+	md, err := scanHospitalMDRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &md, nil
+	return md, nil
 }
 
 func (s *Store) UpdateHospitalMD(ctx context.Context, md *HospitalMD) error {
-	_, err := s.hospitalMDs.ReplaceOne(ctx, bson.M{"_id": md.ID}, md)
+	if !ids.IsValid(md.ID) {
+		return fmt.Errorf("invalid id: %s", md.ID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_mds SET hospital_pending_id=$2::uuid, hospital_id=$3::uuid, name=$4, email=$5, mobile=$6, official_number=$7, username=$8, password_hash=$9, status=$10, jwt_token=$11, fcm_token=$12 WHERE id=$1::uuid`,
+		md.ID, md.HospitalPendingID, md.HospitalID, md.Name, md.Email, md.Mobile, md.OfficialNumber, md.Username, md.PasswordHash, md.Status, md.JWTToken, md.FCMToken)
 	return err
 }
 
-func (s *Store) UpdateHospitalMDJWT(ctx context.Context, id primitive.ObjectID, token string) error {
-	_, err := s.hospitalMDs.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"jwt_token": token}})
+func (s *Store) UpdateHospitalMDJWT(ctx context.Context, id string, token string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_mds SET jwt_token=$2 WHERE id=$1::uuid`, id, token)
 	return err
 }
 
-func (s *Store) ClearHospitalMDJWT(ctx context.Context, id primitive.ObjectID) error {
-	_, err := s.hospitalMDs.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+func (s *Store) ClearHospitalMDJWT(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_mds SET jwt_token=NULL WHERE id=$1::uuid`, id)
 	return err
 }
 
-func (s *Store) SetHospitalMDHospitalID(ctx context.Context, mdID primitive.ObjectID, hospitalID primitive.ObjectID) error {
-	_, err := s.hospitalMDs.UpdateOne(ctx, bson.M{"_id": mdID}, bson.M{"$set": bson.M{"hospital_id": hospitalID, "status": "active"}})
+func (s *Store) SetHospitalMDHospitalID(ctx context.Context, mdID string, hospitalID string) error {
+	if !ids.IsValid(mdID) {
+		return fmt.Errorf("invalid id: %s", mdID)
+	}
+	if !ids.IsValid(hospitalID) {
+		return fmt.Errorf("invalid id: %s", hospitalID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_mds SET hospital_id=$2::uuid, status='active' WHERE id=$1::uuid`, mdID, hospitalID)
 	return err
 }
 
 // ---- Hospital Receptionist (Phase 2) ----
 
 func (s *Store) CreateHospitalReceptionist(ctx context.Context, r *HospitalReceptionist) error {
-	r.ID = primitive.NewObjectID()
+	r.ID = ids.New()
 	r.CreatedAt = time.Now()
 	r.Active = true
-	_, err := s.hospitalReceptionists.InsertOne(ctx, r)
+	_, err := s.pool.Exec(ctx, `INSERT INTO hospital_receptionists (id, hospital_id, created_by_md_id, name, username, password_hash, mobile, active, jwt_token, created_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10)`,
+		r.ID, r.HospitalID, r.CreatedByMDID, r.Name, r.Username, r.PasswordHash, r.Mobile, r.Active, r.JWTToken, r.CreatedAt)
 	return err
 }
 
 func (s *Store) FindHospitalReceptionistByUsername(ctx context.Context, username string) (*HospitalReceptionist, error) {
-	var r HospitalReceptionist
-	err := s.hospitalReceptionists.FindOne(ctx, bson.M{"username": username}).Decode(&r)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token FROM hospital_receptionists WHERE username=$1`, username)
+	r, err := scanHospitalReceptionistRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &r, nil
+	return r, nil
 }
 
-func (s *Store) FindHospitalReceptionistByID(ctx context.Context, id primitive.ObjectID) (*HospitalReceptionist, error) {
-	var r HospitalReceptionist
-	err := s.hospitalReceptionists.FindOne(ctx, bson.M{"_id": id}).Decode(&r)
+func (s *Store) FindHospitalReceptionistByID(ctx context.Context, id string) (*HospitalReceptionist, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid id: %s", id)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token FROM hospital_receptionists WHERE id=$1::uuid`, id)
+	r, err := scanHospitalReceptionistRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &r, nil
+	return r, nil
 }
 
-func (s *Store) ListReceptionistsByHospital(ctx context.Context, hospitalID primitive.ObjectID) ([]HospitalReceptionist, error) {
-	cursor, err := s.hospitalReceptionists.Find(ctx, bson.M{"hospital_id": hospitalID})
+func (s *Store) ListReceptionistsByHospital(ctx context.Context, hospitalID string) ([]HospitalReceptionist, error) {
+	if !ids.IsValid(hospitalID) {
+		return nil, fmt.Errorf("invalid id: %s", hospitalID)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token FROM hospital_receptionists WHERE hospital_id=$1::uuid`, hospitalID)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var list []HospitalReceptionist
-	if err = cursor.All(ctx, &list); err != nil {
-		return nil, err
+	for rows.Next() {
+		var r HospitalReceptionist
+		var mobile *string
+		var jwtToken *string
+		var id, hid, mdid string
+		if err := rows.Scan(&id, &hid, &mdid, &r.Name, &r.Username, &r.PasswordHash, &mobile, &r.Active, &r.CreatedAt, &jwtToken); err != nil {
+			return nil, err
+		}
+		r.ID = id
+		r.HospitalID = hid
+		r.CreatedByMDID = mdid
+		r.Mobile = mobile
+		r.JWTToken = jwtToken
+		list = append(list, r)
 	}
 	if list == nil {
 		list = []HospitalReceptionist{}
 	}
-	return list, nil
+	return list, rows.Err()
 }
 
-func (s *Store) DeleteHospitalReceptionist(ctx context.Context, id primitive.ObjectID) error {
-	_, err := s.hospitalReceptionists.DeleteOne(ctx, bson.M{"_id": id})
+func (s *Store) DeleteHospitalReceptionist(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM hospital_receptionists WHERE id=$1::uuid`, id)
 	return err
 }
 
-func (s *Store) UpdateHospitalReceptionistJWT(ctx context.Context, id primitive.ObjectID, token string) error {
-	_, err := s.hospitalReceptionists.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"jwt_token": token}})
+func (s *Store) UpdateHospitalReceptionistJWT(ctx context.Context, id string, token string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_receptionists SET jwt_token=$2 WHERE id=$1::uuid`, id, token)
 	return err
 }
 
-func (s *Store) ClearHospitalReceptionistJWT(ctx context.Context, id primitive.ObjectID) error {
-	_, err := s.hospitalReceptionists.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+func (s *Store) ClearHospitalReceptionistJWT(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_receptionists SET jwt_token=NULL WHERE id=$1::uuid`, id)
 	return err
 }
 
 // ---- Ambulance Attendant (chat) ----
 
 func (s *Store) CreateAmbulanceAttendant(ctx context.Context, a *AmbulanceAttendant) error {
-	a.ID = primitive.NewObjectID()
+	a.ID = ids.New()
 	a.CreatedAt = time.Now()
 	a.Active = true
-	_, err := s.ambulanceAttendants.InsertOne(ctx, a)
+	_, err := s.pool.Exec(ctx, `INSERT INTO ambulance_attendants (id, name, mobile, assigned_driver_id, jwt_token, fcm_token, active, created_at) VALUES ($1::uuid, $2, $3, $4::uuid, $5, $6, $7, $8)`,
+		a.ID, a.Name, a.Mobile, a.AssignedDriverID, a.JWTToken, a.FCMToken, a.Active, a.CreatedAt)
 	return err
 }
 
 func (s *Store) FindAmbulanceAttendantByMobile(ctx context.Context, mobile string) (*AmbulanceAttendant, error) {
-	var a AmbulanceAttendant
-	err := s.ambulanceAttendants.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&a)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, assigned_driver_id::text, jwt_token, fcm_token, active, created_at FROM ambulance_attendants WHERE mobile=$1`, mobile)
+	a, err := scanAmbulanceAttendantRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &a, nil
+	return a, nil
 }
 
-func (s *Store) FindAmbulanceAttendantByID(ctx context.Context, id primitive.ObjectID) (*AmbulanceAttendant, error) {
-	var a AmbulanceAttendant
-	err := s.ambulanceAttendants.FindOne(ctx, bson.M{"_id": id}).Decode(&a)
+func (s *Store) FindAmbulanceAttendantByID(ctx context.Context, id string) (*AmbulanceAttendant, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid id: %s", id)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, assigned_driver_id::text, jwt_token, fcm_token, active, created_at FROM ambulance_attendants WHERE id=$1::uuid`, id)
+	a, err := scanAmbulanceAttendantRow(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &a, nil
+	return a, nil
 }
 
-func (s *Store) UpdateAmbulanceAttendantJWT(ctx context.Context, id primitive.ObjectID, token string) error {
-	_, err := s.ambulanceAttendants.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"jwt_token": token}})
+func (s *Store) UpdateAmbulanceAttendantJWT(ctx context.Context, id string, token string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE ambulance_attendants SET jwt_token=$2 WHERE id=$1::uuid`, id, token)
 	return err
 }
 
-func (s *Store) ClearAmbulanceAttendantJWT(ctx context.Context, id primitive.ObjectID) error {
-	_, err := s.ambulanceAttendants.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$unset": bson.M{"jwt_token": ""}})
+func (s *Store) ClearAmbulanceAttendantJWT(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE ambulance_attendants SET jwt_token=NULL WHERE id=$1::uuid`, id)
 	return err
 }
 
-func (s *Store) ListAttendantsByDriver(ctx context.Context, driverID primitive.ObjectID) ([]AmbulanceAttendant, error) {
-	cursor, err := s.ambulanceAttendants.Find(ctx, bson.M{"assigned_driver_id": driverID, "active": true})
+func (s *Store) ListAttendantsByDriver(ctx context.Context, driverID string) ([]AmbulanceAttendant, error) {
+	if !ids.IsValid(driverID) {
+		return nil, fmt.Errorf("invalid id: %s", driverID)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, assigned_driver_id::text, jwt_token, fcm_token, active, created_at FROM ambulance_attendants WHERE assigned_driver_id=$1::uuid AND active=true`, driverID)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer rows.Close()
 	var list []AmbulanceAttendant
-	if err = cursor.All(ctx, &list); err != nil {
-		return nil, err
+	for rows.Next() {
+		var a AmbulanceAttendant
+		var assignedDriverID *string
+		var jwtToken, fcmToken *string
+		var id string
+		if err := rows.Scan(&id, &a.Name, &a.Mobile, &assignedDriverID, &jwtToken, &fcmToken, &a.Active, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		a.ID = id
+		if assignedDriverID != nil && *assignedDriverID != "" {
+			a.AssignedDriverID = assignedDriverID
+		}
+		a.JWTToken = jwtToken
+		a.FCMToken = fcmToken
+		list = append(list, a)
 	}
 	if list == nil {
 		list = []AmbulanceAttendant{}
 	}
-	return list, nil
+	return list, rows.Err()
 }
 
-func (s *Store) DeactivateAttendantsForDriver(ctx context.Context, driverID primitive.ObjectID) error {
-	_, err := s.ambulanceAttendants.UpdateMany(ctx, bson.M{"assigned_driver_id": driverID, "active": true}, bson.M{"$set": bson.M{"active": false}})
+func (s *Store) DeactivateAttendantsForDriver(ctx context.Context, driverID string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE ambulance_attendants SET active=false WHERE assigned_driver_id=$1::uuid AND active=true`, driverID)
 	return err
 }
 
-func (s *Store) DeleteAttendantForDriver(ctx context.Context, driverID, attendantID primitive.ObjectID) error {
-	_, err := s.ambulanceAttendants.DeleteOne(ctx, bson.M{"_id": attendantID, "assigned_driver_id": driverID})
+func (s *Store) DeleteAttendantForDriver(ctx context.Context, driverID, attendantID string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	if !ids.IsValid(attendantID) {
+		return fmt.Errorf("invalid id: %s", attendantID)
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM ambulance_attendants WHERE id=$1::uuid AND assigned_driver_id=$2::uuid`, attendantID, driverID)
 	return err
 }
 
 func (s *Store) UpdateAmbulanceAttendant(ctx context.Context, a *AmbulanceAttendant) error {
-	_, err := s.ambulanceAttendants.ReplaceOne(ctx, bson.M{"_id": a.ID}, a)
+	if !ids.IsValid(a.ID) {
+		return fmt.Errorf("invalid id: %s", a.ID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE ambulance_attendants SET name=$2, mobile=$3, assigned_driver_id=$4::uuid, jwt_token=$5, fcm_token=$6, active=$7 WHERE id=$1::uuid`,
+		a.ID, a.Name, a.Mobile, a.AssignedDriverID, a.JWTToken, a.FCMToken, a.Active)
 	return err
 }

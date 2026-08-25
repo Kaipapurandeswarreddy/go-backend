@@ -2,39 +2,73 @@ package admin
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
+	"ambigo-backend/internal/ids"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Store struct {
-	ambulanceTypes *mongo.Collection
-	admins         *mongo.Collection
+	pool *pgxpool.Pool
 }
 
-func NewStore(dataDB, usersDB *mongo.Database) *Store {
-	return &Store{
-		ambulanceTypes: dataDB.Collection("ambulance_type"),
-		admins:         usersDB.Collection("admin"),
-	}
+// NewStore creates a Store backed by a pgx pool. The pool is shared across
+// all admin tables (ambulance_types, admins) which now live in a single
+// Postgres database (previously Data + Users mongo databases).
+func NewStore(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool}
 }
+
+// NewStoreWithPool is an alias kept for grep-ability; prefer NewStore.
+func NewStoreWithPool(pool *pgxpool.Pool) *Store { return NewStore(pool) }
 
 func (s *Store) CreateAmbulanceType(ctx context.Context, amb *AmbulanceType) error {
-	amb.ID = primitive.NewObjectID()
-	_, err := s.ambulanceTypes.InsertOne(ctx, amb)
+	if ids.IsZero(amb.ID) {
+		amb.ID = ids.New()
+	}
+	pricingJSON, err := json.Marshal(amb.PricingTier)
+	if err != nil {
+		return fmt.Errorf("marshal pricing_tier: %w", err)
+	}
+	if pricingJSON == nil || string(pricingJSON) == "null" {
+		pricingJSON = []byte("[]")
+	}
+	const q = `INSERT INTO ambulance_types (id, name, photo, helper_included, otp_required, listing_threshold, base_fare, driver_share, pricing_tier)
+	           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`
+	_, err = s.pool.Exec(ctx, q, amb.ID, amb.Name, amb.Photo, amb.HelperIncluded, amb.OTPRequired, amb.ListingThreshold, amb.BaseFare, amb.DriverShare, pricingJSON)
 	return err
 }
 
 func (s *Store) ListAmbulanceTypes(ctx context.Context) ([]AmbulanceType, error) {
-	cursor, err := s.ambulanceTypes.Find(ctx, bson.M{})
+	const q = `SELECT id, name, photo, helper_included, otp_required, listing_threshold, base_fare, driver_share, pricing_tier FROM ambulance_types`
+	rows, err := s.pool.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
-
+	defer rows.Close()
 	var list []AmbulanceType
-	if err = cursor.All(ctx, &list); err != nil {
+	for rows.Next() {
+		var amb AmbulanceType
+		var pricingBytes []byte
+		if err := rows.Scan(&amb.ID, &amb.Name, &amb.Photo, &amb.HelperIncluded, &amb.OTPRequired, &amb.ListingThreshold, &amb.BaseFare, &amb.DriverShare, &pricingBytes); err != nil {
+			return nil, err
+		}
+		if len(pricingBytes) > 0 {
+			if err := json.Unmarshal(pricingBytes, &amb.PricingTier); err != nil {
+				return nil, fmt.Errorf("unmarshal pricing_tier: %w", err)
+			}
+		}
+		if amb.PricingTier == nil {
+			amb.PricingTier = []PricingTier{}
+		}
+		list = append(list, amb)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	if list == nil {
@@ -44,79 +78,150 @@ func (s *Store) ListAmbulanceTypes(ctx context.Context) ([]AmbulanceType, error)
 }
 
 func (s *Store) GetAmbulanceTypeByID(ctx context.Context, idStr string) (*AmbulanceType, error) {
-	objID, err := primitive.ObjectIDFromHex(idStr)
-	if err != nil {
-		return nil, err
+	if !ids.IsValid(idStr) {
+		return nil, fmt.Errorf("invalid ambulance_type id: %s", idStr)
 	}
-
+	const q = `SELECT id, name, photo, helper_included, otp_required, listing_threshold, base_fare, driver_share, pricing_tier FROM ambulance_types WHERE id=$1::uuid`
 	var amb AmbulanceType
-	err = s.ambulanceTypes.FindOne(ctx, bson.M{"_id": objID}).Decode(&amb)
+	var pricingBytes []byte
+	err := s.pool.QueryRow(ctx, q, idStr).Scan(&amb.ID, &amb.Name, &amb.Photo, &amb.HelperIncluded, &amb.OTPRequired, &amb.ListingThreshold, &amb.BaseFare, &amb.DriverShare, &pricingBytes)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
+	}
+	if len(pricingBytes) > 0 {
+		if err := json.Unmarshal(pricingBytes, &amb.PricingTier); err != nil {
+			return nil, fmt.Errorf("unmarshal pricing_tier: %w", err)
+		}
+	}
+	if amb.PricingTier == nil {
+		amb.PricingTier = []PricingTier{}
 	}
 	return &amb, nil
 }
 
 func (s *Store) UpdateAmbulanceType(ctx context.Context, amb *AmbulanceType) error {
-	_, err := s.ambulanceTypes.ReplaceOne(ctx, bson.M{"_id": amb.ID}, amb)
+	if ids.IsZero(amb.ID) {
+		return fmt.Errorf("ambulance_type id is required")
+	}
+	pricingJSON, err := json.Marshal(amb.PricingTier)
+	if err != nil {
+		return fmt.Errorf("marshal pricing_tier: %w", err)
+	}
+	if pricingJSON == nil || string(pricingJSON) == "null" {
+		pricingJSON = []byte("[]")
+	}
+	const q = `UPDATE ambulance_types SET name=$1, photo=$2, helper_included=$3, otp_required=$4, listing_threshold=$5, base_fare=$6, driver_share=$7, pricing_tier=$8::jsonb WHERE id=$9::uuid`
+	_, err = s.pool.Exec(ctx, q, amb.Name, amb.Photo, amb.HelperIncluded, amb.OTPRequired, amb.ListingThreshold, amb.BaseFare, amb.DriverShare, pricingJSON, amb.ID)
 	return err
 }
 
-func (s *Store) DeleteAmbulanceType(ctx context.Context, id primitive.ObjectID) error {
-	_, err := s.ambulanceTypes.DeleteOne(ctx, bson.M{"_id": id})
+func (s *Store) DeleteAmbulanceType(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid ambulance_type id: %s", id)
+	}
+	const q = `DELETE FROM ambulance_types WHERE id=$1::uuid`
+	_, err := s.pool.Exec(ctx, q, id)
 	return err
+}
+
+func scanAdmin(row pgx.Row) (*Admin, error) {
+	var a Admin
+	var username sql.NullString
+	var mobile sql.NullString
+	err := row.Scan(&a.ID, &username, &a.HashedPassword, &a.Name, &a.Role, &a.Active, &mobile)
+	if err != nil {
+		return nil, err
+	}
+	if username.Valid {
+		a.Username = username.String
+	}
+	if mobile.Valid {
+		a.Mobile = mobile.String
+	}
+	return &a, nil
 }
 
 func (s *Store) FindAdminByUsername(ctx context.Context, username string) (*Admin, error) {
-	var admin Admin
-	err := s.admins.FindOne(ctx, bson.M{"username": username}).Decode(&admin)
+	const q = `SELECT id, username, hashed_password, name, role, active, mobile FROM admins WHERE username=$1`
+	row := s.pool.QueryRow(ctx, q, username)
+	a, err := scanAdmin(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &admin, nil
+	return a, nil
 }
 
 func (s *Store) FindAdminByMobile(ctx context.Context, mobile string) (*Admin, error) {
-	var admin Admin
-	err := s.admins.FindOne(ctx, bson.M{"mobile": mobile}).Decode(&admin)
+	const q = `SELECT id, username, hashed_password, name, role, active, mobile FROM admins WHERE mobile=$1`
+	row := s.pool.QueryRow(ctx, q, mobile)
+	a, err := scanAdmin(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &admin, nil
+	return a, nil
 }
 
-func (s *Store) FindAdminByID(ctx context.Context, id primitive.ObjectID) (*Admin, error) {
-	var admin Admin
-	err := s.admins.FindOne(ctx, bson.M{"_id": id}).Decode(&admin)
+func (s *Store) FindAdminByID(ctx context.Context, id string) (*Admin, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid admin id: %s", id)
+	}
+	const q = `SELECT id, username, hashed_password, name, role, active, mobile FROM admins WHERE id=$1::uuid`
+	row := s.pool.QueryRow(ctx, q, id)
+	a, err := scanAdmin(row)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &admin, nil
+	return a, nil
 }
 
-func (s *Store) UpdateAdminFCM(ctx context.Context, id primitive.ObjectID, fcmToken string) error {
-	_, err := s.admins.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"fcm_token": fcmToken}})
+func (s *Store) UpdateAdminFCM(ctx context.Context, id string, fcmToken string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid admin id: %s", id)
+	}
+	const q = `UPDATE admins SET fcm_token=$1, updated_at=now() WHERE id=$2::uuid`
+	_, err := s.pool.Exec(ctx, q, fcmToken, id)
 	return err
 }
 
-func (s *Store) UpdateAdminLocation(ctx context.Context, id primitive.ObjectID, location *GeoJSON) error {
-	_, err := s.admins.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"location": location}})
+func (s *Store) UpdateAdminLocation(ctx context.Context, id string, location *GeoJSON) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid admin id: %s", id)
+	}
+	var locJSON []byte
+	var err error
+	if location != nil {
+		locJSON, err = json.Marshal(location)
+		if err != nil {
+			return fmt.Errorf("marshal location: %w", err)
+		}
+	}
+	const qWith = `UPDATE admins SET location=$1::jsonb, updated_at=now() WHERE id=$2::uuid`
+	const qNull = `UPDATE admins SET location=NULL, updated_at=now() WHERE id=$1::uuid`
+	if location == nil {
+		_, err = s.pool.Exec(ctx, qNull, id)
+	} else {
+		_, err = s.pool.Exec(ctx, qWith, locJSON, id)
+	}
 	return err
 }
 
-func (s *Store) UpdateAdminPassword(ctx context.Context, id primitive.ObjectID, hashedPassword string) error {
-	_, err := s.admins.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"hashed_password": hashedPassword}})
+func (s *Store) UpdateAdminPassword(ctx context.Context, id string, hashedPassword string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid admin id: %s", id)
+	}
+	const q = `UPDATE admins SET hashed_password=$1, updated_at=now() WHERE id=$2::uuid`
+	_, err := s.pool.Exec(ctx, q, hashedPassword, id)
 	return err
 }

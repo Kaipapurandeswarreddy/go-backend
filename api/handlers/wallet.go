@@ -1,4 +1,4 @@
-package handlers
+﻿package handlers
 
 import (
 	"encoding/json"
@@ -13,8 +13,6 @@ import (
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/payment"
 	"ambigo-backend/internal/requestid"
-
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type WalletHandler struct {
@@ -40,8 +38,7 @@ func (h *WalletHandler) HandleGetWallet(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	objID, _ := primitive.ObjectIDFromHex(uidStr)
-	driver, err := h.AuthStore.FindDriverByID(r.Context(), objID)
+	driver, err := h.AuthStore.FindDriverByID(r.Context(), uidStr)
 	if err != nil || driver == nil {
 		response.Error(w, "Driver not found", http.StatusNotFound)
 		return
@@ -67,8 +64,7 @@ func (h *WalletHandler) HandleUpdateWallet(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	objID, _ := primitive.ObjectIDFromHex(uidStr)
-	driver, err := h.AuthStore.FindDriverByID(r.Context(), objID)
+	driver, err := h.AuthStore.FindDriverByID(r.Context(), uidStr)
 	if err != nil || driver == nil {
 		response.Error(w, "Driver not found", http.StatusNotFound)
 		return
@@ -100,7 +96,7 @@ func (h *WalletHandler) HandleUpdateWallet(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	if err := h.WalletStore.UpdateWalletDetails(r.Context(), objID, req); err != nil {
+	if err := h.WalletStore.UpdateWalletDetails(r.Context(), uidStr, req); err != nil {
 		response.Error(w, "Error updating wallet details", http.StatusInternalServerError)
 		return
 	}
@@ -127,8 +123,7 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	objID, _ := primitive.ObjectIDFromHex(uidStr)
-	driver, err := h.AuthStore.FindDriverByID(r.Context(), objID)
+	driver, err := h.AuthStore.FindDriverByID(r.Context(), uidStr)
 	if err != nil || driver == nil {
 		response.Error(w, "Driver not found", http.StatusNotFound)
 		return
@@ -150,7 +145,7 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Deduct balance atomically before calling Zwitch
-	if err := h.WalletStore.DeductBalance(r.Context(), objID, req.Amount); err != nil {
+	if err := h.WalletStore.DeductBalance(r.Context(), uidStr, req.Amount); err != nil {
 		response.Error(w, "Insufficient wallet balance", http.StatusBadRequest)
 		return
 	}
@@ -159,8 +154,8 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 	if err != nil || resp == nil {
 		log := logger.Ctx(r.Context())
 		log.Error().Err(err).Msg("Zwitch transfer failed, refunding wallet")
-		if refundErr := h.WalletStore.UpdateWalletBalance(r.Context(), objID, req.Amount); refundErr != nil {
-			log.Error().Err(refundErr).Msg("Refund also failed — manual intervention required")
+		if refundErr := h.WalletStore.UpdateWalletBalance(r.Context(), uidStr, req.Amount); refundErr != nil {
+			log.Error().Err(refundErr).Msg("Refund also failed -- manual intervention required")
 		}
 		response.Error(w, "Withdrawal Initiation failed", http.StatusBadRequest)
 		return

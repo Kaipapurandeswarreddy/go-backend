@@ -2,58 +2,132 @@ package payment
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
+	"ambigo-backend/internal/ids"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// WalletTransaction mirrors the Records.wallet collection, now stored in
+// wallet_transactions table per migrations/00001_init.sql.
 type WalletTransaction struct {
-	ID                  primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
-	DriverID            string             `bson:"driver_id" json:"driver_id"`
-	ZwitchBeneficiaryID string             `bson:"zwitch_beneficiary_id" json:"zwitch_beneficiary_id"`
-	ZwitchID            string             `bson:"zwitch_id" json:"zwitch_id"`
-	Amount              float64            `bson:"amount" json:"amount"`
-	AccountNo           string             `bson:"account_no" json:"account_no"`
-	MerchantReferenceID string             `bson:"merchant_reference_id" json:"merchant_reference_id"`
-	BankReferenceNo     string             `bson:"bank_reference_no" json:"bank_reference_no"`
-	ZwitchTransferID    string             `bson:"zwitch_transfer_id" json:"zwitch_transfer_id"`
-	Status              string             `bson:"status" json:"status"`
-	ErrorMessage        string             `bson:"error_message" json:"error_message"`
-	CreatedAt           time.Time          `bson:"created_at" json:"created_at"`
-	UpdatedAt           *time.Time         `bson:"updated_at,omitempty" json:"updated_at,omitempty"`
+	ID                  string     `db:"id" json:"_id"`
+	DriverID            string     `db:"driver_id" json:"driver_id"`
+	ZwitchBeneficiaryID string     `db:"zwitch_beneficiary_id" json:"zwitch_beneficiary_id"`
+	ZwitchID            string     `db:"zwitch_id" json:"zwitch_id"`
+	Amount              float64    `db:"amount" json:"amount"`
+	AccountNo           string     `db:"account_no" json:"account_no"`
+	MerchantReferenceID string     `db:"merchant_reference_id" json:"merchant_reference_id"`
+	BankReferenceNo     string     `db:"bank_reference_no" json:"bank_reference_no"`
+	ZwitchTransferID    string     `db:"zwitch_transfer_id" json:"zwitch_transfer_id"`
+	Status              string     `db:"status" json:"status"`
+	ErrorMessage        string     `db:"error_message" json:"error_message"`
+	CreatedAt           time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt           *time.Time `db:"updated_at" json:"updated_at,omitempty"`
 }
 
+// WalletStore handles wallet_transactions and drivers.wallet_balance /
+// drivers.wallet_details. In Postgres both tables live in the same DB
+// (single pool), but the store is usable inside a pgx.Tx via DBTX.
 type WalletStore struct {
-	transactions *mongo.Collection
-	drivers      *mongo.Collection
+	db DBTX
 }
 
-func NewWalletStore(recordsDB *mongo.Database, usersDB *mongo.Database) *WalletStore {
-	return &WalletStore{
-		transactions: recordsDB.Collection("wallet"),
-		drivers:      usersDB.Collection("drivers"),
-	}
+// NewWalletStore creates a WalletStore backed by a pgxpool.Pool.
+// The original Mongo version required two databases (Records + Users); the
+// Postgres version uses a single pool since both tables are in the public
+// schema (wallet_transactions + drivers).
+func NewWalletStore(pool *pgxpool.Pool) *WalletStore {
+	return &WalletStore{db: pool}
 }
 
-func (s *WalletStore) InsertTransaction(ctx context.Context, tx *WalletTransaction) error {
-	tx.ID = primitive.NewObjectID()
-	tx.CreatedAt = time.Now()
-	_, err := s.transactions.InsertOne(ctx, tx)
-	return err
+// NewWalletStoreWithDB creates a WalletStore from any DBTX (pool or Tx).
+func NewWalletStoreWithDB(db DBTX) *WalletStore {
+	return &WalletStore{db: db}
 }
 
-func (s *WalletStore) ListTransactions(ctx context.Context, driverID string) ([]WalletTransaction, error) {
-	cursor, err := s.transactions.Find(ctx, bson.M{"driver_id": driverID})
+// WithTx returns a new WalletStore bound to the given transaction.
+func (s *WalletStore) WithTx(tx pgx.Tx) *WalletStore {
+	return &WalletStore{db: tx}
+}
+
+const walletSelect = `SELECT id::text, driver_id, zwitch_beneficiary_id, zwitch_id, amount, account_no, merchant_reference_id, bank_reference_no, zwitch_transfer_id, status, error_message, created_at, updated_at FROM wallet_transactions`
+
+func scanWalletTransaction(row pgx.Row) (*WalletTransaction, error) {
+	var w WalletTransaction
+	err := row.Scan(
+		&w.ID,
+		&w.DriverID,
+		&w.ZwitchBeneficiaryID,
+		&w.ZwitchID,
+		&w.Amount,
+		&w.AccountNo,
+		&w.MerchantReferenceID,
+		&w.BankReferenceNo,
+		&w.ZwitchTransferID,
+		&w.Status,
+		&w.ErrorMessage,
+		&w.CreatedAt,
+		&w.UpdatedAt,
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	return &w, nil
+}
 
+// InsertTransaction inserts a new wallet transaction. ID and CreatedAt are
+// generated if empty/zero via ids.New() / time.Now().
+func (s *WalletStore) InsertTransaction(ctx context.Context, tx *WalletTransaction) error {
+	if tx.ID == "" {
+		tx.ID = ids.New()
+	}
+	if tx.CreatedAt.IsZero() {
+		tx.CreatedAt = time.Now()
+	}
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO wallet_transactions (id, driver_id, zwitch_beneficiary_id, zwitch_id, amount, account_no, merchant_reference_id, bank_reference_no, zwitch_transfer_id, status, error_message, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		tx.ID, tx.DriverID, tx.ZwitchBeneficiaryID, tx.ZwitchID, tx.Amount, tx.AccountNo, tx.MerchantReferenceID, tx.BankReferenceNo, tx.ZwitchTransferID, tx.Status, tx.ErrorMessage, tx.CreatedAt, tx.UpdatedAt,
+	)
+	return err
+}
+
+// ListTransactions returns all wallet transactions for a driver, ordered by
+// created_at descending. Returns empty slice (not nil) if none found.
+func (s *WalletStore) ListTransactions(ctx context.Context, driverID string) ([]WalletTransaction, error) {
+	rows, err := s.db.Query(ctx, walletSelect+` WHERE driver_id=$1 ORDER BY created_at DESC`, driverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 	var list []WalletTransaction
-	if err = cursor.All(ctx, &list); err != nil {
+	for rows.Next() {
+		var w WalletTransaction
+		if err := rows.Scan(
+			&w.ID,
+			&w.DriverID,
+			&w.ZwitchBeneficiaryID,
+			&w.ZwitchID,
+			&w.Amount,
+			&w.AccountNo,
+			&w.MerchantReferenceID,
+			&w.BankReferenceNo,
+			&w.ZwitchTransferID,
+			&w.Status,
+			&w.ErrorMessage,
+			&w.CreatedAt,
+			&w.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		list = append(list, w)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	if list == nil {
@@ -62,37 +136,49 @@ func (s *WalletStore) ListTransactions(ctx context.Context, driverID string) ([]
 	return list, nil
 }
 
-// UpdateWalletBalance increments or decrements the wallet balance.
-// A negative amount indicates a withdrawal.
-func (s *WalletStore) UpdateWalletBalance(ctx context.Context, driverID primitive.ObjectID, amount float64) error {
-	filter := bson.M{"_id": driverID}
-	update := bson.M{"$inc": bson.M{"wallet_balance": amount}}
-	_, err := s.drivers.UpdateOne(ctx, filter, update)
+// UpdateWalletBalance increments or decrements the driver's wallet balance.
+// A negative amount indicates a debit. Postgres equivalent of Mongo
+// `$inc: {wallet_balance: amount}` is:
+// `UPDATE drivers SET wallet_balance = wallet_balance + $2 WHERE id=$1`
+func (s *WalletStore) UpdateWalletBalance(ctx context.Context, driverID string, amount float64) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE drivers SET wallet_balance = wallet_balance + $2 WHERE id=$1`,
+		driverID, amount,
+	)
 	return err
 }
 
-// DeductBalance atomically deducts the amount only if sufficient balance exists.
-// Prevents concurrent withdrawals from driving the balance negative.
-func (s *WalletStore) DeductBalance(ctx context.Context, driverID primitive.ObjectID, amount float64) error {
-	filter := bson.M{
-		"_id":            driverID,
-		"wallet_balance": bson.M{"$gte": amount},
-	}
-	update := bson.M{"$inc": bson.M{"wallet_balance": -amount}}
-	result, err := s.drivers.UpdateOne(ctx, filter, update)
+// DeductBalance atomically deducts amount only if sufficient balance exists.
+// Prevents concurrent withdrawals from driving balance negative.
+// Postgres: `UPDATE drivers SET wallet_balance = wallet_balance - $2 WHERE id=$1 AND wallet_balance >= $2`
+// Check RowsAffected==0 -> insufficient wallet balance. This is the atomic
+// CAS guard that replaces Mongo's `{"wallet_balance": {"$gte": amount}}` + `$inc`.
+func (s *WalletStore) DeductBalance(ctx context.Context, driverID string, amount float64) error {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE drivers SET wallet_balance = wallet_balance - $2 WHERE id=$1 AND wallet_balance >= $2`,
+		driverID, amount,
+	)
 	if err != nil {
 		return err
 	}
-	if result.ModifiedCount == 0 {
+	if tag.RowsAffected() == 0 {
 		return errors.New("insufficient wallet balance")
 	}
 	return nil
 }
 
-// UpdateWalletDetails saves the driver's Zwitch bank details.
-func (s *WalletStore) UpdateWalletDetails(ctx context.Context, driverID primitive.ObjectID, details interface{}) error {
-	filter := bson.M{"_id": driverID}
-	update := bson.M{"$set": bson.M{"wallet_details": details}}
-	_, err := s.drivers.UpdateOne(ctx, filter, update)
+// UpdateWalletDetails saves the driver's bank / Zwitch details into
+// drivers.wallet_details (JSONB). The original Mongo used `$set: {wallet_details: details}`.
+// Postgres: `UPDATE drivers SET wallet_details=$2 WHERE id=$1`.
+// details is marshalled to JSON; WalletDetails struct works directly.
+func (s *WalletStore) UpdateWalletDetails(ctx context.Context, driverID string, details interface{}) error {
+	data, err := json.Marshal(details)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(ctx,
+		`UPDATE drivers SET wallet_details=$2::jsonb, updated_at=now() WHERE id=$1::uuid`,
+		driverID, data,
+	)
 	return err
 }

@@ -9,11 +9,10 @@ import (
 
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/offer"
 	"ambigo-backend/internal/payment"
-
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 const codeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // No I, O, 0, 1 to avoid confusion
@@ -73,7 +72,10 @@ func (s *Service) GenerateReferralCode(ctx context.Context) (string, error) {
 
 // GetOrCreateUserCode ensures a user has a personal referral code.
 // If the user already has one, it returns it. Otherwise, it generates and stores one.
-func (s *Service) GetOrCreateUserCode(ctx context.Context, userID primitive.ObjectID) (string, error) {
+func (s *Service) GetOrCreateUserCode(ctx context.Context, userID string) (string, error) {
+	if !ids.IsValid(userID) {
+		return "", fmt.Errorf("invalid user id: %s", userID)
+	}
 	user, err := s.authStore.FindUserByID(ctx, userID)
 	if err != nil || user == nil {
 		return "", fmt.Errorf("user not found")
@@ -95,7 +97,10 @@ func (s *Service) GetOrCreateUserCode(ctx context.Context, userID primitive.Obje
 }
 
 // GetOrCreateDriverCode ensures a driver has a personal referral code.
-func (s *Service) GetOrCreateDriverCode(ctx context.Context, driverID primitive.ObjectID) (string, error) {
+func (s *Service) GetOrCreateDriverCode(ctx context.Context, driverID string) (string, error) {
+	if !ids.IsValid(driverID) {
+		return "", fmt.Errorf("invalid driver id: %s", driverID)
+	}
 	driver, err := s.authStore.FindDriverByID(ctx, driverID)
 	if err != nil || driver == nil {
 		return "", fmt.Errorf("driver not found")
@@ -134,7 +139,7 @@ func (s *Service) ProcessSignupReferral(ctx context.Context, refereeID, refereeR
 		return err
 	}
 	if user != nil {
-		referrerID = user.ID.Hex()
+		referrerID = user.ID
 		referrerRole = "user"
 	} else {
 		driver, err := s.authStore.FindDriverByReferralCode(ctx, code)
@@ -142,7 +147,7 @@ func (s *Service) ProcessSignupReferral(ctx context.Context, refereeID, refereeR
 			return err
 		}
 		if driver != nil {
-			referrerID = driver.ID.Hex()
+			referrerID = driver.ID
 			referrerRole = "driver"
 		}
 	}
@@ -232,12 +237,12 @@ func (s *Service) checkAndCreditForRide(ctx context.Context, entityID, role stri
 	for _, rec := range pending {
 		updated, err := s.store.IncrementRidesDone(ctx, rec.ID)
 		if err != nil {
-			logger.Log.Error().Err(err).Str("record_id", rec.ID.Hex()).Msg("Failed to increment rides_done")
+			logger.Log.Error().Err(err).Str("record_id", rec.ID).Msg("Failed to increment rides_done")
 			continue
 		}
 
 		logger.Log.Info().
-			Str("record_id", rec.ID.Hex()).
+			Str("record_id", rec.ID).
 			Int("rides_done", updated.RidesDone).
 			Int("rides_required", updated.RidesRequired).
 			Msg("Referral ride count incremented")
@@ -265,13 +270,14 @@ func (s *Service) creditReferrer(ctx context.Context, rec *Record) {
 
 	switch rec.ReferrerRole {
 	case "driver":
-		// Credit driver wallet
-		objID, err := primitive.ObjectIDFromHex(rec.ReferrerID)
-		if err == nil {
-			if err := s.walletStore.UpdateWalletBalance(ctx, objID, rec.ReferrerAmount); err != nil {
-				logger.Log.Error().Err(err).Str("driver_id", rec.ReferrerID).Float64("amount", rec.ReferrerAmount).Msg("Failed to credit referrer driver wallet")
-				return
-			}
+		// Credit driver wallet — string UUID, validated via ids.IsValid
+		if !ids.IsValid(rec.ReferrerID) {
+			logger.Log.Error().Str("driver_id", rec.ReferrerID).Msg("Invalid referrer driver ID")
+			return
+		}
+		if err := s.walletStore.UpdateWalletBalance(ctx, rec.ReferrerID, rec.ReferrerAmount); err != nil {
+			logger.Log.Error().Err(err).Str("driver_id", rec.ReferrerID).Float64("amount", rec.ReferrerAmount).Msg("Failed to credit referrer driver wallet")
+			return
 		}
 	case "user":
 		// Credit user via offers collection
@@ -298,7 +304,7 @@ func (s *Service) creditReferrer(ctx context.Context, rec *Record) {
 
 	// Publish event for FCM push notification
 	s.eventBus.PublishEvent(eventbus.ChannelReferralCredited, eventbus.ReferralCreditedPayload{
-		RecordID:      rec.ID.Hex(),
+		RecordID:      rec.ID,
 		RecipientID:   rec.ReferrerID,
 		RecipientRole: rec.ReferrerRole,
 		Amount:        rec.ReferrerAmount,
@@ -316,12 +322,13 @@ func (s *Service) creditReferee(ctx context.Context, rec *Record) {
 	switch rec.RefereeRole {
 	case "driver":
 		// Credit driver wallet
-		objID, err := primitive.ObjectIDFromHex(rec.RefereeID)
-		if err == nil {
-			if err := s.walletStore.UpdateWalletBalance(ctx, objID, rec.RefereeAmount); err != nil {
-				logger.Log.Error().Err(err).Str("driver_id", rec.RefereeID).Float64("amount", rec.RefereeAmount).Msg("Failed to credit referee driver wallet")
-				return
-			}
+		if !ids.IsValid(rec.RefereeID) {
+			logger.Log.Error().Str("driver_id", rec.RefereeID).Msg("Invalid referee driver ID")
+			return
+		}
+		if err := s.walletStore.UpdateWalletBalance(ctx, rec.RefereeID, rec.RefereeAmount); err != nil {
+			logger.Log.Error().Err(err).Str("driver_id", rec.RefereeID).Float64("amount", rec.RefereeAmount).Msg("Failed to credit referee driver wallet")
+			return
 		}
 	case "user":
 		// Credit user via offers collection
@@ -347,7 +354,7 @@ func (s *Service) creditReferee(ctx context.Context, rec *Record) {
 
 	// Publish event for FCM push notification
 	s.eventBus.PublishEvent(eventbus.ChannelReferralCredited, eventbus.ReferralCreditedPayload{
-		RecordID:      rec.ID.Hex(),
+		RecordID:      rec.ID,
 		RecipientID:   rec.RefereeID,
 		RecipientRole: rec.RefereeRole,
 		Amount:        rec.RefereeAmount,
@@ -357,18 +364,18 @@ func (s *Service) creditReferee(ctx context.Context, rec *Record) {
 
 // GetRewards builds the rewards response for a user or driver.
 func (s *Service) GetRewards(ctx context.Context, entityID, role string) (*RewardsResponse, error) {
-	// Get the referral code
-	objID, err := primitive.ObjectIDFromHex(entityID)
-	if err != nil {
-		return nil, err
+	// Validate entityID is a valid UUID string
+	if !ids.IsValid(entityID) {
+		return nil, fmt.Errorf("invalid id: %s", entityID)
 	}
 
 	var myCode string
+	var err error
 	switch role {
 	case "user":
-		myCode, err = s.GetOrCreateUserCode(ctx, objID)
+		myCode, err = s.GetOrCreateUserCode(ctx, entityID)
 	case "driver":
-		myCode, err = s.GetOrCreateDriverCode(ctx, objID)
+		myCode, err = s.GetOrCreateDriverCode(ctx, entityID)
 	default:
 		return nil, fmt.Errorf("invalid role: %s", role)
 	}
