@@ -21,15 +21,46 @@ func NewFCMNotifier(fcmClient *notification.FCMClient, authStore *auth.Store) *F
 	return &FCMNotifier{fcmClient: fcmClient, authStore: authStore}
 }
 
+const fcmWorkerPoolSize = 10
+
 func (n *FCMNotifier) SubscribeTo(bus *InMemoryBus) {
-	bus.Subscribe(ChannelRideDriverOffered, n.handleRideOffered)
-	bus.Subscribe(ChannelRideAccepted, n.handleRideAccepted)
-	bus.Subscribe(ChannelRideArrived, n.handleRideArrived)
-	bus.Subscribe(ChannelRideStarted, n.handleRideStarted)
-	bus.Subscribe(ChannelRideCompleted, n.handleRideCompleted)
-	bus.Subscribe(ChannelRideCancelled, n.handleRideCancelled)
-	bus.Subscribe(ChannelAuthDriverApproved, n.handleDriverApproved)
-	bus.Subscribe(ChannelReferralCredited, n.handleReferralCredited)
+	n.subscribeWithPool(bus, ChannelRideDriverOffered, n.handleRideOffered)
+	n.subscribeWithPool(bus, ChannelRideAccepted, n.handleRideAccepted)
+	n.subscribeWithPool(bus, ChannelRideArrived, n.handleRideArrived)
+	n.subscribeWithPool(bus, ChannelRideStarted, n.handleRideStarted)
+	n.subscribeWithPool(bus, ChannelRideCompleted, n.handleRideCompleted)
+	n.subscribeWithPool(bus, ChannelRideCancelled, n.handleRideCancelled)
+	n.subscribeWithPool(bus, ChannelAuthDriverApproved, n.handleDriverApproved)
+	n.subscribeWithPool(bus, ChannelReferralCredited, n.handleReferralCredited)
+}
+
+// subscribeWithPool creates a single shared channel via SubscribeWithChan and
+// spawns 10 goroutines that compete for messages. This replaces the previous
+// single-goroutine-per-channel model which at 200 rps needed 50s to drain
+// 500 ride:driver_offered events (FCM fetch 5s + send). With 10 workers the
+// drain time is ~5s while preserving the 5s context + GetFCMToken + SendDataMessage
+// logic inside each handler.
+func (n *FCMNotifier) subscribeWithPool(bus *InMemoryBus, channel string, handler func([]byte)) {
+	ch := bus.SubscribeWithChan(channel)
+	for i := 0; i < fcmWorkerPoolSize; i++ {
+		go func(workerID int) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Log.Error().Interface("panic", r).Str("channel", channel).Int("worker", workerID).Msg("Panic in FCM worker")
+				}
+			}()
+			for msg := range ch {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Log.Error().Interface("panic", r).Str("channel", channel).Int("worker", workerID).Msg("Panic in FCM handler")
+						}
+					}()
+					handler(msg)
+				}()
+			}
+		}(i)
+	}
 }
 
 func (n *FCMNotifier) handleRideOffered(payload []byte) {

@@ -39,7 +39,7 @@ func (s *AuditStore) InsertEvent(ctx context.Context, event *AuditEvent) error {
 	} else {
 		requestID = event.RequestID
 	}
-	const q = `INSERT INTO audit_log (id, event_type, channel, payload, request_id, created_at) VALUES ($1,$2,$3,$4,$5,$6)`
+	const q = `INSERT INTO audit_log (id, event_type, channel, payload, request_id, created_at) VALUES ($1,$2,$3,$4::jsonb,$5,$6)`
 	_, err := s.pool.Exec(ctx, q, event.ID, event.EventType, event.Channel, event.Payload, requestID, event.CreatedAt)
 	return err
 }

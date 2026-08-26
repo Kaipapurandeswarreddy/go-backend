@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-
-	"encoding/json"
 
 	"ambigo-backend/api/handlers"
 	"ambigo-backend/api/middleware"
@@ -213,6 +214,45 @@ func main() {
 	// Metrics endpoint for Prometheus scraping (no API key needed)
 	mux.Handle("GET /metrics", promhttp.Handler())
 
+	// pprof endpoint — gated behind ENABLE_PPROF and API-key guard (not public like /metrics).
+	// Blank import _ "net/http/pprof" registers handlers on http.DefaultServeMux.
+	// Only mounted when ENABLE_PPROF=="true" and always wrapped with apiKeyAuth.
+	// Timeout note: main server retains ReadTimeout 10s / WriteTimeout 30s. pprof
+	// profiles (heap, goroutine) finish within 30s; long profiles (trace/profile
+	// with ?seconds=30) would be truncated by WriteTimeout. To avoid raising the
+	// main server's timeout, a loopback-only secondary server with WriteTimeout=0
+	// is started for extended traces, while the main mux keeps 30s.
+	if os.Getenv("ENABLE_PPROF") == "true" {
+		pprofHandler := apiKeyAuth(http.DefaultServeMux)
+		mux.Handle("/debug/pprof/", pprofHandler)
+		mux.Handle("/debug/pprof/cmdline", pprofHandler)
+		mux.Handle("/debug/pprof/profile", pprofHandler)
+		mux.Handle("/debug/pprof/symbol", pprofHandler)
+		mux.Handle("/debug/pprof/trace", pprofHandler)
+		log.Info().Msg("pprof enabled at /debug/pprof/ (API-key guarded; main WriteTimeout 30s retained)")
+		go func() {
+			pprofMux := http.NewServeMux()
+			pprofMux.Handle("/debug/pprof/", http.DefaultServeMux)
+			pprofMux.Handle("/debug/pprof/cmdline", http.DefaultServeMux)
+			pprofMux.Handle("/debug/pprof/profile", http.DefaultServeMux)
+			pprofMux.Handle("/debug/pprof/symbol", http.DefaultServeMux)
+			pprofMux.Handle("/debug/pprof/trace", http.DefaultServeMux)
+			guarded := apiKeyAuth(pprofMux)
+			srv := &http.Server{
+				Addr:              "127.0.0.1:6060",
+				Handler:           guarded,
+				ReadTimeout:       10 * time.Second,
+				WriteTimeout:      0, // unlimited for long pprof traces
+				ReadHeaderTimeout: 5 * time.Second,
+				MaxHeaderBytes:    1 << 20,
+			}
+			log.Info().Msg("pprof secondary server listening on 127.0.0.1:6060 (WriteTimeout=0)")
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error().Err(err).Msg("pprof secondary server stopped")
+			}
+		}()
+	}
+
 	// Basic Health Check (no API key needed)
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -222,9 +262,7 @@ func main() {
 		if err := pool.Ping(ctx); err != nil {
 			postgresOK = "unreachable"
 		}
-		// Also report pool stats for observability
-		_ = pool.Stat()
-
+		stat := pool.Stat()
 		googleOK := "ok"
 		if appConfig.GoogleMapsAPIKey == "" {
 			googleOK = "not_configured"
@@ -242,9 +280,14 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  overall,
 			"version": "v2-pg",
-			"checks": map[string]string{
-				"postgres": postgresOK,
-				"googleap": googleOK,
+			"checks": map[string]interface{}{
+				"postgres":           postgresOK,
+				"googleap":           googleOK,
+				"pool_total_conns":   stat.TotalConns(),
+				"pool_acquired_conns": stat.AcquiredConns(),
+				"pool_idle_conns":    stat.IdleConns(),
+				"pool_max_conns":     stat.MaxConns(),
+				"pool_constructing_conns": fmt.Sprintf("%d", stat.ConstructingConns()),
 			},
 		})
 	})
@@ -416,8 +459,9 @@ func main() {
 	mux.Handle("POST /api/v2/admin/referral/config", requireAdmin(http.HandlerFunc(referralHandler.HandleSaveConfig)))
 
 	// Housekeeping: audit_log TTL 30d + auth_otp 5m cleanup (replaces Mongo TTL indexes)
+	// OTP rows expire after 5m — ticker must match (was 1h => 12x bloat of expired rows)
 	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
+		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

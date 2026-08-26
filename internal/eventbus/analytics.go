@@ -50,7 +50,7 @@ func (a *AnalyticsTracker) handleRideRequested(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "ride_requested").Str("ride_id", p.RideID).Str("user_id", p.UserID).Bool("sos", p.IsSOS).Str("payment_mode", p.PaymentMode).Float64("fare", p.Fare).Float64("distance_km", p.DistanceKm).Str("amb_type_id", p.AmbTypeID).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleRideDriverOffered(payload []byte) {
@@ -60,7 +60,7 @@ func (a *AnalyticsTracker) handleRideDriverOffered(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "ride_driver_offered").Str("ride_id", p.RideID).Str("driver_id", p.DriverID).Str("user_id", p.UserID).Float64("pickup_distance_km", p.PickupDistanceKm).Float64("trip_distance_km", p.TripDistanceKm).Int("eta_seconds", p.ETASeconds).Float64("driver_share", p.DriverShare).Bool("sos", p.IsSOS).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleRideAccepted(payload []byte) {
@@ -70,7 +70,7 @@ func (a *AnalyticsTracker) handleRideAccepted(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "ride_accepted").Str("ride_id", p.RideID).Str("driver_id", p.DriverID).Str("user_id", p.UserID).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleRideArrived(payload []byte) {
@@ -80,7 +80,7 @@ func (a *AnalyticsTracker) handleRideArrived(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "ride_arrived").Str("ride_id", p.RideID).Str("user_id", p.UserID).Str("driver_id", p.DriverID).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleRideStarted(payload []byte) {
@@ -90,7 +90,7 @@ func (a *AnalyticsTracker) handleRideStarted(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "ride_started").Str("ride_id", p.RideID).Str("user_id", p.UserID).Str("driver_id", p.DriverID).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleRideCompleted(payload []byte) {
@@ -100,7 +100,7 @@ func (a *AnalyticsTracker) handleRideCompleted(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "ride_completed").Str("ride_id", p.RideID).Str("user_id", p.UserID).Str("driver_id", p.DriverID).Float64("amount", p.FinalAmount).Float64("driver_share", p.DriverShare).Str("payment_mode", p.PaymentMode).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleRideCancelled(payload []byte) {
@@ -110,7 +110,7 @@ func (a *AnalyticsTracker) handleRideCancelled(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "ride_cancelled").Str("ride_id", p.RideID).Str("user_id", p.UserID).Str("driver_id", p.DriverID).Str("reason", p.Reason).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleAuthOTPRequested(payload []byte) {
@@ -120,7 +120,7 @@ func (a *AnalyticsTracker) handleAuthOTPRequested(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "auth_otp_requested").Str("mobile", p.Mobile).Str("role", p.Role).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleUserRegistered(payload []byte) {
@@ -130,7 +130,7 @@ func (a *AnalyticsTracker) handleUserRegistered(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "user_registered").Str("user_id", p.UserID).Str("mobile", p.Mobile).Str("name", p.Name).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleUserLoggedIn(payload []byte) {
@@ -140,7 +140,7 @@ func (a *AnalyticsTracker) handleUserLoggedIn(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "user_logged_in").Str("user_id", p.UserID).Str("mobile", p.Mobile).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleDriverCreated(payload []byte) {
@@ -150,7 +150,7 @@ func (a *AnalyticsTracker) handleDriverCreated(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "driver_created").Str("driver_id", p.DriverID).Str("mobile", p.Mobile).Str("name", p.Name).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleDriverLoggedIn(payload []byte) {
@@ -160,7 +160,7 @@ func (a *AnalyticsTracker) handleDriverLoggedIn(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "driver_logged_in").Str("driver_id", p.DriverID).Str("mobile", p.Mobile).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleDriverApproved(payload []byte) {
@@ -170,7 +170,7 @@ func (a *AnalyticsTracker) handleDriverApproved(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "driver_approved").Str("driver_id", p.DriverID).Str("name", p.Name).Str("mobile", p.Mobile).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handlePaymentCompleted(payload []byte) {
@@ -180,7 +180,7 @@ func (a *AnalyticsTracker) handlePaymentCompleted(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "payment_completed").Str("payment_id", p.PaymentID).Str("ride_id", p.RideID).Str("user_id", p.UserID).Str("driver_id", p.DriverID).Float64("amount", p.Amount).Str("mode", p.Mode).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleWalletWithdrawal(payload []byte) {
@@ -190,7 +190,7 @@ func (a *AnalyticsTracker) handleWalletWithdrawal(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "wallet_withdrawal").Str("driver_id", p.DriverID).Float64("amount", p.Amount).Str("status", p.Status).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleAmbTypeCreated(payload []byte) {
@@ -200,7 +200,7 @@ func (a *AnalyticsTracker) handleAmbTypeCreated(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "amb_type_created").Str("amb_type_id", p.AmbTypeID).Str("name", p.Name).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleAmbTypeDeleted(payload []byte) {
@@ -210,7 +210,7 @@ func (a *AnalyticsTracker) handleAmbTypeDeleted(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "amb_type_deleted").Str("amb_type_id", p.AmbTypeID).Str("name", p.Name).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleHospitalAdded(payload []byte) {
@@ -220,7 +220,7 @@ func (a *AnalyticsTracker) handleHospitalAdded(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "hospital_added").Str("hospital_id", p.HospitalID).Str("name", p.Name).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleHospitalUpdated(payload []byte) {
@@ -230,7 +230,7 @@ func (a *AnalyticsTracker) handleHospitalUpdated(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "hospital_updated").Str("hospital_id", p.HospitalID).Str("name", p.Name).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleHospitalDeleted(payload []byte) {
@@ -240,7 +240,7 @@ func (a *AnalyticsTracker) handleHospitalDeleted(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "hospital_deleted").Str("hospital_id", p.HospitalID).Str("name", p.Name).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleOfferCreated(payload []byte) {
@@ -250,7 +250,7 @@ func (a *AnalyticsTracker) handleOfferCreated(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "offer_created").Str("offer_id", p.OfferID).Str("description", p.Description).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }
 
 func (a *AnalyticsTracker) handleOfferDeleted(payload []byte) {
@@ -260,5 +260,5 @@ func (a *AnalyticsTracker) handleOfferDeleted(payload []byte) {
 		return
 	}
 	l := logger.Log.With().Str("event", "offer_deleted").Str("offer_id", p.OfferID).Str("request_id", p.RequestID).Logger()
-	l.Info().Msg("")
+	l.Info().Msg("analytics event")
 }

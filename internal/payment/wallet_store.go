@@ -34,7 +34,8 @@ type WalletTransaction struct {
 // drivers.wallet_details. In Postgres both tables live in the same DB
 // (single pool), but the store is usable inside a pgx.Tx via DBTX.
 type WalletStore struct {
-	db DBTX
+	pool *pgxpool.Pool
+	db   DBTX
 }
 
 // NewWalletStore creates a WalletStore backed by a pgxpool.Pool.
@@ -42,7 +43,7 @@ type WalletStore struct {
 // Postgres version uses a single pool since both tables are in the public
 // schema (wallet_transactions + drivers).
 func NewWalletStore(pool *pgxpool.Pool) *WalletStore {
-	return &WalletStore{db: pool}
+	return &WalletStore{pool: pool, db: pool}
 }
 
 // NewWalletStoreWithDB creates a WalletStore from any DBTX (pool or Tx).
@@ -52,8 +53,11 @@ func NewWalletStoreWithDB(db DBTX) *WalletStore {
 
 // WithTx returns a new WalletStore bound to the given transaction.
 func (s *WalletStore) WithTx(tx pgx.Tx) *WalletStore {
-	return &WalletStore{db: tx}
+	return &WalletStore{pool: s.pool, db: tx}
 }
+
+// Pool returns the underlying pool (may be nil if created via NewWalletStoreWithDB).
+func (s *WalletStore) Pool() *pgxpool.Pool { return s.pool }
 
 const walletSelect = `SELECT id::text, driver_id, zwitch_beneficiary_id, zwitch_id, amount, account_no, merchant_reference_id, bank_reference_no, zwitch_transfer_id, status, error_message, created_at, updated_at FROM wallet_transactions`
 
@@ -97,10 +101,68 @@ func (s *WalletStore) InsertTransaction(ctx context.Context, tx *WalletTransacti
 	return err
 }
 
-// ListTransactions returns all wallet transactions for a driver, ordered by
-// created_at descending. Returns empty slice (not nil) if none found.
+// ListTransactions returns the most recent 50 wallet transactions for a driver, ordered by
+// created_at descending. Use ListTransactionsPaginated for keyset pagination.
 func (s *WalletStore) ListTransactions(ctx context.Context, driverID string) ([]WalletTransaction, error) {
-	rows, err := s.db.Query(ctx, walletSelect+` WHERE driver_id=$1 ORDER BY created_at DESC`, driverID)
+	return s.ListTransactionsPaginated(ctx, driverID, 50, "")
+}
+
+// ListTransactionsPaginated returns wallet transactions with keyset pagination (capped at 50).
+func (s *WalletStore) ListTransactionsPaginated(ctx context.Context, driverID string, limit int, cursor string) ([]WalletTransaction, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var rows pgx.Rows
+	var err error
+	if cursor != "" && ids.IsValid(cursor) {
+		// cursor is an id; keyset on (created_at, id)
+		rows, err = s.db.Query(ctx, walletSelect+` WHERE driver_id=$1 AND (created_at, id) < ((SELECT created_at FROM wallet_transactions WHERE id=$3::uuid), $3::uuid) ORDER BY created_at DESC, id DESC LIMIT $2`, driverID, limit, cursor)
+	} else {
+		rows, err = s.db.Query(ctx, walletSelect+` WHERE driver_id=$1 ORDER BY created_at DESC, id DESC LIMIT $2`, driverID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []WalletTransaction
+	for rows.Next() {
+		var w WalletTransaction
+		if err := rows.Scan(
+			&w.ID,
+			&w.DriverID,
+			&w.ZwitchBeneficiaryID,
+			&w.ZwitchID,
+			&w.Amount,
+			&w.AccountNo,
+			&w.MerchantReferenceID,
+			&w.BankReferenceNo,
+			&w.ZwitchTransferID,
+			&w.Status,
+			&w.ErrorMessage,
+			&w.CreatedAt,
+			&w.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		list = append(list, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []WalletTransaction{}
+	}
+	return list, nil
+}
+
+func (s *WalletStore) ListTransactionsWithOffset(ctx context.Context, driverID string, limit int, offset int) ([]WalletTransaction, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.db.Query(ctx, walletSelect+` WHERE driver_id=$1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`, driverID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -179,6 +241,18 @@ func (s *WalletStore) UpdateWalletDetails(ctx context.Context, driverID string, 
 	_, err = s.db.Exec(ctx,
 		`UPDATE drivers SET wallet_details=$2::jsonb, updated_at=now() WHERE id=$1::uuid`,
 		driverID, data,
+	)
+	return err
+}
+
+// UpdateTransactionStatus updates the status and auxiliary fields of a wallet
+// transaction identified by merchant_reference_id. Used in the withdrawal Saga
+// (Tx2 after Zwitch call and compensating refund Tx2b) per
+// docs/migration/03-tech-choices-evaluation.md §6.
+func (s *WalletStore) UpdateTransactionStatus(ctx context.Context, merchantReferenceID string, status string, bankReferenceNo string, zwitchTransferID string, errorMessage string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE wallet_transactions SET status=$2, bank_reference_no=$3, zwitch_transfer_id=$4, error_message=$5, updated_at=now() WHERE merchant_reference_id=$1`,
+		merchantReferenceID, status, bankReferenceNo, zwitchTransferID, errorMessage,
 	)
 	return err
 }

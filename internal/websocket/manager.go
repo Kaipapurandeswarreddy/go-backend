@@ -181,6 +181,11 @@ func (m *Manager) Run() {
 
 		case message := <-m.broadcast:
 			// Example generic broadcast (rarely used, usually we target specific IDs)
+			msgTypeBroadcast := "unknown"
+			var bm BaseMessage
+			if err := json.Unmarshal(message, &bm); err == nil && bm.Type != "" {
+				msgTypeBroadcast = bm.Type
+			}
 			m.mu.RLock()
 			for _, roleClients := range m.clients {
 				for _, clientsForID := range roleClients {
@@ -188,7 +193,8 @@ func (m *Manager) Run() {
 						select {
 						case client.Send <- message:
 						default:
-							// Ignore if send buffer is full
+							metrics.WSMessagesDropped.WithLabelValues(client.Role, msgTypeBroadcast, "send_buffer_full").Inc()
+							logger.Log.Warn().Str("role", client.Role).Str("id", client.ID).Str("msg_type", msgTypeBroadcast).Str("reason", "send_buffer_full").Int("chan_len", len(client.Send)).Int("chan_cap", cap(client.Send)).Msg("WS broadcast dropped: send buffer full")
 						}
 					}
 				}
@@ -291,7 +297,8 @@ func (m *Manager) SendToClient(role, id string, msgType string, payload interfac
 		case client.Send <- finalMsg:
 			logger.Log.Debug().Str("msg_type", msgType).Str("role", role).Str("id", id).Int("chan_len", len(client.Send)).Int("chan_cap", cap(client.Send)).Msg("Queued to client")
 		default:
-			logger.Log.Warn().Str("role", role).Str("id", id).Str("msg_type", msgType).Msg("Send channel full, dropping message")
+			metrics.WSMessagesDropped.WithLabelValues(role, msgType, "send_buffer_full").Inc()
+			logger.Log.Warn().Str("role", role).Str("id", id).Str("msg_type", msgType).Str("reason", "send_buffer_full").Int("chan_len", len(client.Send)).Int("chan_cap", cap(client.Send)).Msg("Send channel full, dropping message")
 		}
 	}
 }
@@ -312,6 +319,8 @@ func (m *Manager) SendToRideWatchers(rideID string, msgType string, payload inte
 		select {
 		case client.Send <- msgBytes:
 		default:
+			metrics.WSMessagesDropped.WithLabelValues(client.Role, msgType, "send_buffer_full").Inc()
+			logger.Log.Warn().Str("role", client.Role).Str("id", client.ID).Str("msg_type", msgType).Str("reason", "send_buffer_full").Int("chan_len", len(client.Send)).Int("chan_cap", cap(client.Send)).Msg("WS SendToRideWatchers dropped: send buffer full")
 		}
 	}
 }

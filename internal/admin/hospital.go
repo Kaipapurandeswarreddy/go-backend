@@ -324,8 +324,53 @@ func (s *HospitalStore) CreateHospital(ctx context.Context, h *Hospital) error {
 }
 
 func (s *HospitalStore) ListHospitals(ctx context.Context) ([]Hospital, error) {
-	q := `SELECT ` + hospitalColumns + ` FROM hospitals`
-	rows, err := s.pool.Query(ctx, q)
+	return s.ListHospitalsPaginated(ctx, 50, "")
+}
+
+func (s *HospitalStore) ListHospitalsPaginated(ctx context.Context, limit int, cursor string) ([]Hospital, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var q string
+	var rows pgx.Rows
+	var err error
+	if cursor != "" && ids.IsValid(cursor) {
+		q = `SELECT ` + hospitalColumns + ` FROM hospitals WHERE (created_at, id) < ((SELECT created_at FROM hospitals WHERE id=$2::uuid), $2::uuid) ORDER BY created_at DESC, id DESC LIMIT $1`
+		rows, err = s.pool.Query(ctx, q, limit, cursor)
+	} else {
+		q = `SELECT ` + hospitalColumns + ` FROM hospitals ORDER BY created_at DESC, id DESC LIMIT $1`
+		rows, err = s.pool.Query(ctx, q, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []Hospital
+	for rows.Next() {
+		h, err := scanHospital(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, *h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []Hospital{}
+	}
+	return list, nil
+}
+
+func (s *HospitalStore) ListHospitalsWithOffset(ctx context.Context, limit int, offset int) ([]Hospital, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	q := `SELECT ` + hospitalColumns + ` FROM hospitals ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`
+	rows, err := s.pool.Query(ctx, q, limit, offset)
 	if err != nil {
 		return nil, err
 	}

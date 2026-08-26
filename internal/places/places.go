@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/metrics"
 	"ambigo-backend/internal/retry"
+
+	"github.com/sony/gobreaker"
 )
 
 // Place is a normalized hospital result returned by the Google Places API (New).
@@ -25,9 +29,40 @@ type Place struct {
 // PlacesClient talks to the Google Places API (New) nearby-search endpoint.
 // It mirrors the pattern of dispatch.RouteClient.
 type PlacesClient struct {
-	APIKey string
-	APIURL string
-	Client *http.Client
+	APIKey  string
+	APIURL  string
+	Client  *http.Client
+	breaker *gobreaker.CircuitBreaker
+}
+
+func newPlacesBreaker() *gobreaker.CircuitBreaker {
+	return gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "places",
+		MaxRequests: 20,
+		Interval:    60 * time.Second,
+		Timeout:     30 * time.Second,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			if counts.Requests < 10 {
+				return false
+			}
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return failureRatio >= 0.5
+		},
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			logger.Log.Info().Str("client", name).Str("from", from.String()).Str("to", to.String()).Msg("circuit breaker state changed")
+			var val float64
+			switch to {
+			case gobreaker.StateClosed:
+				val = 0
+			case gobreaker.StateOpen:
+				val = 1
+			case gobreaker.StateHalfOpen:
+				val = 2
+			}
+			metrics.CircuitBreakerState.WithLabelValues(name).Set(val)
+			metrics.CircuitBreakerTransitions.WithLabelValues(name, from.String(), to.String()).Inc()
+		},
+	})
 }
 
 func NewPlacesClient(apiKey, apiURL string) *PlacesClient {
@@ -41,6 +76,7 @@ func NewPlacesClient(apiKey, apiURL string) *PlacesClient {
 				IdleConnTimeout: 90 * time.Second,
 			},
 		},
+		breaker: newPlacesBreaker(),
 	}
 }
 
@@ -81,66 +117,79 @@ func (p *PlacesClient) SearchNearby(ctx context.Context, lat, lng float64, radiu
 		return nil, nil
 	}
 
+	// Fallback to empty without calling Google when circuit breaker is open
+	if p.breaker != nil && p.breaker.State() == gobreaker.StateOpen {
+		logger.Log.Warn().Str("client", "places").Msg("circuit breaker open, falling back to empty without calling Google")
+		return []Place{}, nil
+	}
+
 	var result []Place
-	err := retry.Do(ctx, retry.Default, func(ctx context.Context) error {
-		body := searchNearbyRequest{
-			IncludedTypes:  []string{"hospital"},
-			MaxResultCount: maxResults,
-			RankPreference: "DISTANCE",
-		}
-		body.LocationRestriction.Circle.Center.Latitude = lat
-		body.LocationRestriction.Circle.Center.Longitude = lng
-		body.LocationRestriction.Circle.Radius = radiusM
+	_, err := p.breaker.Execute(func() (interface{}, error) {
+		innerErr := retry.Do(ctx, retry.Default, func(ctx context.Context) error {
+			body := searchNearbyRequest{
+				IncludedTypes:  []string{"hospital"},
+				MaxResultCount: maxResults,
+				RankPreference: "DISTANCE",
+			}
+			body.LocationRestriction.Circle.Center.Latitude = lat
+			body.LocationRestriction.Circle.Center.Longitude = lng
+			body.LocationRestriction.Circle.Radius = radiusM
 
-		jsonData, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
+			jsonData, err := json.Marshal(body)
+			if err != nil {
+				return err
+			}
 
-		req, err := http.NewRequestWithContext(ctx, "POST", p.APIURL, bytes.NewBuffer(jsonData))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Goog-Api-Key", p.APIKey)
-		req.Header.Set("X-Goog-FieldMask", "places.id,places.displayName,places.formattedAddress,places.location,places.types")
+			req, err := http.NewRequestWithContext(ctx, "POST", p.APIURL, bytes.NewBuffer(jsonData))
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Goog-Api-Key", p.APIKey)
+			req.Header.Set("X-Goog-FieldMask", "places.id,places.displayName,places.formattedAddress,places.location,places.types")
 
-		start := time.Now()
-		resp, err := p.Client.Do(req)
-		metrics.ObserveGoogleAPI(time.Since(start))
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
+			start := time.Now()
+			resp, err := p.Client.Do(req)
+			metrics.ObserveGoogleAPI(time.Since(start))
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("google places api returned status: %d", resp.StatusCode)
-		}
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("google places api returned status: %d", resp.StatusCode)
+			}
 
-		var resData searchNearbyResponse
-		if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
-			return err
-		}
+			var resData searchNearbyResponse
+			if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+				return err
+			}
 
-		if len(resData.Places) == 0 {
-			result = []Place{}
+			if len(resData.Places) == 0 {
+				result = []Place{}
+				return nil
+			}
+
+			result = make([]Place, 0, len(resData.Places))
+			for _, rp := range resData.Places {
+				result = append(result, Place{
+					ID:            rp.ID,
+					DisplayName:   rp.DisplayName.Text,
+					FormattedAddr: rp.FormattedAddress,
+					Lat:           rp.Location.Latitude,
+					Lng:           rp.Location.Longitude,
+					Types:         rp.Types,
+				})
+			}
 			return nil
-		}
-
-		result = make([]Place, 0, len(resData.Places))
-		for _, rp := range resData.Places {
-			result = append(result, Place{
-				ID:            rp.ID,
-				DisplayName:   rp.DisplayName.Text,
-				FormattedAddr: rp.FormattedAddress,
-				Lat:           rp.Location.Latitude,
-				Lng:           rp.Location.Longitude,
-				Types:         rp.Types,
-			})
-		}
-		return nil
+		})
+		return nil, innerErr
 	})
 	if err != nil {
+		if errors.Is(err, gobreaker.ErrOpenState) {
+			logger.Log.Warn().Str("client", "places").Msg("circuit breaker open, fallback to empty")
+			return []Place{}, nil
+		}
 		return nil, err
 	}
 	if result == nil {

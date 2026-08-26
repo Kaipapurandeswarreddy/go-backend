@@ -60,7 +60,7 @@ func (h *HospitalAuthHandler) HandleHospitalMDRequestOTP(w http.ResponseWriter, 
 		response.Error(w, "Failed to generate OTP", http.StatusInternalServerError)
 		return
 	}
-	_ = auth.SendSMS(h.SMSCfg, req.Mobile, otp, req.AppSignature)
+	auth.SendSMSAsync(h.SMSCfg, req.Mobile, otp, req.AppSignature)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"detail": "OTP sent"})
 }
@@ -110,7 +110,7 @@ func (h *HospitalAuthHandler) HandleHospitalMDLoginRequestOTP(w http.ResponseWri
 		response.Error(w, "Failed to generate OTP", http.StatusInternalServerError)
 		return
 	}
-	_ = auth.SendSMS(h.SMSCfg, req.Mobile, otp, req.AppSignature)
+	auth.SendSMSAsync(h.SMSCfg, req.Mobile, otp, req.AppSignature)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"detail": "OTP sent"})
 }

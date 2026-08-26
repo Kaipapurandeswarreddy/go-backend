@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"ambigo-backend/api/middleware"
@@ -13,6 +14,8 @@ import (
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/payment"
 	"ambigo-backend/internal/requestid"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type WalletHandler struct {
@@ -144,46 +147,81 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Deduct balance atomically before calling Zwitch
-	if err := h.WalletStore.DeductBalance(r.Context(), uidStr, req.Amount); err != nil {
+	// Saga Tx1: deduct balance + insert pending transaction atomically
+	// Idempotency via merchant_reference_id UNIQUE (migrations 00001_init.sql:372)
+	pendingTx := &payment.WalletTransaction{
+		DriverID:            uidStr,
+		ZwitchBeneficiaryID: driver.WalletDetails.BenfID,
+		Amount:              req.Amount,
+		AccountNo:           driver.WalletDetails.AccountNo,
+		MerchantReferenceID: merchantRefID,
+		Status:              "pending",
+	}
+	if err := payment.WithTx(r.Context(), h.WalletStore.Pool(), func(tx pgx.Tx) error {
+		wTx := h.WalletStore.WithTx(tx)
+		if err := wTx.DeductBalance(r.Context(), uidStr, req.Amount); err != nil {
+			return err
+		}
+		return wTx.InsertTransaction(r.Context(), pendingTx)
+	}); err != nil {
 		response.Error(w, "Insufficient wallet balance", http.StatusBadRequest)
 		return
 	}
 
 	resp, err := h.ZwitchService.CreateTransfer(&driver.WalletDetails, amountToTransfer, merchantRefID)
+	log := logger.Ctx(r.Context())
 	if err != nil || resp == nil {
-		log := logger.Ctx(r.Context())
 		log.Error().Err(err).Msg("Zwitch transfer failed, refunding wallet")
-		if refundErr := h.WalletStore.UpdateWalletBalance(r.Context(), uidStr, req.Amount); refundErr != nil {
+		// Compensating Tx2b: refund wallet + mark transaction failed
+		if refundErr := payment.WithTx(r.Context(), h.WalletStore.Pool(), func(tx pgx.Tx) error {
+			wTx := h.WalletStore.WithTx(tx)
+			if rErr := wTx.UpdateWalletBalance(r.Context(), uidStr, req.Amount); rErr != nil {
+				return rErr
+			}
+			errMsg := ""
+			if err != nil {
+				errMsg = err.Error()
+			}
+			return wTx.UpdateTransactionStatus(r.Context(), merchantRefID, "failed", "", "", errMsg)
+		}); refundErr != nil {
 			log.Error().Err(refundErr).Msg("Refund also failed -- manual intervention required")
 		}
 		response.Error(w, "Withdrawal Initiation failed", http.StatusBadRequest)
 		return
 	}
 
-	// Save transaction log
+	// Save transaction result — handle Zwitch status
 	status, _ := resp["status"].(string)
 	bankRef, _ := resp["bank_reference_number"].(string)
 	transferID, _ := resp["id"].(string)
-
-	tx := &payment.WalletTransaction{
-		DriverID:            uidStr,
-		ZwitchBeneficiaryID: driver.WalletDetails.BenfID,
-		Amount:              req.Amount,
-		AccountNo:           driver.WalletDetails.AccountNo,
-		MerchantReferenceID: merchantRefID,
-		BankReferenceNo:     bankRef,
-		ZwitchTransferID:    transferID,
-		Status:              status,
+	errMsg := ""
+	if reason, ok := resp["reason_for_error"].(string); ok {
+		errMsg = reason
 	}
 
-	if status == "failed" || status == "pending" {
-		if reason, ok := resp["reason_for_error"].(string); ok {
-			tx.ErrorMessage = reason
+	// If Zwitch reports failed, compensating refund
+	if status == "failed" {
+		log.Error().Str("merchant_ref", merchantRefID).Str("status", status).Msg("Zwitch returned failed, refunding")
+		if refundErr := payment.WithTx(r.Context(), h.WalletStore.Pool(), func(tx pgx.Tx) error {
+			wTx := h.WalletStore.WithTx(tx)
+			if rErr := wTx.UpdateWalletBalance(r.Context(), uidStr, req.Amount); rErr != nil {
+				return rErr
+			}
+			return wTx.UpdateTransactionStatus(r.Context(), merchantRefID, "failed", bankRef, transferID, errMsg)
+		}); refundErr != nil {
+			log.Error().Err(refundErr).Msg("Refund also failed -- manual intervention required")
 		}
+		response.Error(w, "Withdrawal Initiation failed", http.StatusBadRequest)
+		return
 	}
 
-	h.WalletStore.InsertTransaction(r.Context(), tx)
+	// Success or pending — update transaction status in Tx2
+	if updErr := payment.WithTx(r.Context(), h.WalletStore.Pool(), func(tx pgx.Tx) error {
+		wTx := h.WalletStore.WithTx(tx)
+		return wTx.UpdateTransactionStatus(r.Context(), merchantRefID, status, bankRef, transferID, errMsg)
+	}); updErr != nil {
+		log.Error().Err(updErr).Msg("Failed to update wallet transaction status")
+	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelWalletWithdrawal, eventbus.WalletWithdrawalPayload{
 		DriverID: uidStr, Amount: req.Amount, Status: status, RequestID: reqID,
@@ -199,7 +237,62 @@ func (h *WalletHandler) HandleListTransactions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	list, err := h.WalletStore.ListTransactions(r.Context(), uidStr)
+	limit := 50
+	cursor := r.URL.Query().Get("cursor")
+	if cursor == "" {
+		cursor = r.URL.Query().Get("after_id")
+	}
+	offset := 0
+	if v := r.URL.Query().Get("skip"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	} else if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 50 {
+			limit = n
+		}
+	}
+	// Allow JSON body {limit,cursor,skip} for POST compatibility.
+	if r.Body != nil && r.ContentLength != 0 {
+		var body struct {
+			Limit   *int   `json:"limit"`
+			Cursor  string `json:"cursor"`
+			AfterID string `json:"after_id"`
+			Skip    *int   `json:"skip"`
+			Offset  *int   `json:"offset"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Limit != nil && *body.Limit > 0 {
+			n := *body.Limit
+			if n > 50 {
+				n = 50
+			}
+			limit = n
+		}
+		if body.Cursor != "" {
+			cursor = body.Cursor
+		} else if body.AfterID != "" {
+			cursor = body.AfterID
+		}
+		if body.Skip != nil && *body.Skip >= 0 {
+			offset = *body.Skip
+		} else if body.Offset != nil && *body.Offset >= 0 {
+			offset = *body.Offset
+		}
+	}
+
+	var list []payment.WalletTransaction
+	var err error
+	if offset > 0 && cursor == "" {
+		list, err = h.WalletStore.ListTransactionsWithOffset(r.Context(), uidStr, limit, offset)
+	} else {
+		list, err = h.WalletStore.ListTransactionsPaginated(r.Context(), uidStr, limit, cursor)
+	}
 	if err != nil {
 		response.Error(w, "Failed to list transactions", http.StatusInternalServerError)
 		return

@@ -54,16 +54,78 @@ func (s *Store) Create(ctx context.Context, o *Offer) error {
 	return err
 }
 
-// List returns all offers. Returns an empty slice (non-nil) when no rows exist.
+// List returns all offers capped at 50 rows. For larger sets use ListPaginated.
 func (s *Store) List(ctx context.Context) ([]Offer, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers`,
-	)
+	return s.ListPaginated(ctx, 50, "")
+}
+
+// ListPaginated returns offers with keyset pagination and a hard cap of 50.
+func (s *Store) ListPaginated(ctx context.Context, limit int, cursor string) ([]Offer, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var rows pgx.Rows
+	var err error
+	if cursor != "" && ids.IsValid(cursor) {
+		rows, err = s.pool.Query(ctx,
+			`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers WHERE (created_at, id) < ((SELECT created_at FROM offers WHERE id=$2::uuid), $2::uuid) ORDER BY created_at DESC, id DESC LIMIT $1`, limit, cursor)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
+	var list []Offer
+	for rows.Next() {
+		var o Offer
+		var userID sql.NullString
+		var offerPerc, offerAmount, maxDiscount sql.NullFloat64
+		if err := rows.Scan(&o.ID, &o.Description, &userID, &offerPerc, &offerAmount, &maxDiscount); err != nil {
+			return nil, err
+		}
+		if userID.Valid {
+			v := userID.String
+			o.UserID = &v
+		}
+		if offerPerc.Valid {
+			v := offerPerc.Float64
+			o.OfferPercentage = &v
+		}
+		if offerAmount.Valid {
+			v := offerAmount.Float64
+			o.OfferAmount = &v
+		}
+		if maxDiscount.Valid {
+			v := maxDiscount.Float64
+			o.MaxDiscount = &v
+		}
+		list = append(list, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []Offer{}
+	}
+	return list, nil
+}
+
+func (s *Store) ListWithOffset(ctx context.Context, limit int, offset int) ([]Offer, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 	var list []Offer
 	for rows.Next() {
 		var o Offer
@@ -140,10 +202,10 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	return err
 }
 
-// FindByUserID returns all offers for a given user_id (TEXT). Returns empty slice when none.
+// FindByUserID returns offers for a given user_id (TEXT) capped at 50. Returns empty slice when none.
 func (s *Store) FindByUserID(ctx context.Context, userID string) ([]Offer, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers WHERE user_id=$1`,
+		`SELECT id::text, description, user_id, offer_percentage, offer_amount, max_discount FROM offers WHERE user_id=$1 ORDER BY created_at DESC, id DESC LIMIT 50`,
 		userID,
 	)
 	if err != nil {

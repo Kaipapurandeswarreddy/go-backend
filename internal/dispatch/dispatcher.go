@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -66,8 +67,8 @@ func (d *Dispatcher) RequestRide(ctx context.Context, r *ride.Ride) error {
 	rideID := r.ID
 
 	d.mu.Lock()
-	d.acceptChannels[rideID] = make(chan string)
-	d.declineChannels[rideID] = make(chan string)
+	d.acceptChannels[rideID] = make(chan string, 1)
+	d.declineChannels[rideID] = make(chan string, 1)
 	d.mu.Unlock()
 
 	pickupLng, pickupLat := r.Pickup.Coordinates[0], r.Pickup.Coordinates[1]
@@ -132,7 +133,12 @@ func (d *Dispatcher) HandleDriverAccept(ctx context.Context, rideID string, driv
 	ch, exists := d.acceptChannels[rideID]
 	d.mu.RUnlock()
 	if exists {
-		ch <- driverID
+		select {
+		case ch <- driverID:
+		case <-time.After(2 * time.Second):
+			logger.Log.Warn().Str("ride_id", rideID).Str("driver_id", driverID).Msg("dispatcher too slow")
+			return errors.New("dispatcher busy")
+		}
 	}
 
 	rideData, _ := d.RideStore.GetRideByID(ctx, rideID)
@@ -155,7 +161,12 @@ func (d *Dispatcher) HandleDriverDecline(ctx context.Context, rideID, driverID s
 	ch, exists := d.declineChannels[rideID]
 	d.mu.RUnlock()
 	if exists {
-		ch <- driverID
+		select {
+		case ch <- driverID:
+		case <-time.After(2 * time.Second):
+			logger.Log.Warn().Str("ride_id", rideID).Str("driver_id", driverID).Msg("dispatcher too slow")
+			return
+		}
 	}
 }
 
