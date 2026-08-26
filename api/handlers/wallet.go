@@ -73,7 +73,13 @@ func (h *WalletHandler) HandleUpdateWallet(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	dbAcc := driver.WalletDetails
+	// WalletDetails is optional at driver creation (admin add); handle nil
+	var dbAcc *auth.WalletDetails
+	if driver.WalletDetails != nil {
+		dbAcc = driver.WalletDetails
+	} else {
+		dbAcc = &auth.WalletDetails{}
+	}
 	if dbAcc.AccountNo == "" {
 		// New beneficiary
 		benfID, err := h.ZwitchService.CreateBeneficiary(&req, uidStr)
@@ -132,7 +138,7 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if driver.WalletDetails.BenfID == "" {
+	if driver.WalletDetails == nil || driver.WalletDetails.BenfID == "" {
 		response.Error(w, "Driver Account Details not found", http.StatusBadRequest)
 		return
 	}
@@ -168,7 +174,7 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.ZwitchService.CreateTransfer(&driver.WalletDetails, amountToTransfer, merchantRefID)
+	resp, err := h.ZwitchService.CreateTransfer(driver.WalletDetails, amountToTransfer, merchantRefID)
 	log := logger.Ctx(r.Context())
 	if err != nil || resp == nil {
 		log.Error().Err(err).Msg("Zwitch transfer failed, refunding wallet")
