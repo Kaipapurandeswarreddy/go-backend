@@ -31,9 +31,9 @@ type DriverDetails struct {
 }
 
 type WalletDetails struct {
-	AccountNo string `db:"account_no" json:"account_no" validate:"required"`
-	BenfName  string `db:"benf_name" json:"benf_name" validate:"required"`
-	IFSCCode  string `db:"ifsc_code" json:"ifsc_code" validate:"required"`
+	AccountNo string `db:"account_no" json:"account_no"`
+	BenfName  string `db:"benf_name" json:"benf_name"`
+	IFSCCode  string `db:"ifsc_code" json:"ifsc_code"`
 	BenfID    string `db:"benf_id" json:"benf_id"`
 }
 
@@ -44,7 +44,7 @@ type Driver struct {
 	Photo              string         `db:"photo" json:"photo"`
 	VehicleType        string         `db:"vehicle_type" json:"vehicle_type" validate:"required"`
 	VehicleReg         string         `db:"vehicle_registration" json:"vehicle_registration" validate:"required"`
-	WalletDetails      WalletDetails  `db:"wallet_details" json:"wallet_details"`
+	WalletDetails      *WalletDetails `db:"wallet_details" json:"wallet_details,omitempty"`
 	WalletBalance      float64        `db:"wallet_balance" json:"wallet_balance"`
 	ReferralCode       string         `db:"referral_code" json:"referral_code"`
 	MyReferralCode     string         `db:"my_referral_code" json:"my_referral_code,omitempty"`
