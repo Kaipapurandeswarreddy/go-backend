@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
@@ -79,7 +80,14 @@ func (h *VerificationHandler) HandleUpdateVerification(w http.ResponseWriter, r 
 
 	var req auth.VerificationUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			response.Error(w, "Images too large: must be <10 MB total, please re-pick smaller images", http.StatusRequestEntityTooLarge)
+			return
+		}
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
 		return
 	}
 
