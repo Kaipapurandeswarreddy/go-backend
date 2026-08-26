@@ -80,7 +80,7 @@ func LoadConfig() *AppConfig {
 	cfg := &AppConfig{
 		MongoURI:    mongoURI,
 		DatabaseURL: databaseURL,
-		PGMaxOpenConns:    int32(envIntOrDefault("PG_MAX_OPEN_CONNS", 25)),
+		PGMaxOpenConns:    int32(envIntOrDefault("PG_MAX_OPEN_CONNS", 50)),
 		PGMinOpenConns:    int32(envIntOrDefault("PG_MIN_OPEN_CONNS", 5)),
 		PGMaxConnLifetime: envDurationOrDefault("PG_MAX_CONN_LIFETIME", 5*time.Minute),
 		PGMaxConnIdleTime: envDurationOrDefault("PG_MAX_CONN_IDLE_TIME", 2*time.Minute),

@@ -98,17 +98,47 @@ func RateLimit(next http.HandlerFunc, limiter *ipLimiter) http.HandlerFunc {
 
 // MobileRateLimiter limits per mobile number (V1, V7)
 type MobileRateLimiter struct {
-	mu      sync.Mutex
-	clients map[string]*clientLimiter
-	rate    rate.Limit
-	burst   int
+	mu          sync.Mutex
+	clients     map[string]*clientLimiter
+	rate        rate.Limit
+	burst       int
+	cleanupDone chan struct{}
 }
 
 func NewMobileRateLimiter(r rate.Limit, burst int) *MobileRateLimiter {
-	return &MobileRateLimiter{
-		clients: make(map[string]*clientLimiter),
-		rate:    r,
-		burst:   burst,
+	l := &MobileRateLimiter{
+		clients:     make(map[string]*clientLimiter),
+		rate:        r,
+		burst:       burst,
+		cleanupDone: make(chan struct{}),
+	}
+	go l.cleanupLoop()
+	return l
+}
+
+func (l *MobileRateLimiter) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		l.mu.Lock()
+		for mobile, c := range l.clients {
+			if time.Since(c.lastSeen) > 10*time.Minute {
+				delete(l.clients, mobile)
+			}
+		}
+		// Cap at 100k entries to prevent OOM under brute-force
+		if len(l.clients) > 100000 {
+			// Evict oldest 10% (approx) — simple random eviction
+			n := len(l.clients) / 10
+			for mobile := range l.clients {
+				delete(l.clients, mobile)
+				n--
+				if n <= 0 {
+					break
+				}
+			}
+		}
+		l.mu.Unlock()
 	}
 }
 

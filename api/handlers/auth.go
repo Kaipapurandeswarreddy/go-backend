@@ -80,7 +80,7 @@ func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Reques
 
 	otp, err := h.AuthStore.GenerateAndStoreOTP(r.Context(), payload.Mobile)
 	if err != nil {
-		logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Msg("Failed to generate OTP")
+		logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Str("request_id", requestid.FromContext(r.Context())).Msg("Failed to generate OTP")
 		response.Error(w, "Failed to send OTP", http.StatusInternalServerError)
 		return
 	}
@@ -90,12 +90,10 @@ func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Reques
 		Mobile: payload.Mobile, Role: "user", RequestID: reqID,
 	})
 
-	// V12: Don't leak SMS error details
-	if err := auth.SendSMS(h.SMSCfg, payload.Mobile, otp, payload.AppSignature); err != nil {
-		logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Msg("SMS send failed")
-		response.Error(w, "Failed to send OTP", http.StatusInternalServerError)
-		return
-	}
+	// Async SMS: OTP already persisted, return 200 immediately and deliver
+	// SMS on the background worker with retry. Avoids blocking the HTTP
+	// handler for up to 10s on SMSCountry latency.
+	auth.SendSMSAsync(h.SMSCfg, payload.Mobile, otp, payload.AppSignature)
 
 	// Look up existing user to show name on OTP screen
 	var name string
@@ -170,14 +168,14 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		}
 		user, err = h.AuthStore.CreateUser(r.Context(), payload.Name, payload.Mobile, payload.ReferralCode)
 		if err != nil {
-			logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Msg("Failed to create user")
+			logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Str("request_id", reqID).Msg("Failed to create user")
 			response.Error(w, "Registration failed", http.StatusInternalServerError)
 			return
 		}
 		// Generate a personal referral code for this new user
 		if h.ReferralService != nil {
 			if _, err := h.ReferralService.GetOrCreateUserCode(r.Context(), user.ID); err != nil {
-				logger.Log.Error().Err(err).Str("user_id", user.ID).Msg("Failed to generate referral code for new user")
+				logger.Log.Error().Err(err).Str("user_id", user.ID).Str("request_id", reqID).Msg("Failed to generate referral code for new user")
 			}
 		}
 		h.EventBus.PublishEvent(eventbus.ChannelAuthUserRegistered, eventbus.AuthUserRegisteredPayload{
@@ -186,7 +184,7 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		// V20: Process referral after user creation
 		if payload.ReferralCode != "" && h.ReferralService != nil {
 			if err := h.ReferralService.ProcessSignupReferral(r.Context(), user.ID, "user", payload.ReferralCode); err != nil {
-				logger.Log.Error().Err(err).Str("user_id", user.ID).Str("code", payload.ReferralCode).Msg("Failed to process signup referral")
+				logger.Log.Error().Err(err).Str("user_id", user.ID).Str("code", payload.ReferralCode).Str("request_id", reqID).Msg("Failed to process signup referral")
 			}
 		}
 	}
@@ -242,7 +240,7 @@ func (h *AuthHandler) HandleDriverRequestOTP(w http.ResponseWriter, r *http.Requ
 
 	otp, err := h.AuthStore.GenerateAndStoreOTP(r.Context(), payload.Mobile)
 	if err != nil {
-		logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Msg("Failed to generate OTP")
+		logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Str("request_id", requestid.FromContext(r.Context())).Msg("Failed to generate OTP")
 		response.Error(w, "Failed to send OTP", http.StatusInternalServerError)
 		return
 	}
@@ -252,11 +250,7 @@ func (h *AuthHandler) HandleDriverRequestOTP(w http.ResponseWriter, r *http.Requ
 		Mobile: payload.Mobile, Role: "driver", RequestID: reqID,
 	})
 
-	if err := auth.SendSMS(h.SMSCfg, payload.Mobile, otp, payload.AppSignature); err != nil {
-		logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Msg("SMS send failed")
-		response.Error(w, "Failed to send OTP", http.StatusInternalServerError)
-		return
-	}
+	auth.SendSMSAsync(h.SMSCfg, payload.Mobile, otp, payload.AppSignature)
 
 	// Look up existing driver to show name on OTP screen
 	var name string
@@ -332,7 +326,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 			}
 			unverifiedDriver, err = h.AuthStore.CreateUnverifiedDriver(r.Context(), payload.Name, payload.Mobile)
 			if err != nil {
-				logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Msg("Failed to create driver")
+				logger.Log.Error().Err(err).Str("mobile", payload.Mobile).Str("request_id", reqID).Msg("Failed to create driver")
 				response.Error(w, "Registration failed", http.StatusInternalServerError)
 				return
 			}
@@ -348,7 +342,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 			// V20: Process referral after driver creation
 			if payload.ReferralCode != "" && h.ReferralService != nil {
 				if err := h.ReferralService.ProcessSignupReferral(r.Context(), unverifiedDriver.ID, "driver", payload.ReferralCode); err != nil {
-					logger.Log.Error().Err(err).Str("driver_id", unverifiedDriver.ID).Str("code", payload.ReferralCode).Msg("Failed to process driver signup referral")
+					logger.Log.Error().Err(err).Str("driver_id", unverifiedDriver.ID).Str("code", payload.ReferralCode).Str("request_id", reqID).Msg("Failed to process driver signup referral")
 				}
 			}
 		}
@@ -358,7 +352,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	// Revoke all previous sessions so only this device stays logged in
 	revokedCount, err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID, "session_replaced")
 	if err != nil {
-		logger.Log.Error().Err(err).Str("driver_id", driverID).Msg("Failed to revoke old driver sessions")
+		logger.Log.Error().Err(err).Str("driver_id", driverID).Str("request_id", reqID).Msg("Failed to revoke old driver sessions")
 	}
 
 	accessToken, err := auth.GenerateAccessToken(driverID, role, h.JWTSecret)
@@ -401,6 +395,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 
 // V8: Token refresh endpoint with chain lineage (handles cold-boot retry storms)
 func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
 	var payload struct {
 		RefreshToken string `json:"refresh_token"`
 		DeviceID     string `json:"device_id,omitempty"`
@@ -440,7 +435,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 		}
 		if err != auth.ErrTokenAlreadyRevoked {
 			// Transient DB error — don't mask as auth failure
-			logger.Log.Error().Err(err).Msg("Refresh token rotation failed")
+			logger.Log.Error().Err(err).Str("request_id", reqID).Msg("Refresh token rotation failed")
 			response.Error(w, "Internal error", http.StatusInternalServerError)
 			return
 		}
@@ -452,12 +447,12 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 		liveToken, err := h.AuthStore.FindLiveInChain(r.Context(), tokenDoc)
 		if err != nil {
 			if err == auth.ErrBrokenChain || err == auth.ErrCycleDetected {
-				logger.Log.Error().Err(err).Str("token_id", tokenDoc.ID).Msg("Token chain corrupted")
+				logger.Log.Error().Err(err).Str("token_id", tokenDoc.ID).Str("request_id", reqID).Msg("Token chain corrupted")
 				response.Error(w, "Internal error", http.StatusInternalServerError)
 				return
 			}
 			if err != auth.ErrNoLiveToken {
-				logger.Log.Error().Err(err).Str("token_id", tokenDoc.ID).Msg("FindLiveInChain failed")
+				logger.Log.Error().Err(err).Str("token_id", tokenDoc.ID).Str("request_id", reqID).Msg("FindLiveInChain failed")
 				response.Error(w, "Internal error", http.StatusInternalServerError)
 				return
 			}
@@ -479,7 +474,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			if err != auth.ErrTokenAlreadyRevoked {
-				logger.Log.Error().Err(err).Msg("Chain rotation failed")
+				logger.Log.Error().Err(err).Str("request_id", reqID).Msg("Chain rotation failed")
 				response.Error(w, "Internal error", http.StatusInternalServerError)
 				return
 			}
@@ -500,10 +495,11 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(middleware.UserIDKey).(string)
 	role, _ := r.Context().Value(middleware.UserRoleKey).(string)
+	reqID := requestid.FromContext(r.Context())
 
 	// Revoke all refresh tokens for this user
 	if _, err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), userID, "logout"); err != nil {
-		logger.Log.Error().Err(err).Str("user_id", userID).Msg("Failed to revoke all refresh tokens on logout")
+		logger.Log.Error().Err(err).Str("user_id", userID).Str("request_id", reqID).Msg("Failed to revoke all refresh tokens on logout")
 	}
 
 	// Clear stored JWT (PG: ids are UUID strings; Clear*JWT now takes string)
@@ -519,7 +515,6 @@ func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Publish for audit trail (logout was previously invisible in audit_log)
-	reqID := requestid.FromContext(r.Context())
 	h.EventBus.PublishEvent(eventbus.ChannelAuthLoggedOut, eventbus.AuthLoggedOutPayload{
 		UserID: userID, Role: role, RequestID: reqID,
 	})

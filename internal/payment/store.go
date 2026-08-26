@@ -22,12 +22,13 @@ type DBTX interface {
 }
 
 type Store struct {
-	db DBTX
+	pool *pgxpool.Pool
+	db   DBTX
 }
 
 // NewStore creates a Store backed by a pgxpool.Pool.
 func NewStore(pool *pgxpool.Pool) *Store {
-	return &Store{db: pool}
+	return &Store{pool: pool, db: pool}
 }
 
 // NewStoreWithDB creates a Store from any DBTX (pool or Tx). Useful for tests.
@@ -40,8 +41,11 @@ func NewStoreWithDB(db DBTX) *Store {
 // (e.g. payment + wallet) in a single transaction per
 // docs/migration/03-tech-choices-evaluation.md section 6.
 func (s *Store) WithTx(tx pgx.Tx) *Store {
-	return &Store{db: tx}
+	return &Store{pool: s.pool, db: tx}
 }
+
+// Pool returns the underlying pool (may be nil if Store was created with NewStoreWithDB).
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
 // WithTx runs fn inside a transaction. The fn receives the transaction handle
 // so callers can build Tx-bound stores via Store.WithTx(tx) /

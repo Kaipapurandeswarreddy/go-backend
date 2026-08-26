@@ -4,7 +4,7 @@ import (
 	"net/http"
 )
 
-const MaxBodyBytes = 10 << 20 // 10 MB
+const MaxBodyBytes = 1 << 20 // 1 MB (10 MB only for /driver/verification/update via route-specific override)
 
 func BodyLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

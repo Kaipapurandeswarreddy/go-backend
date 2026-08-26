@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/eventbus"
@@ -49,7 +50,61 @@ func (h *OfferHandler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OfferHandler) HandleList(w http.ResponseWriter, r *http.Request) {
-	list, err := h.Store.List(r.Context())
+	limit := 50
+	cursor := r.URL.Query().Get("cursor")
+	if cursor == "" {
+		cursor = r.URL.Query().Get("after_id")
+	}
+	offset := 0
+	if v := r.URL.Query().Get("skip"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	} else if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 50 {
+			limit = n
+		}
+	}
+	// Allow JSON body {limit,cursor} as alternative for POST compatibility.
+	if r.Body != nil && r.Method != http.MethodGet && r.ContentLength != 0 {
+		var body struct {
+			Limit   *int   `json:"limit"`
+			Cursor  string `json:"cursor"`
+			AfterID string `json:"after_id"`
+			Skip    *int   `json:"skip"`
+			Offset  *int   `json:"offset"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Limit != nil && *body.Limit > 0 {
+			n := *body.Limit
+			if n > 50 {
+				n = 50
+			}
+			limit = n
+		}
+		if body.Cursor != "" {
+			cursor = body.Cursor
+		} else if body.AfterID != "" {
+			cursor = body.AfterID
+		}
+		if body.Skip != nil && *body.Skip >= 0 {
+			offset = *body.Skip
+		} else if body.Offset != nil && *body.Offset >= 0 {
+			offset = *body.Offset
+		}
+	}
+	var list []offer.Offer
+	var err error
+	if offset > 0 && cursor == "" {
+		list, err = h.Store.ListWithOffset(r.Context(), limit, offset)
+	} else {
+		list, err = h.Store.ListPaginated(r.Context(), limit, cursor)
+	}
 	if err != nil {
 		response.Error(w, "Failed to fetch offers", http.StatusInternalServerError)
 		return

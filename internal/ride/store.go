@@ -44,6 +44,9 @@ func (s *Store) WithTx(tx pgx.Tx) *Store {
 	return &Store{pool: s.pool, db: tx}
 }
 
+// Pool returns the underlying pool (may be nil if Store was created with NewStoreWithDB).
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
 // WithTx runs fn inside a transaction. Mirrors payment.WithTx pattern.
 func WithTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error {
 	tx, err := pool.Begin(ctx)

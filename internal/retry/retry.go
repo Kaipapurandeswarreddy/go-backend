@@ -2,10 +2,20 @@ package retry
 
 import (
 	"context"
+	"errors"
 	"math"
 	"math/rand"
+	"strings"
 	"time"
 )
+
+// NonRetryableError wraps an error that should not be retried (4xx, validation, etc.).
+type NonRetryableError struct {
+	Err error
+}
+
+func (e *NonRetryableError) Error() string { return e.Err.Error() }
+func (e *NonRetryableError) Unwrap() error { return e.Err }
 
 type Config struct {
 	MaxAttempts int
@@ -24,6 +34,19 @@ func Do(ctx context.Context, cfg Config, fn func(context.Context) error) error {
 	for attempt := 0; attempt < cfg.MaxAttempts; attempt++ {
 		if err = fn(ctx); err == nil {
 			return nil
+		}
+		// Do not retry non-retryable errors (4xx client errors) or context cancellation.
+		var nre *NonRetryableError
+		if errors.As(err, &nre) {
+			return err
+		}
+		if strings.Contains(err.Error(), "status: 4") {
+			// Covers 400, 401, 403, 404, 429 — all 4xx are client errors, not transient.
+			// 429 should be handled by circuit breaker with Retry-After, not blind retry.
+			return err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
 		}
 		if attempt == cfg.MaxAttempts-1 {
 			break

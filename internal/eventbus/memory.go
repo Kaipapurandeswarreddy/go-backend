@@ -57,30 +57,37 @@ func (b *InMemoryBus) PublishEvent(channel string, v interface{}) error {
 	return b.Publish(channel, data)
 }
 
+const defaultWorkerPoolSize = 10
+
 func (b *InMemoryBus) Subscribe(channel string, handler func(payload []byte)) error {
-	ch := make(chan []byte, 64)
+	ch := make(chan []byte, 512)
 
 	b.mu.Lock()
 	b.subscribers[channel] = append(b.subscribers[channel], ch)
 	b.mu.Unlock()
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				logger.Log.Error().Interface("panic", r).Str("channel", channel).Msg("Panic in subscriber")
-			}
-		}()
-		for msg := range ch {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						logger.Log.Error().Interface("panic", r).Str("channel", channel).Msg("Panic in subscriber handler")
-					}
-				}()
-				handler(msg)
+	// 10-worker pool draining the same channel: at 200 rps a single sequential
+	// handler (FCM 100ms each) needed 50s for 500 offers; 10 workers brings it
+	// to ~5s. Each worker competes for messages — each message processed exactly once.
+	for i := 0; i < defaultWorkerPoolSize; i++ {
+		go func(workerID int) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Log.Error().Interface("panic", r).Str("channel", channel).Int("worker", workerID).Msg("Panic in subscriber")
+				}
 			}()
-		}
-	}()
+			for msg := range ch {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Log.Error().Interface("panic", r).Str("channel", channel).Int("worker", workerID).Msg("Panic in subscriber handler")
+						}
+					}()
+					handler(msg)
+				}()
+			}
+		}(i)
+	}
 	return nil
 }
 
@@ -104,7 +111,7 @@ func (b *InMemoryBus) Close() error {
 }
 
 func (b *InMemoryBus) SubscribeWithChan(channel string) chan []byte {
-	ch := make(chan []byte, 64)
+	ch := make(chan []byte, 512)
 	b.mu.Lock()
 	b.subscribers[channel] = append(b.subscribers[channel], ch)
 	b.mu.Unlock()

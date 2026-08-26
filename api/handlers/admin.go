@@ -124,13 +124,8 @@ func (h *AdminHandler) HandleAdminMobileRequestOTP(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if err := auth.SendSMS(h.SMSCfg, req.Mobile, otp, ""); err != nil {
-		logger.Log.Error().Err(err).Str("mobile", req.Mobile).Msg("Admin OTP SMS send failed")
-		response.Error(w, "Failed to send SMS", http.StatusInternalServerError)
-		return
-	}
-
-	logger.Log.Info().Str("mobile", req.Mobile).Msg("Admin OTP sent via SMS")
+	auth.SendSMSAsync(h.SMSCfg, req.Mobile, otp, "")
+	logger.Log.Info().Str("mobile", req.Mobile).Msg("Admin OTP enqueued via async SMS worker")
 	json.NewEncoder(w).Encode(map[string]string{"detail": "OTP sent", "name": adminUser.Name})
 }
 
@@ -430,9 +425,16 @@ func (h *AdminHandler) HandleDeleteDriver(w http.ResponseWriter, r *http.Request
 // UNVERIFIED DRIVERS
 // ---------------------------------------------------------------
 
-// HandleListUnverifiedDrivers returns drivers pending approval
+// HandleListUnverifiedDrivers returns drivers pending approval (capped at 50, keyset paginated).
 func (h *AdminHandler) HandleListUnverifiedDrivers(w http.ResponseWriter, r *http.Request) {
-	drivers, err := h.AuthStore.ListUnverifiedDrivers(r.Context())
+	limit, cursor, offset := parsePagination(r)
+	var drivers []auth.UnverifiedDriver
+	var err error
+	if offset > 0 && cursor == "" {
+		drivers, err = h.AuthStore.ListUnverifiedDriversWithOffset(r.Context(), limit, offset)
+	} else {
+		drivers, err = h.AuthStore.ListUnverifiedDriversPaginated(r.Context(), limit, cursor)
+	}
 	if err != nil {
 		response.Error(w, "Internal error", http.StatusInternalServerError)
 		return
@@ -441,9 +443,16 @@ func (h *AdminHandler) HandleListUnverifiedDrivers(w http.ResponseWriter, r *htt
 	json.NewEncoder(w).Encode(drivers)
 }
 
-// HandleListAllUnverifiedDrivers returns all unverified drivers (including rejected/in-progress)
+// HandleListAllUnverifiedDrivers returns all unverified drivers (including rejected/in-progress) capped at 50.
 func (h *AdminHandler) HandleListAllUnverifiedDrivers(w http.ResponseWriter, r *http.Request) {
-	drivers, err := h.AuthStore.ListAllUnverifiedDrivers(r.Context())
+	limit, cursor, offset := parsePagination(r)
+	var drivers []auth.UnverifiedDriver
+	var err error
+	if offset > 0 && cursor == "" {
+		drivers, err = h.AuthStore.ListAllUnverifiedDriversWithOffset(r.Context(), limit, offset)
+	} else {
+		drivers, err = h.AuthStore.ListAllUnverifiedDriversPaginated(r.Context(), limit, cursor)
+	}
 	if err != nil {
 		response.Error(w, "Internal error", http.StatusInternalServerError)
 		return
@@ -637,15 +646,79 @@ func (h *AdminHandler) HandleAdminLocationUpdate(w http.ResponseWriter, r *http.
 // USERS
 // ---------------------------------------------------------------
 
-// HandleListUsers returns all registered users
+// HandleListUsers returns registered users capped at 50, keyset paginated with limit/skip or cursor.
 func (h *AdminHandler) HandleListUsers(w http.ResponseWriter, r *http.Request) {
-	users, err := h.AuthStore.ListUsers(r.Context())
+	limit, cursor, offset := parsePagination(r)
+	var users []auth.User
+	var err error
+	if offset > 0 && cursor == "" {
+		users, err = h.AuthStore.ListUsersWithOffset(r.Context(), limit, offset)
+	} else {
+		users, err = h.AuthStore.ListUsersPaginated(r.Context(), limit, cursor)
+	}
 	if err != nil {
 		response.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
 
 	json.NewEncoder(w).Encode(users)
+}
+
+// parsePagination extracts limit (default 50, capped 50), cursor and offset from query params or JSON body.
+func parsePagination(r *http.Request) (int, string, int) {
+	limit := 50
+	cursor := r.URL.Query().Get("cursor")
+	if cursor == "" {
+		cursor = r.URL.Query().Get("after_id")
+	}
+	offset := 0
+	if v := r.URL.Query().Get("skip"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	} else if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n > 50 {
+				n = 50
+			}
+			limit = n
+		}
+	}
+	// Also try JSON body: {"limit":50,"cursor":"...","after_id":"...","skip":0}
+	if r.Body != nil && r.ContentLength != 0 {
+		var body struct {
+			Limit   *int   `json:"limit"`
+			Cursor  string `json:"cursor"`
+			AfterID string `json:"after_id"`
+			Skip    *int   `json:"skip"`
+			Offset  *int   `json:"offset"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			if body.Limit != nil && *body.Limit > 0 {
+				n := *body.Limit
+				if n > 50 {
+					n = 50
+				}
+				limit = n
+			}
+			if body.Cursor != "" {
+				cursor = body.Cursor
+			} else if body.AfterID != "" {
+				cursor = body.AfterID
+			}
+			if body.Skip != nil && *body.Skip >= 0 {
+				offset = *body.Skip
+			} else if body.Offset != nil && *body.Offset >= 0 {
+				offset = *body.Offset
+			}
+		}
+	}
+	return limit, cursor, offset
 }
 
 // ---------------------------------------------------------------

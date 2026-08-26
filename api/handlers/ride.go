@@ -22,6 +22,8 @@ import (
 	"ambigo-backend/internal/referral"
 	"ambigo-backend/internal/requestid"
 	"ambigo-backend/internal/ride"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type RideHandler struct {
@@ -416,12 +418,6 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.Dispatcher.RideStore.UpdateRideStatus(r.Context(), rideID, ride.StatusInProgress, ride.StatusCompleted)
-	if err != nil {
-		response.Error(w, "Failed to complete ride: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
 	// Use the pre-calculated fare from when the ride was requested
 	finalAmount := 0.0
 	if rideData.Fare != nil && rideData.Fare.Total > 0 {
@@ -455,14 +451,15 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		finalAmount = 50.0
 	}
 
-	// Apply referral credit discount
+	// Apply referral credit discount — kept outside Tx (outbox pattern per 03 §6)
+	// The discount is consumed from offers (separate table) and must not hold ride row lock during external logic.
 	referralDiscount := 0.0
 	if h.ReferralService != nil {
 		discount, err := h.ReferralService.ConsumeUserReferralCredit(r.Context(), rideData.UserID)
 		if err == nil {
 			referralDiscount = discount
 		} else {
-			logger.Log.Error().Err(err).Str("user_id", rideData.UserID).Msg("Failed to consume referral credit")
+			logger.Log.Error().Err(err).Str("user_id", rideData.UserID).Str("request_id", reqID).Msg("Failed to consume referral credit")
 		}
 	}
 
@@ -499,16 +496,46 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		pmt.PaidAt = &now
 	}
 
-	// Persist referral discount in ride fare for history & driver wallet eventual consistency
+	// Prepare fare update payload if referral discount applied
+	var fareToUpdate *ride.Fare
 	if referralDiscount > 0 && rideData.Fare != nil {
 		rideData.Fare.ReferralDiscount = referralDiscount
 		rideData.Fare.Total = userAmount
-		if err := h.Dispatcher.RideStore.UpdateRideFare(r.Context(), rideID, rideData.Fare); err != nil {
-			logger.Log.Error().Err(err).Str("ride_id", rideID).Msg("Failed to update ride fare with referral discount")
-		}
+		fareToUpdate = rideData.Fare
 	}
 
-	h.PaymentStore.CreatePayment(r.Context(), pmt)
+	// Atomic Saga: ride status + fare + payment + wallet commission in single Tx
+	// Uses payment.WithTx with rideStore.WithTx / paymentStore.WithTx / walletStore.WithTx per 03 §6 and SYSTEM_DESIGN_AUDIT §4.2
+	// Pool is shared (single Postgres DB), so any store's pool is valid; use PaymentStore.Pool()
+	if err := payment.WithTx(r.Context(), h.Dispatcher.RideStore.Pool(), func(tx pgx.Tx) error {
+		rTx := h.Dispatcher.RideStore.WithTx(tx)
+		sTx := h.PaymentStore.WithTx(tx)
+		wTx := h.WalletStore.WithTx(tx)
+		if err := rTx.UpdateRideStatus(r.Context(), rideID, ride.StatusInProgress, ride.StatusCompleted); err != nil {
+			return err
+		}
+		if fareToUpdate != nil {
+			if err := rTx.UpdateRideFare(r.Context(), rideID, fareToUpdate); err != nil {
+				return err
+			}
+		}
+		if err := sTx.CreatePayment(r.Context(), pmt); err != nil {
+			return err
+		}
+		if req.PaymentMode != "online" {
+			commission := pmt.OriginalAmount - pmt.DriverShare
+			if commission > 0 && ids.IsValid(driverID) {
+				if err := wTx.UpdateWalletBalance(r.Context(), driverID, -commission); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		logger.Log.Error().Err(err).Str("ride_id", rideID).Str("request_id", reqID).Msg("Failed to complete ride transaction")
+		response.Error(w, "Failed to complete ride: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelRideCompleted, eventbus.RideCompletedPayload{
 		RideID:      rideID,

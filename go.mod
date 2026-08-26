@@ -14,6 +14,7 @@ require (
 	github.com/prometheus/client_golang v1.20.0
 	github.com/razorpay/razorpay-go v1.4.1
 	github.com/rs/zerolog v1.33.0
+	github.com/sony/gobreaker v1.0.0
 	github.com/uber/h3-go/v4 v4.5.0
 	go.mongodb.org/mongo-driver v1.17.9
 	golang.org/x/crypto v0.54.0

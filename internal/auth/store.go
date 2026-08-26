@@ -448,30 +448,60 @@ func (s *Store) FindLiveInChain(ctx context.Context, startingFrom *RefreshToken)
 	if startingFrom == nil {
 		return nil, fmt.Errorf("FindLiveInChain: startingFrom is nil")
 	}
-	current := startingFrom
-	visited := make(map[string]bool)
-
-	for current.SupersededBy != nil && !ids.IsZero(*current.SupersededBy) {
-		if visited[*current.SupersededBy] {
+	if !ids.IsValid(startingFrom.ID) {
+		return nil, fmt.Errorf("invalid id: %s", startingFrom.ID)
+	}
+	// Bounded single-query chain walk: depth capped to 10, cycle-safe via visited array.
+	const q = `
+	WITH RECURSIVE chain AS (
+		SELECT rt.*, 1 AS depth, ARRAY[rt.id] AS visited
+		FROM refresh_tokens rt
+		WHERE rt.id = $1::uuid
+		UNION ALL
+		SELECT rt.*, c.depth + 1, c.visited || rt.id
+		FROM refresh_tokens rt
+		JOIN chain c ON rt.id = c.superseded_by
+		WHERE c.depth < 10
+		  AND c.superseded_by IS NOT NULL
+		  AND NOT rt.id = ANY(c.visited)
+	)
+	SELECT id::text, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked, revoked_at, revoked_reason, superseded_by::text
+	FROM chain
+	WHERE NOT revoked
+	  AND expires_at > now()
+	  AND id <> $1::uuid
+	ORDER BY depth ASC
+	LIMIT 1`
+	row := s.pool.QueryRow(ctx, q, startingFrom.ID)
+	rt, err := scanRefreshTokenRow(row)
+	if err == nil {
+		return rt, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	// No live token found — distinguish broken chain / cycle vs clean end.
+	const gapQ = `
+	WITH RECURSIVE chain AS (
+		SELECT rt.id, rt.superseded_by, 1 AS depth, ARRAY[rt.id] AS visited
+		FROM refresh_tokens rt WHERE rt.id = $1::uuid
+		UNION ALL
+		SELECT rt.id, rt.superseded_by, c.depth+1, c.visited || rt.id
+		FROM refresh_tokens rt JOIN chain c ON rt.id = c.superseded_by
+		WHERE c.depth < 10 AND c.superseded_by IS NOT NULL AND NOT rt.id = ANY(c.visited)
+	)
+	SELECT
+		EXISTS(SELECT 1 FROM chain c WHERE c.superseded_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM refresh_tokens rt WHERE rt.id = c.superseded_by)) AS has_gap,
+		EXISTS(SELECT 1 FROM chain c JOIN refresh_tokens rt ON rt.id = c.superseded_by WHERE rt.id = ANY(c.visited)) AS has_cycle`
+	var hasGap, hasCycle bool
+	if err := s.pool.QueryRow(ctx, gapQ, startingFrom.ID).Scan(&hasGap, &hasCycle); err == nil {
+		if hasCycle {
 			return nil, ErrCycleDetected
 		}
-		visited[*current.SupersededBy] = true
-
-		next, err := s.findRefreshTokenByID(ctx, *current.SupersededBy)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, ErrBrokenChain
-			}
-			return nil, err
+		if hasGap {
+			return nil, ErrBrokenChain
 		}
-
-		if !next.Revoked && time.Now().Before(next.ExpiresAt) {
-			return next, nil
-		}
-
-		current = next
 	}
-
 	return nil, ErrNoLiveToken
 }
 
@@ -917,7 +947,60 @@ func (s *Store) DeleteDriver(ctx context.Context, id string) error {
 }
 
 func (s *Store) ListUnverifiedDrivers(ctx context.Context) ([]UnverifiedDriver, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers WHERE under_progress=true`)
+	return s.ListUnverifiedDriversPaginated(ctx, 50, "")
+}
+
+func (s *Store) ListUnverifiedDriversPaginated(ctx context.Context, limit int, cursor string) ([]UnverifiedDriver, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var rows pgx.Rows
+	var err error
+	if cursor != "" && ids.IsValid(cursor) {
+		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers WHERE under_progress=true AND (created_at, id) < ((SELECT created_at FROM unverified_drivers WHERE id=$2::uuid), $2::uuid) ORDER BY created_at DESC, id DESC LIMIT $1`, limit, cursor)
+	} else {
+		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers WHERE under_progress=true ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var drivers []UnverifiedDriver
+	for rows.Next() {
+		var d UnverifiedDriver
+		var locationData []byte
+		var errorMessage *string
+		var fcmToken, jwtToken *string
+		var id string
+		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.PortraitImage, &d.POIImage, &d.DLImage, &d.RCImage, &d.AmbFront, &d.AmbInside, &d.VehicleType, &d.UnderProgress, &errorMessage, &fcmToken, &jwtToken, &locationData); err != nil {
+			return nil, err
+		}
+		d.ID = id
+		d.ErrorMessage = errorMessage
+		d.FCMToken = fcmToken
+		d.JWTToken = jwtToken
+		if len(locationData) > 0 && string(locationData) != "null" {
+			var loc GeoJSONPoint
+			if err := json.Unmarshal(locationData, &loc); err == nil {
+				d.Location = &loc
+			}
+		}
+		drivers = append(drivers, d)
+	}
+	if drivers == nil {
+		drivers = []UnverifiedDriver{}
+	}
+	return drivers, rows.Err()
+}
+
+func (s *Store) ListUnverifiedDriversWithOffset(ctx context.Context, limit int, offset int) ([]UnverifiedDriver, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers WHERE under_progress=true ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -951,7 +1034,60 @@ func (s *Store) ListUnverifiedDrivers(ctx context.Context) ([]UnverifiedDriver, 
 }
 
 func (s *Store) ListAllUnverifiedDrivers(ctx context.Context) ([]UnverifiedDriver, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers`)
+	return s.ListAllUnverifiedDriversPaginated(ctx, 50, "")
+}
+
+func (s *Store) ListAllUnverifiedDriversPaginated(ctx context.Context, limit int, cursor string) ([]UnverifiedDriver, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var rows pgx.Rows
+	var err error
+	if cursor != "" && ids.IsValid(cursor) {
+		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers WHERE (created_at, id) < ((SELECT created_at FROM unverified_drivers WHERE id=$2::uuid), $2::uuid) ORDER BY created_at DESC, id DESC LIMIT $1`, limit, cursor)
+	} else {
+		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var drivers []UnverifiedDriver
+	for rows.Next() {
+		var d UnverifiedDriver
+		var locationData []byte
+		var errorMessage *string
+		var fcmToken, jwtToken *string
+		var id string
+		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.PortraitImage, &d.POIImage, &d.DLImage, &d.RCImage, &d.AmbFront, &d.AmbInside, &d.VehicleType, &d.UnderProgress, &errorMessage, &fcmToken, &jwtToken, &locationData); err != nil {
+			return nil, err
+		}
+		d.ID = id
+		d.ErrorMessage = errorMessage
+		d.FCMToken = fcmToken
+		d.JWTToken = jwtToken
+		if len(locationData) > 0 && string(locationData) != "null" {
+			var loc GeoJSONPoint
+			if err := json.Unmarshal(locationData, &loc); err == nil {
+				d.Location = &loc
+			}
+		}
+		drivers = append(drivers, d)
+	}
+	if drivers == nil {
+		drivers = []UnverifiedDriver{}
+	}
+	return drivers, rows.Err()
+}
+
+func (s *Store) ListAllUnverifiedDriversWithOffset(ctx context.Context, limit int, offset int) ([]UnverifiedDriver, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -985,7 +1121,62 @@ func (s *Store) ListAllUnverifiedDrivers(ctx context.Context) ([]UnverifiedDrive
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users ORDER BY created_at DESC, id DESC`)
+	return s.ListUsersPaginated(ctx, 50, "")
+}
+
+func (s *Store) ListUsersWithOffset(ctx context.Context, limit int, offset int) ([]User, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var users []User
+	for rows.Next() {
+		var u User
+		var myReferralCode *string
+		var locationData []byte
+		var fcmToken, jwtToken *string
+		var id string
+		if err := rows.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken); err != nil {
+			return nil, err
+		}
+		u.ID = id
+		if myReferralCode != nil {
+			u.MyReferralCode = *myReferralCode
+		}
+		if len(locationData) > 0 && string(locationData) != "null" {
+			var loc GeoJSONPoint
+			if err := json.Unmarshal(locationData, &loc); err == nil {
+				u.Location = &loc
+			}
+		}
+		u.FCMToken = fcmToken
+		u.JWTToken = jwtToken
+		users = append(users, u)
+	}
+	if users == nil {
+		users = []User{}
+	}
+	return users, rows.Err()
+}
+
+func (s *Store) ListUsersPaginated(ctx context.Context, limit int, cursor string) ([]User, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var rows pgx.Rows
+	var err error
+	if cursor != "" && ids.IsValid(cursor) {
+		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users WHERE (created_at, id) < ((SELECT created_at FROM users WHERE id=$2::uuid), $2::uuid) ORDER BY created_at DESC, id DESC LIMIT $1`, limit, cursor)
+	} else {
+		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+	}
 	if err != nil {
 		return nil, err
 	}

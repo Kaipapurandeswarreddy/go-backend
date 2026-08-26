@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
@@ -97,16 +98,55 @@ func (h *SharedHandler) HandleCheckHospitalUpdates(w http.ResponseWriter, r *htt
 
 // HandleListHospitals returns hospitals. When the request body includes
 // lat/lng, it returns hospitals within the H3 ring around that point sorted by
-// distance; otherwise it returns the full list (backward compatible with the
-// current app that sends an empty body).
+// distance; otherwise it returns the full list capped at 50 (keyset paginated).
 func (h *SharedHandler) HandleListHospitals(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Lat      *float64 `json:"lat"`
 		Lng      *float64 `json:"lng"`
 		RadiusKm *float64 `json:"radius_km"`
+		Limit    *int     `json:"limit"`
+		Cursor   string   `json:"cursor"`
+		AfterID  string   `json:"after_id"`
+		Skip     *int     `json:"skip"`
+		Offset   *int     `json:"offset"`
 	}
 	// Body is optional; ignore decode errors so an empty body works.
 	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	limit := 50
+	cursor := req.Cursor
+	offset := 0
+	if cursor == "" {
+		cursor = req.AfterID
+	}
+	if req.Limit != nil && *req.Limit > 0 && *req.Limit <= 50 {
+		limit = *req.Limit
+	}
+	if req.Skip != nil && *req.Skip >= 0 {
+		offset = *req.Skip
+	} else if req.Offset != nil && *req.Offset >= 0 {
+		offset = *req.Offset
+	}
+	// Also allow query params for pagination.
+	if qv := r.URL.Query().Get("limit"); qv != "" {
+		if n, err2 := strconv.Atoi(qv); err2 == nil && n > 0 && n <= 50 {
+			limit = n
+		}
+	}
+	if qv := r.URL.Query().Get("skip"); qv != "" {
+		if n, err2 := strconv.Atoi(qv); err2 == nil && n >= 0 {
+			offset = n
+		}
+	} else if qv := r.URL.Query().Get("offset"); qv != "" {
+		if n, err2 := strconv.Atoi(qv); err2 == nil && n >= 0 {
+			offset = n
+		}
+	}
+	if qv := r.URL.Query().Get("cursor"); qv != "" {
+		cursor = qv
+	} else if qv := r.URL.Query().Get("after_id"); qv != "" {
+		cursor = qv
+	}
 
 	var list []admin.Hospital
 	var err error
@@ -120,7 +160,13 @@ func (h *SharedHandler) HandleListHospitals(w http.ResponseWriter, r *http.Reque
 		}
 		list, err = h.HospitalStore.FindByCells(r.Context(), cells)
 	} else {
-		list, err = h.HospitalStore.ListHospitals(r.Context())
+		if offset > 0 && cursor == "" {
+			list, err = h.HospitalStore.ListHospitalsWithOffset(r.Context(), limit, offset)
+		} else if cursor != "" || req.Limit != nil || offset > 0 {
+			list, err = h.HospitalStore.ListHospitalsPaginated(r.Context(), limit, cursor)
+		} else {
+			list, err = h.HospitalStore.ListHospitals(r.Context())
+		}
 	}
 	if err != nil {
 		response.Error(w, "Failed to fetch list", http.StatusInternalServerError)

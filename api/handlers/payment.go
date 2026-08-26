@@ -15,6 +15,8 @@ import (
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/payment"
 	"ambigo-backend/internal/requestid"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type PaymentHandler struct {
@@ -120,17 +122,24 @@ func (h *PaymentHandler) HandleProcessUserPayment(w http.ResponseWriter, r *http
 		return
 	}
 
-	err = h.Store.MarkPaymentPaid(r.Context(), req.PaymentID, req.RzpPaymentID, payment.ModeOnline)
-	if err != nil {
-		response.Error(w, "Failed to mark payment as paid", http.StatusInternalServerError)
-		return
-	}
-
-	// Credit driver wallet (online payment confirmed)
-	if ids.IsValid(pmt.PartnerID) && pmt.PartnerID != "" && pmt.DriverShare > 0 {
-		if wErr := h.WalletStore.UpdateWalletBalance(r.Context(), pmt.PartnerID, pmt.DriverShare); wErr != nil {
-			logger.Log.Error().Err(wErr).Str("driver_id", pmt.PartnerID).Msg("Failed to credit wallet on online payment")
+	// Atomic: mark paid + credit wallet in single Tx (was two Exec with silent log on 2nd failure → driver never credited)
+	err = payment.WithTx(r.Context(), h.Store.Pool(), func(tx pgx.Tx) error {
+		sTx := h.Store.WithTx(tx)
+		wTx := h.WalletStore.WithTx(tx)
+		if err := sTx.MarkPaymentPaid(r.Context(), req.PaymentID, req.RzpPaymentID, payment.ModeOnline); err != nil {
+			return err
 		}
+		if ids.IsValid(pmt.PartnerID) && pmt.PartnerID != "" && pmt.DriverShare > 0 {
+			if err := wTx.UpdateWalletBalance(r.Context(), pmt.PartnerID, pmt.DriverShare); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		logger.Log.Error().Err(err).Str("payment_id", req.PaymentID).Str("request_id", reqID).Msg("Failed to process online payment transaction")
+		response.Error(w, "Failed to process payment", http.StatusInternalServerError)
+		return
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelPaymentCompleted, eventbus.PaymentCompletedPayload{
@@ -184,20 +193,26 @@ func (h *PaymentHandler) HandleProcessDriverPayment(w http.ResponseWriter, r *ht
 		return
 	}
 
-	err = h.Store.MarkPaymentPaid(r.Context(), paymentID, "", payment.ModeCash)
-	if err != nil {
-		response.Error(w, "Failed to mark payment as paid", http.StatusInternalServerError)
-		return
-	}
-
-	// Debit commission from driver wallet (cash collected by driver)
-	if ids.IsValid(pmt.PartnerID) && pmt.PartnerID != "" {
-		commission := pmt.OriginalAmount - pmt.DriverShare
-		if commission > 0 {
-			if wErr := h.WalletStore.UpdateWalletBalance(r.Context(), pmt.PartnerID, -commission); wErr != nil {
-				logger.Log.Error().Err(wErr).Str("driver_id", pmt.PartnerID).Msg("Failed to debit commission on cash payment")
+	err = payment.WithTx(r.Context(), h.Store.Pool(), func(tx pgx.Tx) error {
+		sTx := h.Store.WithTx(tx)
+		wTx := h.WalletStore.WithTx(tx)
+		if err := sTx.MarkPaymentPaid(r.Context(), paymentID, "", payment.ModeCash); err != nil {
+			return err
+		}
+		if ids.IsValid(pmt.PartnerID) && pmt.PartnerID != "" {
+			commission := pmt.OriginalAmount - pmt.DriverShare
+			if commission > 0 {
+				if err := wTx.UpdateWalletBalance(r.Context(), pmt.PartnerID, -commission); err != nil {
+					return err
+				}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		logger.Log.Error().Err(err).Str("payment_id", paymentID).Str("request_id", reqID).Msg("Failed to process cash payment transaction")
+		response.Error(w, "Failed to process payment", http.StatusInternalServerError)
+		return
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelPaymentCompleted, eventbus.PaymentCompletedPayload{
@@ -245,20 +260,26 @@ func (h *PaymentHandler) HandleProcessUserCashPayment(w http.ResponseWriter, r *
 		return
 	}
 
-	err = h.Store.MarkPaymentPaid(r.Context(), req.PaymentID, "", payment.ModeCash)
-	if err != nil {
-		response.Error(w, "Failed to mark payment as paid", http.StatusInternalServerError)
-		return
-	}
-
-	// Debit commission from driver wallet (user-initiated cash switch)
-	if ids.IsValid(pmt.PartnerID) && pmt.PartnerID != "" {
-		commission := pmt.OriginalAmount - pmt.DriverShare
-		if commission > 0 {
-			if wErr := h.WalletStore.UpdateWalletBalance(r.Context(), pmt.PartnerID, -commission); wErr != nil {
-				logger.Log.Error().Err(wErr).Str("driver_id", pmt.PartnerID).Msg("Failed to debit commission on user cash payment")
+	err = payment.WithTx(r.Context(), h.Store.Pool(), func(tx pgx.Tx) error {
+		sTx := h.Store.WithTx(tx)
+		wTx := h.WalletStore.WithTx(tx)
+		if err := sTx.MarkPaymentPaid(r.Context(), req.PaymentID, "", payment.ModeCash); err != nil {
+			return err
+		}
+		if ids.IsValid(pmt.PartnerID) && pmt.PartnerID != "" {
+			commission := pmt.OriginalAmount - pmt.DriverShare
+			if commission > 0 {
+				if err := wTx.UpdateWalletBalance(r.Context(), pmt.PartnerID, -commission); err != nil {
+					return err
+				}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		logger.Log.Error().Err(err).Str("payment_id", req.PaymentID).Str("request_id", reqID).Msg("Failed to process user cash payment transaction")
+		response.Error(w, "Failed to process payment", http.StatusInternalServerError)
+		return
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelPaymentCompleted, eventbus.PaymentCompletedPayload{
@@ -374,7 +395,22 @@ func (h *PaymentHandler) HandleRazorpayWebhook(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if err := h.Store.MarkPaymentPaid(r.Context(), pmt.ID, event.Payload.Payment.Entity.ID, payment.ModeOnline); err != nil {
+	// Atomic: mark paid + credit wallet in single Tx (saga per 03 §6)
+	// Returns 500 on wallet failure instead of 200 + silent log.
+	err = payment.WithTx(r.Context(), h.Store.Pool(), func(tx pgx.Tx) error {
+		sTx := h.Store.WithTx(tx)
+		wTx := h.WalletStore.WithTx(tx)
+		if err := sTx.MarkPaymentPaid(r.Context(), pmt.ID, event.Payload.Payment.Entity.ID, payment.ModeOnline); err != nil {
+			return err
+		}
+		if ids.IsValid(pmt.PartnerID) && pmt.PartnerID != "" && pmt.DriverShare > 0 {
+			if err := wTx.UpdateWalletBalance(r.Context(), pmt.PartnerID, pmt.DriverShare); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		log.Error().Err(err).Str("payment_id", pmt.ID).Msg("PaymentWebhook failed to mark payment as paid")
 		response.Error(w, "Failed to update payment", http.StatusInternalServerError)
 		return

@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"math"
 	"sort"
 	"sync"
 
@@ -10,6 +11,19 @@ import (
 	"ambigo-backend/internal/location"
 	"ambigo-backend/internal/logger"
 )
+
+// haversineKm returns the great-circle distance between two points in kilometers.
+// Used to cheaply sort candidates before expensive Google Routes calls.
+func haversineKm(lat1, lng1, lat2, lng2 float64) float64 {
+	const R = 6371.0 // Earth radius in km
+	dLat := (lat2 - lat1) * math.Pi / 180.0
+	dLng := (lng2 - lng1) * math.Pi / 180.0
+	lat1Rad := lat1 * math.Pi / 180.0
+	lat2Rad := lat2 * math.Pi / 180.0
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(lat1Rad)*math.Cos(lat2Rad)*math.Sin(dLng/2)*math.Sin(dLng/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	return R * c
+}
 
 type Candidate struct {
 	DriverID        string
@@ -173,6 +187,17 @@ func (m *Matcher) FindBestDrivers(ctx context.Context, pickupLat, pickupLng floa
 
 	if len(available) == 0 {
 		return nil, errors.New("no drivers found in the vicinity")
+	}
+
+	// Cap to 10 closest by haversine BEFORE expensive Google Routes calls.
+	// Previously every driver in the ring triggered a Google call, then capped to 5 after.
+	// In dense Hyderabad (100 drivers in k=1 ring) that was 100 HTTP calls per ride → 429s.
+	// Now: cheap haversine sort → take 10 → only 10 Google calls → keep top 5 by real ETA.
+	if len(available) > 10 {
+		sort.Slice(available, func(i, j int) bool {
+			return haversineKm(available[i].lat, available[i].lng, pickupLat, pickupLng) < haversineKm(available[j].lat, available[j].lng, pickupLat, pickupLng)
+		})
+		available = available[:10]
 	}
 
 	var candidates []Candidate
