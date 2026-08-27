@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -10,13 +11,12 @@ import (
 	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
+	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/requestid"
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/translation"
 	"golang.org/x/crypto/bcrypt"
-
-	"ambigo-backend/internal/ids"
 )
 
 type AdminHandler struct {
@@ -376,23 +376,118 @@ func (h *AdminHandler) HandleAddDriver(w http.ResponseWriter, r *http.Request) {
 func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request) {
 	reqID := requestid.FromContext(r.Context())
 
-	var driver auth.Driver
-	if err := json.NewDecoder(r.Body).Decode(&driver); err != nil {
+	var req auth.Driver
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	if ids.IsZero(driver.ID) {
+	if ids.IsZero(req.ID) {
 		response.Error(w, "ID is required", http.StatusBadRequest)
 		return
 	}
+	if !ids.IsValid(req.ID) {
+		response.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
 
-	if err := h.AuthStore.UpdateDriver(r.Context(), &driver); err != nil {
+	existing, err := h.AuthStore.FindDriverByID(r.Context(), req.ID)
+	if err != nil {
+		response.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if existing == nil {
+		response.Error(w, "Driver not found", http.StatusNotFound)
+		return
+	}
+
+	// Merge: only overwrite fields that are non-empty / non-nil in the incoming payload
+	if req.Name != "" {
+		existing.Name = req.Name
+	}
+	if req.Mobile != "" {
+		existing.Mobile = req.Mobile
+	}
+	if req.Photo != "" {
+		existing.Photo = req.Photo
+	}
+	if req.VehicleType != "" {
+		existing.VehicleType = req.VehicleType
+	}
+	if req.VehicleReg != "" {
+		existing.VehicleReg = req.VehicleReg
+	}
+	if req.ReferralCode != "" {
+		existing.ReferralCode = req.ReferralCode
+	}
+	if req.MyReferralCode != "" {
+		existing.MyReferralCode = req.MyReferralCode
+	}
+	if req.WalletBalance != 0 {
+		existing.WalletBalance = req.WalletBalance
+	}
+	if req.Location != nil {
+		existing.Location = req.Location
+	}
+	if req.FCMToken != nil {
+		existing.FCMToken = req.FCMToken
+	}
+	if req.JWTToken != nil {
+		existing.JWTToken = req.JWTToken
+	}
+	if req.LastLocationUpdate != nil {
+		existing.LastLocationUpdate = req.LastLocationUpdate
+	}
+	if req.WalletDetails != nil {
+		if existing.WalletDetails == nil {
+			existing.WalletDetails = &auth.WalletDetails{}
+		}
+		if req.WalletDetails.AccountNo != "" {
+			existing.WalletDetails.AccountNo = req.WalletDetails.AccountNo
+		}
+		if req.WalletDetails.BenfName != "" {
+			existing.WalletDetails.BenfName = req.WalletDetails.BenfName
+		}
+		if req.WalletDetails.IFSCCode != "" {
+			existing.WalletDetails.IFSCCode = req.WalletDetails.IFSCCode
+		}
+		if req.WalletDetails.BenfID != "" {
+			existing.WalletDetails.BenfID = req.WalletDetails.BenfID
+		}
+	}
+	if req.Details != nil {
+		if existing.Details == nil {
+			existing.Details = &auth.DriverDetails{}
+		}
+		if req.Details.POIImage != "" {
+			existing.Details.POIImage = req.Details.POIImage
+		}
+		if req.Details.RCNumber != "" {
+			existing.Details.RCNumber = req.Details.RCNumber
+		}
+		if req.Details.RCImage != "" {
+			existing.Details.RCImage = req.Details.RCImage
+		}
+		if req.Details.DLNumber != "" {
+			existing.Details.DLNumber = req.Details.DLNumber
+		}
+		if req.Details.DLImage != "" {
+			existing.Details.DLImage = req.Details.DLImage
+		}
+		if req.Details.AmbFront != "" {
+			existing.Details.AmbFront = req.Details.AmbFront
+		}
+		if req.Details.AmbInside != "" {
+			existing.Details.AmbInside = req.Details.AmbInside
+		}
+	}
+
+	if err := h.AuthStore.UpdateDriver(r.Context(), existing); err != nil {
 		response.Error(w, "Failed to update driver", http.StatusInternalServerError)
 		return
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthDriverLoggedIn, eventbus.AuthDriverLoggedInPayload{
-		DriverID: driver.ID, Mobile: driver.Mobile, RequestID: reqID,
+		DriverID: existing.ID, Mobile: existing.Mobile, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Driver updated successfully"})
@@ -782,23 +877,80 @@ func (h *AdminHandler) HandleListOngoingRides(w http.ResponseWriter, r *http.Req
 func (h *AdminHandler) HandleUpdateAmbulanceType(w http.ResponseWriter, r *http.Request) {
 	reqID := requestid.FromContext(r.Context())
 
-	var amb admin.AmbulanceType
-	if err := json.NewDecoder(r.Body).Decode(&amb); err != nil {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	if ids.IsZero(amb.ID) {
+	var req admin.AmbulanceType
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	if ids.IsZero(req.ID) {
 		response.Error(w, "ID is required", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.Store.UpdateAmbulanceType(r.Context(), &amb); err != nil {
+	existing, err := h.Store.GetAmbulanceTypeByID(r.Context(), req.ID)
+	if err != nil {
+		response.Error(w, "Failed to fetch ambulance type: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if existing == nil {
+		response.Error(w, "Ambulance type not found", http.StatusNotFound)
+		return
+	}
+
+	// Merge: only overwrite non-zero / provided fields to support partial updates
+	merged := *existing
+	if req.Name != "" {
+		merged.Name = req.Name
+	}
+	if req.Photo != "" {
+		merged.Photo = req.Photo
+	}
+	if req.ListingThreshold != 0 {
+		merged.ListingThreshold = req.ListingThreshold
+	}
+	if req.BaseFare != 0 {
+		merged.BaseFare = req.BaseFare
+	}
+	if req.DriverShare != 0 {
+		merged.DriverShare = req.DriverShare
+	}
+	if len(req.PricingTier) > 0 {
+		merged.PricingTier = req.PricingTier
+	}
+	// Bool fields: detect presence via raw JSON to allow explicit false
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &raw); err == nil {
+		if _, ok := raw["helper_included"]; ok {
+			merged.HelperIncluded = req.HelperIncluded
+		}
+		if _, ok := raw["otp_required"]; ok {
+			merged.OTPRequired = req.OTPRequired
+		}
+	} else {
+		// fallback: overwrite if incoming differs from existing (allows toggling)
+		if req.HelperIncluded != existing.HelperIncluded {
+			merged.HelperIncluded = req.HelperIncluded
+		}
+		if req.OTPRequired != existing.OTPRequired {
+			merged.OTPRequired = req.OTPRequired
+		}
+	}
+
+	if err := h.Store.UpdateAmbulanceType(r.Context(), &merged); err != nil {
 		response.Error(w, "Failed to update ambulance type", http.StatusInternalServerError)
 		return
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelAdminAmbTypeCreated, eventbus.AdminAmbTypePayload{
-		AmbTypeID: amb.ID, Name: amb.Name, RequestID: reqID,
+		AmbTypeID: merged.ID, Name: merged.Name, RequestID: reqID,
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Ambulance type updated"})
@@ -885,8 +1037,13 @@ func (h *AdminHandler) HandleAddHospital(w http.ResponseWriter, r *http.Request)
 func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Request) {
 	reqID := requestid.FromContext(r.Context())
 
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
 	var req HospitalRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
@@ -894,50 +1051,161 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 		response.Error(w, "ID is required", http.StatusBadRequest)
 		return
 	}
-	if !response.Validate(w, &req) {
-		return
-	}
-
 	if !ids.IsValid(req.ID) {
 		response.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
 
-	hType := req.HospitalType
-	if hType == "" {
-		hType = admin.ClassifyHospitalType(req.Name, nil)
+	existing, err := h.HospitalStore.FindByID(r.Context(), req.ID)
+	if err != nil {
+		response.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if existing == nil {
+		response.Error(w, "Hospital not found", http.StatusNotFound)
+		return
 	}
 
-	hospital := admin.Hospital{
-		ID:      req.ID,
-		Name:    translation.Map{"en_US": req.Name},
-		Address: translation.Map{"en_US": req.Address},
-		City:    translation.Map{"en_US": req.City},
-		Location: admin.GeoJSON{
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	// Extended fields for full Hospital struct merge (covers PlaceID, Source, H3Cells, etc.)
+	var ext struct {
+		PlaceID      *string   `json:"place_id"`
+		Source       *string   `json:"source"`
+		H3Cells      *[]string `json:"h3_cells"`
+		HospitalType *string   `json:"hospital_type"`
+		Category     *string   `json:"category"`
+		GoogleTypes  *[]string `json:"google_types"`
+		TypeLocked   *bool     `json:"type_locked"`
+	}
+	_ = json.Unmarshal(body, &ext)
+
+	// Also decode as Hospital to handle translation.Map and other types directly
+	var incoming admin.Hospital
+	_ = json.Unmarshal(body, &incoming)
+
+	// Merge: only overwrite existing if incoming is non-zero / present
+	if req.Name != "" {
+		if existing.Name == nil {
+			existing.Name = make(translation.Map)
+		}
+		existing.Name["en_US"] = req.Name
+	} else if len(incoming.Name) > 0 {
+		existing.Name = incoming.Name
+	}
+	if req.Address != "" {
+		if existing.Address == nil {
+			existing.Address = make(translation.Map)
+		}
+		existing.Address["en_US"] = req.Address
+	} else if len(incoming.Address) > 0 {
+		existing.Address = incoming.Address
+	}
+	if req.City != "" {
+		if existing.City == nil {
+			existing.City = make(translation.Map)
+		}
+		existing.City["en_US"] = req.City
+	} else if len(incoming.City) > 0 {
+		existing.City = incoming.City
+	}
+	if req.Coordinates.Lat != 0 || req.Coordinates.Lng != 0 {
+		existing.Location = admin.GeoJSON{
 			Type:        "Point",
 			Coordinates: []float64{req.Coordinates.Lng, req.Coordinates.Lat},
-		},
-		AlwaysOpen:   req.AlwaysOpen,
-		Services:     req.Services,
-		Source:       admin.HospitalSourceAdmin,
-		H3Cells:      admin.BuildH3Cells(req.Coordinates.Lng, req.Coordinates.Lat),
-		HospitalType: hType,
-		Category:     admin.HospitalCategoryFromType(hType),
-		TypeLocked:   true,
-	}
-	if req.Services == nil {
-		hospital.Services = []string{}
+		}
+		existing.H3Cells = admin.BuildH3Cells(req.Coordinates.Lng, req.Coordinates.Lat)
+	} else if len(incoming.Location.Coordinates) > 0 {
+		existing.Location = incoming.Location
+		if len(incoming.H3Cells) > 0 {
+			existing.H3Cells = incoming.H3Cells
+		} else {
+			existing.H3Cells = admin.BuildH3Cells(incoming.Location.Coordinates[0], incoming.Location.Coordinates[1])
+		}
 	}
 	if req.Timing != nil {
-		hospital.Timing = &admin.Timing{
+		existing.Timing = &admin.Timing{
 			Start: req.Timing.Start,
 			End:   req.Timing.End,
 		}
-	} else {
-		hospital.Timing = &admin.Timing{Start: "12:00 AM", End: "11:59 PM"}
+	} else if incoming.Timing != nil {
+		existing.Timing = incoming.Timing
+	}
+	if _, ok := raw["always_open"]; ok {
+		existing.AlwaysOpen = req.AlwaysOpen
+	} else if _, ok := raw["AlwaysOpen"]; ok {
+		existing.AlwaysOpen = incoming.AlwaysOpen
+	}
+	if req.Services != nil {
+		existing.Services = req.Services
+	} else if len(incoming.Services) > 0 {
+		existing.Services = incoming.Services
+	} else if _, ok := raw["services"]; ok && incoming.Services != nil {
+		// explicitly sent empty array -> clear
+		existing.Services = incoming.Services
+	}
+	if req.HospitalType != "" {
+		existing.HospitalType = req.HospitalType
+		existing.Category = admin.HospitalCategoryFromType(req.HospitalType)
+		existing.TypeLocked = true
+	} else if ext.HospitalType != nil && *ext.HospitalType != "" {
+		existing.HospitalType = *ext.HospitalType
+		existing.Category = admin.HospitalCategoryFromType(*ext.HospitalType)
+		existing.TypeLocked = true
+	} else if incoming.HospitalType != "" {
+		existing.HospitalType = incoming.HospitalType
+		if incoming.Category != "" {
+			existing.Category = incoming.Category
+		} else {
+			existing.Category = admin.HospitalCategoryFromType(incoming.HospitalType)
+		}
+		if incoming.TypeLocked {
+			existing.TypeLocked = true
+		}
+	}
+	if ext.PlaceID != nil && *ext.PlaceID != "" {
+		existing.PlaceID = *ext.PlaceID
+	} else if incoming.PlaceID != "" {
+		existing.PlaceID = incoming.PlaceID
+	}
+	if ext.Source != nil && *ext.Source != "" {
+		existing.Source = *ext.Source
+	} else if incoming.Source != "" {
+		existing.Source = incoming.Source
+	}
+	// H3Cells from ext only if coordinates not already handled
+	if !(req.Coordinates.Lat != 0 || req.Coordinates.Lng != 0) && len(incoming.Location.Coordinates) == 0 {
+		if ext.H3Cells != nil && len(*ext.H3Cells) > 0 {
+			existing.H3Cells = *ext.H3Cells
+		} else if len(incoming.H3Cells) > 0 {
+			existing.H3Cells = incoming.H3Cells
+		}
+	}
+	if ext.Category != nil && *ext.Category != "" {
+		existing.Category = *ext.Category
+	} else if incoming.Category != "" {
+		existing.Category = incoming.Category
+	}
+	if ext.GoogleTypes != nil {
+		if len(*ext.GoogleTypes) > 0 {
+			existing.GoogleTypes = *ext.GoogleTypes
+		} else if _, ok := raw["google_types"]; ok {
+			existing.GoogleTypes = *ext.GoogleTypes
+		}
+	} else if len(incoming.GoogleTypes) > 0 {
+		existing.GoogleTypes = incoming.GoogleTypes
+	} else if _, ok := raw["google_types"]; ok && incoming.GoogleTypes != nil {
+		existing.GoogleTypes = incoming.GoogleTypes
+	}
+	if ext.TypeLocked != nil {
+		existing.TypeLocked = *ext.TypeLocked
 	}
 
-	if err := h.HospitalStore.UpdateHospital(r.Context(), &hospital); err != nil {
+	if err := h.HospitalStore.UpdateHospital(r.Context(), existing); err != nil {
 		response.Error(w, "Hospital updated failed", http.StatusBadRequest)
 		return
 	}
