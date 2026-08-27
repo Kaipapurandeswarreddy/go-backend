@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"regexp"
@@ -421,7 +422,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 	if !tokenDoc.Revoked && time.Now().Before(tokenDoc.ExpiresAt) {
 		newRT, newTokenStr, err := h.AuthStore.RotateById(r.Context(), tokenDoc, payload.DeviceID, payload.DeviceName)
 		if err == nil {
-			newAccessToken, err := auth.GenerateAccessToken(newRT.UserID, newRT.Role, h.JWTSecret)
+			newAccessToken, err := h.generateAccessTokenForRole(r.Context(), newRT)
 			if err != nil {
 				response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 				return
@@ -461,7 +462,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 			// Found live token deeper in the chain — rotate it to issue a new string
 			newRT, newTokenStr, err := h.AuthStore.RotateById(r.Context(), liveToken, payload.DeviceID, payload.DeviceName)
 			if err == nil {
-				newAccessToken, err := auth.GenerateAccessToken(newRT.UserID, newRT.Role, h.JWTSecret)
+				newAccessToken, err := h.generateAccessTokenForRole(r.Context(), newRT)
 				if err != nil {
 					response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 					return
@@ -545,4 +546,17 @@ func (h *AuthHandler) HandleRevokeSession(w http.ResponseWriter, r *http.Request
 	}
 	_ = h.AuthStore.RevokeSessionByDeviceID(r.Context(), userID, payload.DeviceID, "manual_revoke")
 	response.Success(w, http.StatusOK, map[string]string{"detail": "Session revoked"})
+}
+
+func (h *AuthHandler) generateAccessTokenForRole(ctx context.Context, rt *auth.RefreshToken) (string, error) {
+	if rt.Role == "hospital_md" {
+		if md, _ := h.AuthStore.FindHospitalMDByID(ctx, rt.UserID); md != nil && md.HospitalID != nil && *md.HospitalID != "" {
+			return auth.GenerateHospitalAccessToken(rt.UserID, rt.Role, *md.HospitalID, h.JWTSecret)
+		}
+	} else if rt.Role == "hospital_receptionist" {
+		if rec, _ := h.AuthStore.FindHospitalReceptionistByID(ctx, rt.UserID); rec != nil && rec.HospitalID != "" {
+			return auth.GenerateHospitalAccessToken(rt.UserID, rt.Role, rec.HospitalID, h.JWTSecret)
+		}
+	}
+	return auth.GenerateAccessToken(rt.UserID, rt.Role, h.JWTSecret)
 }
