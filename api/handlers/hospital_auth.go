@@ -238,7 +238,19 @@ func (h *HospitalAuthHandler) HandleHospitalMDVerifyOTP(w http.ResponseWriter, r
 		return
 	}
 	if md.Status != "active" {
-		response.Error(w, "Account pending approval", http.StatusForbidden)
+		if md.Status == "pending" {
+			response.Error(w, "Account pending admin approval", http.StatusForbidden)
+			return
+		}
+		if md.Status == "rejected" {
+			response.Error(w, "Account has been rejected", http.StatusForbidden)
+			return
+		}
+		if md.Status == "banned" {
+			response.Error(w, "Account has been banned", http.StatusForbidden)
+			return
+		}
+		response.Error(w, "Account not active", http.StatusForbidden)
 		return
 	}
 
@@ -353,6 +365,18 @@ func (h *HospitalAuthHandler) HandleHospitalMDLoginPassword(w http.ResponseWrite
 		return
 	}
 	if md.Status != "active" {
+		if md.Status == "pending" {
+			response.Error(w, "Account pending admin approval", http.StatusForbidden)
+			return
+		}
+		if md.Status == "rejected" {
+			response.Error(w, "Account has been rejected", http.StatusForbidden)
+			return
+		}
+		if md.Status == "banned" {
+			response.Error(w, "Account has been banned", http.StatusForbidden)
+			return
+		}
 		response.Error(w, "Account not active", http.StatusForbidden)
 		return
 	}
