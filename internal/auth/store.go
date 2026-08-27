@@ -1388,6 +1388,58 @@ func (s *Store) SetHospitalMDHospitalID(ctx context.Context, mdID string, hospit
 	return err
 }
 
+func (s *Store) ListHospitalMDs(ctx context.Context) ([]HospitalMD, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []HospitalMD
+	for rows.Next() {
+		var md HospitalMD
+		var id, hpID, hID, username, pwHash, jwtToken, fcmToken *string
+		if err := rows.Scan(&id, &hpID, &hID, &md.Name, &md.Email, &md.Mobile, &md.OfficialNumber, &username, &pwHash, &md.Status, &jwtToken, &fcmToken, &md.CreatedAt); err != nil {
+			return nil, err
+		}
+		md.ID = *id
+		md.HospitalPendingID = hpID
+		md.HospitalID = hID
+		md.Username = username
+		md.PasswordHash = pwHash
+		md.JWTToken = jwtToken
+		md.FCMToken = fcmToken
+		list = append(list, md)
+	}
+	if list == nil {
+		list = []HospitalMD{}
+	}
+	return list, nil
+}
+
+func (s *Store) BanHospitalMD(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_mds SET status='banned', jwt_token=NULL WHERE id=$1::uuid`, id)
+	return err
+}
+
+func (s *Store) UnbanHospitalMD(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_mds SET status='active' WHERE id=$1::uuid`, id)
+	return err
+}
+
+func (s *Store) DeleteHospitalMD(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM hospital_mds WHERE id=$1::uuid`, id)
+	return err
+}
+
 // ---- Hospital Receptionist (Phase 2) ----
 
 func (s *Store) CreateHospitalReceptionist(ctx context.Context, r *HospitalReceptionist) error {

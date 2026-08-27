@@ -1489,23 +1489,18 @@ func (h *AdminHandler) HandleRejectPendingHospital(w http.ResponseWriter, r *htt
 		response.Error(w, "Pending hospital not found", http.StatusNotFound)
 		return
 	}
-	reviewerID, _ := r.Context().Value(middleware.UserIDKey).(string)
-	if err := h.PendingHospitalStore.Reject(r.Context(), req.ID, reviewerID, req.ErrorMessage); err != nil {
+	// Delete entirely so MD can re-signup fresh
+	if err := h.PendingHospitalStore.Delete(r.Context(), req.ID); err != nil {
 		response.Error(w, "Reject failed", http.StatusInternalServerError)
 		return
 	}
-	// Also mark MD as rejected
-	if pending.MDID != "" {
-		if ids.IsValid(pending.MDID) {
-			md, _ := h.AuthStore.FindHospitalMDByID(r.Context(), pending.MDID)
-			if md != nil {
-				md.Status = "rejected"
-				_ = h.AuthStore.UpdateHospitalMD(r.Context(), md)
-			}
-		}
+	if pending.MDID != "" && ids.IsValid(pending.MDID) {
+		_ = h.AuthStore.DeleteHospitalMD(r.Context(), pending.MDID)
+		_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), pending.MDID, "rejected")
+		_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), pending.MDID)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital rejected"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital rejected and removed"})
 }
 
 func (h *AdminHandler) HandlePendingHospitalCounter(w http.ResponseWriter, r *http.Request) {
@@ -1516,4 +1511,74 @@ func (h *AdminHandler) HandlePendingHospitalCounter(w http.ResponseWriter, r *ht
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int64{"count": count})
+}
+
+func (h *AdminHandler) HandleListHospitalMDs(w http.ResponseWriter, r *http.Request) {
+	list, err := h.AuthStore.ListHospitalMDs(r.Context())
+	if err != nil {
+		response.Error(w, "Failed to fetch", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func (h *AdminHandler) HandleBanHospitalMD(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	if err := h.AuthStore.BanHospitalMD(r.Context(), req.ID); err != nil {
+		response.Error(w, "Ban failed", http.StatusInternalServerError)
+		return
+	}
+	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), req.ID, "banned")
+	_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), req.ID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"detail": "MD banned"})
+}
+
+func (h *AdminHandler) HandleUnbanHospitalMD(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	if err := h.AuthStore.UnbanHospitalMD(r.Context(), req.ID); err != nil {
+		response.Error(w, "Unban failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"detail": "MD unbanned"})
+}
+
+func (h *AdminHandler) HandleDeleteHospitalMD(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	if err := h.AuthStore.DeleteHospitalMD(r.Context(), req.ID); err != nil {
+		response.Error(w, "Delete failed", http.StatusInternalServerError)
+		return
+	}
+	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), req.ID, "deleted")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"detail": "MD login deleted, hospital retained"})
 }
