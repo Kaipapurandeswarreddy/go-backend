@@ -887,9 +887,6 @@ func (h *AdminHandler) HandleUpdateAmbulanceType(w http.ResponseWriter, r *http.
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	if !response.Validate(w, &req) {
-		return
-	}
 	if ids.IsZero(req.ID) {
 		response.Error(w, "ID is required", http.StatusBadRequest)
 		return
@@ -942,6 +939,10 @@ func (h *AdminHandler) HandleUpdateAmbulanceType(w http.ResponseWriter, r *http.
 		if req.OTPRequired != existing.OTPRequired {
 			merged.OTPRequired = req.OTPRequired
 		}
+	}
+
+	if !response.Validate(w, &merged) {
+		return
 	}
 
 	if err := h.Store.UpdateAmbulanceType(r.Context(), &merged); err != nil {
@@ -1056,6 +1057,23 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	// Conditional validation: only validate coordinates if they were actually sent
+	if _, ok := raw["coordinates"]; ok {
+		if req.Coordinates.Lat < -90 || req.Coordinates.Lat > 90 {
+			response.Error(w, "Coordinates: lat must be -90..90", http.StatusBadRequest)
+			return
+		}
+		if req.Coordinates.Lng < -180 || req.Coordinates.Lng > 180 {
+			response.Error(w, "Coordinates: lng must be -180..180", http.StatusBadRequest)
+			return
+		}
+	}
+
 	existing, err := h.HospitalStore.FindByID(r.Context(), req.ID)
 	if err != nil {
 		response.Error(w, "Internal error", http.StatusInternalServerError)
@@ -1063,12 +1081,6 @@ func (h *AdminHandler) HandleUpdateHospital(w http.ResponseWriter, r *http.Reque
 	}
 	if existing == nil {
 		response.Error(w, "Hospital not found", http.StatusNotFound)
-		return
-	}
-
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
 
