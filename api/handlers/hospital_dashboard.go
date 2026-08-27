@@ -81,8 +81,23 @@ func (h *HospitalDashboardHandler) HandleHospitalIncomingRides(w http.ResponseWr
 		response.Error(w, "Failed to fetch", http.StatusInternalServerError)
 		return
 	}
+	// Enrich with live driver location for the map polyline / moving marker (free, same H3 store as fleet)
+	type enriched struct {
+		*ride.Ride
+		DriverLocation *admin.GeoJSON `json:"driver_location,omitempty"`
+	}
+	enrichedList := make([]enriched, 0, len(rides))
+	for _, rd := range rides {
+		er := enriched{Ride: rd}
+		if rd.DriverID != nil && h.WSManager != nil && h.WSManager.LocStore != nil {
+			if lat, lng, err := h.WSManager.LocStore.GetLocation(*rd.DriverID); err == nil {
+				er.DriverLocation = &admin.GeoJSON{Type: "Point", Coordinates: []float64{lng, lat}}
+			}
+		}
+		enrichedList = append(enrichedList, er)
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(rides)
+	json.NewEncoder(w).Encode(enrichedList)
 }
 
 func (h *HospitalDashboardHandler) HandleHospitalHistory(w http.ResponseWriter, r *http.Request) {
