@@ -843,6 +843,9 @@ func (s *Store) UpdateUnverifiedDriver(ctx context.Context, driver *UnverifiedDr
 
 func (s *Store) ApproveDriver(ctx context.Context, driver *Driver) error {
 	walletDetailsData := marshalJSONB(driver.WalletDetails)
+	if walletDetailsData == nil {
+		walletDetailsData = []byte("{}")
+	}
 	locationData := marshalJSONB(driver.Location)
 	detailsData := marshalJSONB(driver.Details)
 	tx, err := s.pool.Begin(ctx)
@@ -919,6 +922,9 @@ func (s *Store) ListDrivers(ctx context.Context, skip int64) ([]Driver, int64, e
 func (s *Store) InsertDriver(ctx context.Context, driver *Driver) error {
 	driver.ID = ids.New()
 	walletDetailsData := marshalJSONB(driver.WalletDetails)
+	if walletDetailsData == nil {
+		walletDetailsData = []byte("{}")
+	}
 	locationData := marshalJSONB(driver.Location)
 	detailsData := marshalJSONB(driver.Details)
 	_, err := s.pool.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb)`,
@@ -931,6 +937,9 @@ func (s *Store) UpdateDriver(ctx context.Context, driver *Driver) error {
 		return fmt.Errorf("invalid id: %s", driver.ID)
 	}
 	walletDetailsData := marshalJSONB(driver.WalletDetails)
+	if walletDetailsData == nil {
+		walletDetailsData = []byte("{}")
+	}
 	locationData := marshalJSONB(driver.Location)
 	detailsData := marshalJSONB(driver.Details)
 	_, err := s.pool.Exec(ctx, `UPDATE drivers SET name=$2, mobile=$3, photo=$4, vehicle_type=$5, vehicle_registration=$6, wallet_details=$7::jsonb, wallet_balance=$8, referral_code=$9, my_referral_code=$10, location=$11::jsonb, fcm_token=$12, jwt_token=$13, last_location_update=$14, details=$15::jsonb WHERE id=$1::uuid`,
