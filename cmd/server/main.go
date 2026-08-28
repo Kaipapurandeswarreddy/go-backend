@@ -469,14 +469,13 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if _, err := pool.Exec(ctx, `DELETE FROM auth_otp WHERE created_at < now() - interval '5 minutes'`); err != nil {
+			if _, err := authStore.CleanupExpiredOTPs(ctx); err != nil {
 				log.Error().Err(err).Msg("auth_otp cleanup failed")
 			}
-			if _, err := pool.Exec(ctx, `DELETE FROM audit_log WHERE created_at < now() - interval '30 days'`); err != nil {
+			if _, err := auditStore.CleanupOldLogs(ctx); err != nil {
 				log.Error().Err(err).Msg("audit_log cleanup failed")
 			}
-			// refresh_tokens are naturally expired via expires_at check; optional hard delete:
-			if _, err := pool.Exec(ctx, `DELETE FROM refresh_tokens WHERE expires_at < now() - interval '7 days' AND revoked = true`); err != nil {
+			if _, err := authStore.CleanupExpiredRefreshTokens(ctx); err != nil {
 				log.Error().Err(err).Msg("refresh_tokens cleanup failed")
 			}
 			cancel()
