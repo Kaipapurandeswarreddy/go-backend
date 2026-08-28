@@ -81,6 +81,10 @@ func (h *HospitalDashboardHandler) HandleHospitalIncomingRides(w http.ResponseWr
 		response.Error(w, "Failed to fetch", http.StatusInternalServerError)
 		return
 	}
+	// Populate full chat history (drawer -> screen fix)
+	if err := h.RideStore.PopulateConditionUpdates(r.Context(), rides); err != nil {
+		// non-fatal: still return rides with latest_condition only
+	}
 	// Enrich with live driver location for the map polyline / moving marker (free, same H3 store as fleet)
 	type enriched struct {
 		*ride.Ride
@@ -120,6 +124,7 @@ func (h *HospitalDashboardHandler) HandleHospitalHistory(w http.ResponseWriter, 
 		response.Error(w, "Failed to fetch", http.StatusInternalServerError)
 		return
 	}
+	_ = h.RideStore.PopulateConditionUpdates(r.Context(), rides)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rides)
 }
@@ -152,6 +157,10 @@ func (h *HospitalDashboardHandler) HandleHospitalRideDetail(w http.ResponseWrite
 	if rideDoc.HospitalID == nil || *rideDoc.HospitalID != hid {
 		response.Error(w, "Forbidden: different hospital", http.StatusForbidden)
 		return
+	}
+	// Attach full timeline for chat view
+	if ups, err := h.RideStore.ListConditionUpdates(r.Context(), rideDoc.ID); err == nil {
+		rideDoc.ConditionUpdates = ups
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rideDoc)
@@ -423,6 +432,9 @@ func (h *HospitalDashboardHandler) HandleAttendantCurrentRide(w http.ResponseWri
 				// Find current ride for the assigned driver
 				ride, _ := h.RideStore.GetCurrentRide(r.Context(), *att.AssignedDriverID, "driver")
 				if ride != nil {
+					if ups, err := h.RideStore.ListConditionUpdates(r.Context(), ride.ID); err == nil {
+						ride.ConditionUpdates = ups
+					}
 					w.Header().Set("Content-Type", "application/json")
 					json.NewEncoder(w).Encode(map[string]interface{}{"found": true, "ride": ride})
 					return
@@ -437,6 +449,9 @@ func (h *HospitalDashboardHandler) HandleAttendantCurrentRide(w http.ResponseWri
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"found": false})
 		return
+	}
+	if ups, err := h.RideStore.ListConditionUpdates(r.Context(), rides[0].ID); err == nil {
+		rides[0].ConditionUpdates = ups
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"found": true, "ride": rides[0]})

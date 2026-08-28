@@ -598,6 +598,22 @@ func (s *Store) RevokeSessionByDeviceID(ctx context.Context, userID, deviceID, r
 	return err
 }
 
+func (s *Store) CleanupExpiredRefreshTokens(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM refresh_tokens WHERE expires_at < now() - interval '7 days'`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (s *Store) CleanupExpiredOTPs(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM auth_otp WHERE created_at < now() - interval '5 minutes'`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // ---- Logout (V4) ----
 
 func (s *Store) ClearUserJWT(ctx context.Context, userID string) error {

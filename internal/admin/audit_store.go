@@ -43,3 +43,11 @@ func (s *AuditStore) InsertEvent(ctx context.Context, event *AuditEvent) error {
 	_, err := s.pool.Exec(ctx, q, event.ID, event.EventType, event.Channel, event.Payload, requestID, event.CreatedAt)
 	return err
 }
+
+func (s *AuditStore) CleanupOldLogs(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM audit_log WHERE created_at < now() - interval '30 days'`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
