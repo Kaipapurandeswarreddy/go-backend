@@ -1,10 +1,16 @@
 package middleware
 
-import "net/http"
+import (
+	"net/http"
+	"strings"
+)
 
 var allowedOrigins = []string{
 	"https://ambigo.in",
 	"https://admin.ambigo.in",
+	"https://hospital.ambigo.in",
+	"https://hospital-ambigo.netlify.app",
+	"https://ambigo-hospital-portal.onrender.com",
 	"https://ambigo-server-559193701066.asia-south1.run.app",
 	"https://go-backend-viu3.onrender.com",
 	"http://localhost:",
@@ -19,6 +25,14 @@ func isAllowedOrigin(origin string) bool {
 		if origin == ao || len(origin) >= len(ao) && origin[:len(ao)] == ao {
 			return true
 		}
+	}
+	// Allow Netlify preview deploys: e.g. https://deploy-preview-123--hospital-ambigo.netlify.app
+	if strings.HasSuffix(origin, ".netlify.app") && strings.Contains(origin, "hospital-ambigo") {
+		return true
+	}
+	// Allow any subdomain of ambigo.in (hospital/admin etc)
+	if strings.HasSuffix(origin, ".ambigo.in") {
+		return true
 	}
 	return false
 }
