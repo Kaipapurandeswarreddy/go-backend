@@ -1035,3 +1035,82 @@ func (s *Store) ListRidesByHospitalSince(ctx context.Context, hospitalID string,
 	}
 	return rides, nil
 }
+
+// ListConditionUpdates returns full chat history for a ride, ordered oldest -> newest.
+// Used by hospital portal to render WhatsApp-like timeline instead of just latest_condition.
+func (s *Store) ListConditionUpdates(ctx context.Context, rideID string) ([]ConditionUpdate, error) {
+	rows, err := s.db.Query(ctx, `SELECT level, severity, note, source, created_at FROM ride_condition_updates WHERE ride_id=$1::uuid ORDER BY created_at ASC`, rideID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ConditionUpdate
+	for rows.Next() {
+		var cu ConditionUpdate
+		if err := rows.Scan(&cu.Level, &cu.Severity, &cu.Note, &cu.Source, &cu.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, cu)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []ConditionUpdate{}
+	}
+	return out, nil
+}
+
+// ListConditionUpdatesBatch fetches histories for multiple rides in one query.
+// Returns map[rideID] -> []ConditionUpdate ordered ASC.
+func (s *Store) ListConditionUpdatesBatch(ctx context.Context, rideIDs []string) (map[string][]ConditionUpdate, error) {
+	if len(rideIDs) == 0 {
+		return map[string][]ConditionUpdate{}, nil
+	}
+	rows, err := s.db.Query(ctx, `SELECT ride_id::text, level, severity, note, source, created_at FROM ride_condition_updates WHERE ride_id = ANY($1::uuid[]) ORDER BY ride_id, created_at ASC`, rideIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	m := make(map[string][]ConditionUpdate, len(rideIDs))
+	for rows.Next() {
+		var rideID string
+		var cu ConditionUpdate
+		if err := rows.Scan(&rideID, &cu.Level, &cu.Severity, &cu.Note, &cu.Source, &cu.CreatedAt); err != nil {
+			return nil, err
+		}
+		m[rideID] = append(m[rideID], cu)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// ensure every requested id has at least empty slice
+	for _, id := range rideIDs {
+		if _, ok := m[id]; !ok {
+			m[id] = []ConditionUpdate{}
+		}
+	}
+	return m, nil
+}
+
+// PopulateConditionUpdates fills Ride.ConditionUpdates for each ride in slice.
+// Call after ListRidesByHospital / ListRidesByHospitalSince to avoid N+1 on hospital pages.
+func (s *Store) PopulateConditionUpdates(ctx context.Context, rides []*Ride) error {
+	if len(rides) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(rides))
+	for _, r := range rides {
+		ids = append(ids, r.ID)
+	}
+	batch, err := s.ListConditionUpdatesBatch(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for _, r := range rides {
+		if cu, ok := batch[r.ID]; ok {
+			r.ConditionUpdates = cu
+		}
+	}
+	return nil
+}
