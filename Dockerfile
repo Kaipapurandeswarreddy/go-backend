@@ -19,7 +19,7 @@
 # ============================================================
 
 # ---- Stage 1: Build ----
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # Install C toolchain (required for h3-go CGO bindings) + certificates
 RUN apk --no-cache add ca-certificates git gcc musl-dev
