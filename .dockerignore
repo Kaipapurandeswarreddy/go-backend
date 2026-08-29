@@ -1,0 +1,43 @@
+# Secrets — never include in image
+.env
+.env.*
+firebase-key.json
+
+# Compiled binaries (we build inside Docker)
+*.exe
+server
+ambigo-server
+
+# Git / IDE
+.git
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Documentation / design files (not needed at runtime)
+*.md
+*.drawio
+postman_collection.json
+postman_environment.json
+websocket_collection.json
+TESTING_REPORT.md
+API_DOCUMENTATION.md
+LOCAL_POSTGRES.md
+WEBSOCKET_DOCUMENTATION.md
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml
+cloudbuild.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go vendor (if ever vendored)
+vendor/
+
+# Deploy scripts
+deploy_render.py

@@ -1,0 +1,104 @@
+# ============================================================
+# Cloud Build config for deploying Ambigo backend to Cloud Run
+# ============================================================
+#
+# Trigger: Push to `postgres-implementation` branch (or manual)
+#
+# Prerequisites (one-time setup in GCP Console):
+#   1. Enable APIs: Cloud Build, Cloud Run, Artifact Registry, Secret Manager
+#   2. Create Artifact Registry repo:
+#      gcloud artifacts repositories create ambigo --repository-format=docker --location=asia-south1
+#   3. Store secrets in Secret Manager:
+#      gcloud secrets create jwt-secret --data-file=- <<< "your-jwt-secret"
+#      gcloud secrets create api-key --data-file=- <<< "your-api-key"
+#      gcloud secrets create firebase-key --data-file=firebase-key.json
+#      (repeat for each secret listed in the deploy step below)
+#   4. Grant Cloud Build the "Cloud Run Admin" + "Service Account User" roles:
+#      gcloud projects add-iam-policy-binding PROJECT_ID \
+#        --member="serviceAccount:PROJECT_NUMBER@cloudbuild.gserviceaccount.com" \
+#        --role="roles/run.admin"
+#
+# Usage:
+#   gcloud builds submit --config=cloudbuild.yaml .
+# ============================================================
+
+substitutions:
+  _REGION: asia-south1
+  _SERVICE_NAME: ambigo-backend
+  _REPO: ambigo
+
+steps:
+  # Step 1: Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:$SHORT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:latest'
+      - '.'
+
+  # Step 2: Push to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}'
+
+  # Step 3: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:$SHORT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      # Resources — tune based on traffic
+      - '--memory=512Mi'
+      - '--cpu=1'
+      - '--min-instances=1'
+      - '--max-instances=10'
+      - '--concurrency=250'
+      - '--timeout=300'
+      # WebSocket support: Cloud Run gen2 execution environment
+      - '--execution-environment=gen2'
+      # Session affinity for sticky WebSocket connections
+      - '--session-affinity'
+      # Environment variables (non-secret)
+      - '--set-env-vars=PORT=8080'
+      - '--set-env-vars=SMS_API_BASE_URL=https://restapi.smscountry.com/v0.1/Accounts/%s/SMSes/'
+      - '--set-env-vars=SMS_SENDER_ID=AMBHPL'
+      - '--set-env-vars=SMS_COUNTRY_CODE=91'
+      - '--set-env-vars=GOOGLE_ROUTES_API_URL=https://routes.googleapis.com/directions/v2:computeRoutes'
+      - '--set-env-vars=GOOGLE_PLACES_API_URL=https://places.googleapis.com/v1/places:searchNearby'
+      - '--set-env-vars=GOOGLE_TRANSLATE_API_URL=https://translate.googleapis.com/translate_a/single'
+      - '--set-env-vars=ZWITCH_API_BASE_URL=https://api.zwitch.io/v1'
+      - '--set-env-vars=CLOUDSHOPE_API_BASE_URL=https://apiv2.cloudshope.com/api/outboundCall'
+      # Secrets from Secret Manager (mounted as env vars)
+      - '--update-secrets=JWT_SECRET=jwt-secret:latest'
+      - '--update-secrets=API_KEY=api-key:latest'
+      - '--update-secrets=DATABASE_URL=database-url:latest'
+      - '--update-secrets=GOOGLE_MAPS_API_KEY=google-maps-api-key:latest'
+      - '--update-secrets=RAZORPAY_KEY_ID=razorpay-key-id:latest'
+      - '--update-secrets=RAZORPAY_KEY_SECRET=razorpay-key-secret:latest'
+      - '--update-secrets=RAZORPAY_WEBHOOK_SECRET=razorpay-webhook-secret:latest'
+      - '--update-secrets=SMS_COUNTRY_KEY=sms-country-key:latest'
+      - '--update-secrets=SMS_COUNTRY_TOKEN=sms-country-token:latest'
+      - '--update-secrets=ZWITCH_KEY=zwitch-key:latest'
+      - '--update-secrets=ZWITCH_SECRET=zwitch-secret:latest'
+      - '--update-secrets=ZWITCH_ACCOUNT_ID=zwitch-account-id:latest'
+      - '--update-secrets=CLOUDSHOPE_TOKEN=cloudshope-token:latest'
+      - '--update-secrets=CLOUDSHOPE_NUMBER=cloudshope-number:latest'
+      # Firebase credentials — mounted as a file via Secret Manager
+      - '--update-secrets=/app/firebase-key.json=firebase-key:latest'
+      - '--set-env-vars=FIREBASE_CREDENTIALS_PATH=/app/firebase-key.json'
+
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:$SHORT_SHA'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
