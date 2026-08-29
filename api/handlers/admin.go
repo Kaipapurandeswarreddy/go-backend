@@ -1448,6 +1448,7 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 		response.Error(w, "Failed to create hospital", http.StatusInternalServerError)
 		return
 	}
+	_ = h.CounterStore.IncrementCounter(r.Context(), "hospitals")
 	// Update pending status
 	reviewerID, _ := r.Context().Value(middleware.UserIDKey).(string)
 	_ = h.PendingHospitalStore.Approve(r.Context(), req.ID, reviewerID)
