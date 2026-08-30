@@ -27,6 +27,7 @@ import (
 	"ambigo-backend/internal/places"
 	"ambigo-backend/internal/referral"
 	"ambigo-backend/internal/ride"
+	"ambigo-backend/internal/storage"
 	"ambigo-backend/internal/telephony"
 	"ambigo-backend/internal/translation"
 	"ambigo-backend/internal/websocket"
@@ -150,9 +151,14 @@ func main() {
 		SenderID:   appConfig.SMSSenderID,
 		CC:         appConfig.SMSCC,
 	}
+	storageService, err := storage.NewStorageService(context.Background(), appConfig.GCSBucketName)
+	if err != nil {
+		logger.Log.Warn().Err(err).Msg("GCS Storage Service failed to initialize; falling back to DB storage")
+	}
+
 	authHandler := handlers.NewAuthHandler(authStore, eventBus, appConfig.JWTSecret, smsCfg, appConfig.AllowStaleRefreshChain, referralService)
 	profileHandler := handlers.NewProfileHandler(authStore)
-	verificationHandler := handlers.NewVerificationHandler(authStore)
+	verificationHandler := handlers.NewVerificationHandler(authStore, storageService)
 	paymentHandler := handlers.NewPaymentHandler(paymentStore, eventBus, rzpService, walletStore, appConfig.RazorpayWebhookSecret)
 	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, hospitalCityStore, pendingHospitalStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg)
 	hospitalAuthHandler := handlers.NewHospitalAuthHandler(authStore, pendingHospitalStore, hospitalStore, appConfig.JWTSecret, smsCfg)
