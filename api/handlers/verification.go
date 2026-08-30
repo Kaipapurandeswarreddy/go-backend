@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -9,15 +10,19 @@ import (
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/ids"
+	"ambigo-backend/internal/logger"
+	"ambigo-backend/internal/storage"
 )
 
 type VerificationHandler struct {
-	AuthStore *auth.Store
+	AuthStore  *auth.Store
+	StorageSvc *storage.StorageService
 }
 
-func NewVerificationHandler(authStore *auth.Store) *VerificationHandler {
+func NewVerificationHandler(authStore *auth.Store, storageSvc *storage.StorageService) *VerificationHandler {
 	return &VerificationHandler{
-		AuthStore: authStore,
+		AuthStore:  authStore,
+		StorageSvc: storageSvc,
 	}
 }
 
@@ -101,12 +106,44 @@ func (h *VerificationHandler) HandleUpdateVerification(w http.ResponseWriter, r 
 		return
 	}
 
-	driver.PortraitImage = req.PortraitImage
-	driver.POIImage = req.POIImage
-	driver.DLImage = req.DLImage
-	driver.RCImage = req.RCImage
-	driver.AmbFront = req.AmbFront
-	driver.AmbInside = req.AmbInside
+	// Upload Base64 images to Google Cloud Storage (GCS) and store HTTPS URLs in PostgreSQL
+	portraitURL, err := h.uploadDoc(r, driver.ID, "portrait", req.PortraitImage)
+	if err != nil {
+		response.Error(w, "Failed to upload portrait image: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	poiURL, err := h.uploadDoc(r, driver.ID, "poi", req.POIImage)
+	if err != nil {
+		response.Error(w, "Failed to upload POI image: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	dlURL, err := h.uploadDoc(r, driver.ID, "dl", req.DLImage)
+	if err != nil {
+		response.Error(w, "Failed to upload DL image: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rcURL, err := h.uploadDoc(r, driver.ID, "rc", req.RCImage)
+	if err != nil {
+		response.Error(w, "Failed to upload RC image: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ambFrontURL, err := h.uploadDoc(r, driver.ID, "amb_front", req.AmbFront)
+	if err != nil {
+		response.Error(w, "Failed to upload ambulance front image: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ambInsideURL, err := h.uploadDoc(r, driver.ID, "amb_inside", req.AmbInside)
+	if err != nil {
+		response.Error(w, "Failed to upload ambulance inside image: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	driver.PortraitImage = portraitURL
+	driver.POIImage = poiURL
+	driver.DLImage = dlURL
+	driver.RCImage = rcURL
+	driver.AmbFront = ambFrontURL
+	driver.AmbInside = ambInsideURL
 	driver.UnderProgress = true
 	driver.ErrorMessage = nil
 
@@ -118,4 +155,18 @@ func (h *VerificationHandler) HandleUpdateVerification(w http.ResponseWriter, r 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Details updated successfully and recheck initialized"})
+}
+
+func (h *VerificationHandler) uploadDoc(r *http.Request, driverID, docType, data string) (string, error) {
+	if h.StorageSvc != nil {
+		objectPath := fmt.Sprintf("drivers/%s/%s.jpg", driverID, docType)
+		url, err := h.StorageSvc.UploadBase64IfImage(r.Context(), objectPath, data)
+		if err != nil {
+			logger.Log.Error().Err(err).Str("driver_id", driverID).Str("doc_type", docType).Msg("GCS upload failed")
+			return "", err
+		}
+		return url, nil
+	}
+	// Fallback to data as-is if GCS client is nil
+	return data, nil
 }
