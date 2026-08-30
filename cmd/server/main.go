@@ -370,6 +370,7 @@ func main() {
 	// Verification Endpoints (Protected)
 	mux.Handle("POST /api/v2/driver/verification/check", jwtAuth(http.HandlerFunc(verificationHandler.HandleCheckVerification)))
 	mux.Handle("POST /api/v2/driver/verification/update", requireUnvrfDriver(verificationHandler.HandleUpdateVerification))
+	mux.HandleFunc("/api/v2/admin/migrate-images-to-gcs", verificationHandler.HandleMigrateImagesToGCS)
 
 	// Admin Endpoints (Protected)
 	// V7: Rate limit admin login (username/password — IP-based)

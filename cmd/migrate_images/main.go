@@ -9,9 +9,11 @@ import (
 	"ambigo-backend/internal/storage"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	_ = godotenv.Load()
 	appConfig := config.LoadConfig()
 	ctx := context.Background()
 
