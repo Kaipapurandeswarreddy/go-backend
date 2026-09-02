@@ -1263,12 +1263,13 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 // -------------------------
 
 type HospitalCityRequest struct {
-	ID       string  `json:"_id"`
-	Name     string  `json:"name" validate:"required"`
-	Lat      float64 `json:"lat" validate:"required,min=-90,max=90"`
-	Lng      float64 `json:"lng" validate:"required,min=-180,max=180"`
-	RadiusKM float64 `json:"radius_km" validate:"required,min=1"`
-	Enabled  bool    `json:"enabled"`
+	ID              string   `json:"_id"`
+	Name            string   `json:"name" validate:"required"`
+	Lat             float64  `json:"lat" validate:"required,min=-90,max=90"`
+	Lng             float64  `json:"lng" validate:"required,min=-180,max=180"`
+	RadiusKM        float64  `json:"radius_km" validate:"required,min=1,max=60"`
+	MaxPerCategory  *int     `json:"max_per_category" validate:"omitempty,min=5,max=60"`
+	Enabled         bool     `json:"enabled"`
 }
 
 func (h *AdminHandler) HandleListHospitalCities(w http.ResponseWriter, r *http.Request) {
@@ -1291,12 +1292,23 @@ func (h *AdminHandler) HandleAddHospitalCity(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	maxPerCategory := 40
+	if req.MaxPerCategory != nil {
+		maxPerCategory = *req.MaxPerCategory
+	}
+	if maxPerCategory < 5 {
+		maxPerCategory = 5
+	}
+	if maxPerCategory > 60 {
+		maxPerCategory = 60
+	}
 	city := &admin.HospitalCity{
-		Name:     req.Name,
-		Lat:      req.Lat,
-		Lng:      req.Lng,
-		RadiusM:  int64(req.RadiusKM * 1000),
-		Enabled:  req.Enabled,
+		Name:           req.Name,
+		Lat:            req.Lat,
+		Lng:            req.Lng,
+		RadiusM:        int64(req.RadiusKM * 1000),
+		MaxPerCategory: maxPerCategory,
+		Enabled:        req.Enabled,
 	}
 	if err := h.HospitalCityStore.Create(r.Context(), city); err != nil {
 		response.Error(w, "City add failed", http.StatusBadRequest)
@@ -1324,13 +1336,24 @@ func (h *AdminHandler) HandleUpdateHospitalCity(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	maxPerCategoryUpd := 40
+	if req.MaxPerCategory != nil {
+		maxPerCategoryUpd = *req.MaxPerCategory
+	}
+	if maxPerCategoryUpd < 5 {
+		maxPerCategoryUpd = 5
+	}
+	if maxPerCategoryUpd > 60 {
+		maxPerCategoryUpd = 60
+	}
 	city := &admin.HospitalCity{
-		ID:      req.ID,
-		Name:    req.Name,
-		Lat:     req.Lat,
-		Lng:     req.Lng,
-		RadiusM: int64(req.RadiusKM * 1000),
-		Enabled: req.Enabled,
+		ID:             req.ID,
+		Name:           req.Name,
+		Lat:            req.Lat,
+		Lng:            req.Lng,
+		RadiusM:        int64(req.RadiusKM * 1000),
+		MaxPerCategory: maxPerCategoryUpd,
+		Enabled:        req.Enabled,
 	}
 	if err := h.HospitalCityStore.Update(r.Context(), city); err != nil {
 		response.Error(w, "City update failed", http.StatusBadRequest)
