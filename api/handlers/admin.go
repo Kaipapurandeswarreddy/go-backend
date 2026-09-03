@@ -13,6 +13,7 @@ import (
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/logger"
+	"ambigo-backend/internal/mailer"
 	"ambigo-backend/internal/requestid"
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/translation"
@@ -30,9 +31,10 @@ type AdminHandler struct {
 	RideStore            *ride.Store
 	JWTSecret            string
 	SMSCfg               auth.SMSCountryConfig
+	Mailer               *mailer.ResendMailer
 }
 
-func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, hcStore *admin.HospitalCityStore, pStore *admin.PendingHospitalStore, cStore *admin.CounterStore, rStore *ride.Store, jwtSecret string, smsCfg auth.SMSCountryConfig) *AdminHandler {
+func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, hcStore *admin.HospitalCityStore, pStore *admin.PendingHospitalStore, cStore *admin.CounterStore, rStore *ride.Store, jwtSecret string, smsCfg auth.SMSCountryConfig, mailer *mailer.ResendMailer) *AdminHandler {
 	return &AdminHandler{
 		Store:                store,
 		AuthStore:            authStore,
@@ -44,6 +46,7 @@ func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventb
 		RideStore:            rStore,
 		JWTSecret:            jwtSecret,
 		SMSCfg:               smsCfg,
+		Mailer:               mailer,
 	}
 }
 
@@ -1488,6 +1491,13 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 		}
 	}
 
+	// Send approval email (no link, just where to login)
+	if h.Mailer != nil && pending.Email != "" {
+		_ = h.Mailer.SendHospitalApproveEmail(pending.Email, pending.Name, pending.City)
+	} else {
+		logger.Log.Warn().Str("pending_id", pending.ID).Msg("Approve email skipped: no email or mailer")
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital approved", "hospital_id": hospital.ID})
 }
@@ -1513,10 +1523,15 @@ func (h *AdminHandler) HandleRejectPendingHospital(w http.ResponseWriter, r *htt
 		response.Error(w, "Pending hospital not found", http.StatusNotFound)
 		return
 	}
-	// Delete entirely so MD can re-signup fresh
-	if err := h.PendingHospitalStore.Delete(r.Context(), req.ID); err != nil {
+	// Hybrid C: keep pending row as rejected for audit, delete MD to free mobile
+	reviewerID, _ := r.Context().Value(middleware.UserIDKey).(string)
+	if err := h.PendingHospitalStore.Reject(r.Context(), req.ID, reviewerID, req.ErrorMessage); err != nil {
 		response.Error(w, "Reject failed", http.StatusInternalServerError)
 		return
+	}
+	// Send rejection email (no link, just where to login and reason)
+	if h.Mailer != nil && pending.Email != "" {
+		_ = h.Mailer.SendHospitalRejectEmail(pending.Email, pending.Name, req.ErrorMessage)
 	}
 	if pending.MDID != "" && ids.IsValid(pending.MDID) {
 		_ = h.AuthStore.DeleteHospitalMD(r.Context(), pending.MDID)
@@ -1524,7 +1539,7 @@ func (h *AdminHandler) HandleRejectPendingHospital(w http.ResponseWriter, r *htt
 		_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), pending.MDID)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital rejected and removed"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital rejected"})
 }
 
 func (h *AdminHandler) HandlePendingHospitalCounter(w http.ResponseWriter, r *http.Request) {
