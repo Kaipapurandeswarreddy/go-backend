@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"ambigo-backend/internal/mailer"
+
 	"ambigo-backend/api/handlers"
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/config"
@@ -27,6 +29,7 @@ import (
 	"ambigo-backend/internal/places"
 	"ambigo-backend/internal/referral"
 	"ambigo-backend/internal/ride"
+	"ambigo-backend/internal/storage"
 	"ambigo-backend/internal/telephony"
 	"ambigo-backend/internal/translation"
 	"ambigo-backend/internal/websocket"
@@ -150,14 +153,21 @@ func main() {
 		SenderID:   appConfig.SMSSenderID,
 		CC:         appConfig.SMSCC,
 	}
+	storageService, err := storage.NewStorageService(context.Background(), appConfig.GCSBucketName)
+	if err != nil {
+		logger.Log.Warn().Err(err).Msg("GCS Storage Service failed to initialize; falling back to DB storage")
+	}
+
 	authHandler := handlers.NewAuthHandler(authStore, eventBus, appConfig.JWTSecret, smsCfg, appConfig.AllowStaleRefreshChain, referralService)
 	profileHandler := handlers.NewProfileHandler(authStore)
-	verificationHandler := handlers.NewVerificationHandler(authStore)
+	verificationHandler := handlers.NewVerificationHandler(authStore, storageService)
+	mediaHandler := handlers.NewMediaHandler(storageService, appConfig.JWTSecret)
 	paymentHandler := handlers.NewPaymentHandler(paymentStore, eventBus, rzpService, walletStore, appConfig.RazorpayWebhookSecret)
-	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, hospitalCityStore, pendingHospitalStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg)
+	resendMailer := mailer.NewResendMailer(appConfig)
+	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, hospitalCityStore, pendingHospitalStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg, resendMailer)
 	hospitalAuthHandler := handlers.NewHospitalAuthHandler(authStore, pendingHospitalStore, hospitalStore, appConfig.JWTSecret, smsCfg)
-	receptionistHandler := handlers.NewHospitalReceptionistHandler(authStore, appConfig.JWTSecret)
-	attendantAuthHandler := handlers.NewAttendantAuthHandler(authStore, appConfig.JWTSecret, smsCfg)
+	receptionistHandler := handlers.NewHospitalReceptionistHandler(authStore, appConfig.JWTSecret, resendMailer)
+	attendantAuthHandler := handlers.NewAttendantAuthHandler(authStore, appConfig.JWTSecret, smsCfg, eventBus)
 	driverAttendantHandler := handlers.NewDriverAttendantHandler(authStore)
 	hospitalDashboardHandler := handlers.NewHospitalDashboardHandler(rideStore, hospitalStore, adminStore, authStore, wsManager)
 	offerHandler := handlers.NewOfferHandler(offerStore, eventBus)
@@ -361,9 +371,11 @@ func main() {
 	mux.Handle("POST /api/v2/driver/profile", requireDriverOrUnvrf(profileHandler.HandleGetDriverProfile))
 	mux.Handle("POST /api/v2/driver/fcm", requireDriverOrUnvrf(profileHandler.HandleUpdateDriverFCM))
 
-	// Verification Endpoints (Protected)
+	// Verification & Media Endpoints (Protected)
 	mux.Handle("POST /api/v2/driver/verification/check", jwtAuth(http.HandlerFunc(verificationHandler.HandleCheckVerification)))
 	mux.Handle("POST /api/v2/driver/verification/update", requireUnvrfDriver(verificationHandler.HandleUpdateVerification))
+	mux.HandleFunc("/api/v2/admin/migrate-images-to-gcs", verificationHandler.HandleMigrateImagesToGCS)
+	mux.HandleFunc("GET /api/v2/media/view", mediaHandler.HandleViewMedia)
 
 	// Admin Endpoints (Protected)
 	// V7: Rate limit admin login (username/password — IP-based)
@@ -422,6 +434,7 @@ func main() {
 	mux.HandleFunc("POST /api/v2/hospital/md/login/password", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDLoginPassword, adminLoginLimiter))
 	mux.Handle("POST /api/v2/hospital/md/setup-password", requireHospitalMD(http.HandlerFunc(hospitalAuthHandler.HandleHospitalMDSetupPassword)))
 	mux.Handle("POST /api/v2/hospital/auth/me", requireHospitalMD(http.HandlerFunc(hospitalAuthHandler.HandleHospitalMDMe)))
+	mux.HandleFunc("POST /api/v2/hospital/md/status", hospitalAuthHandler.HandleHospitalMDStatus)
 	// Attendant (public, inside driver app)
 	mux.HandleFunc("POST /api/v2/attendant/request-otp", middleware.RateLimit(attendantAuthHandler.HandleAttendantRequestOTP, otpIPLimiter))
 	mux.HandleFunc("POST /api/v2/attendant/verify-otp", middleware.RateLimitMobile(attendantAuthHandler.HandleAttendantVerifyOTP, verifyMobileLimiter))
@@ -439,6 +452,8 @@ func main() {
 	mux.Handle("POST /api/v2/hospital/receptionist/create", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleCreateReceptionist)))
 	mux.Handle("POST /api/v2/hospital/receptionists/list", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleListReceptionists)))
 	mux.Handle("POST /api/v2/hospital/receptionist/delete", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleDeleteReceptionist)))
+	mux.Handle("POST /api/v2/hospital/receptionist/resend-invite", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleResendInvite)))
+	mux.Handle("POST /api/v2/hospital/receptionist/change-password", jwtAuth(http.HandlerFunc(receptionistHandler.HandleChangePassword)))
 	mux.HandleFunc("POST /api/v2/hospital/receptionist/login", middleware.RateLimit(receptionistHandler.HandleReceptionistLogin, adminLoginLimiter))
 	mux.Handle("POST /api/v2/hospital/receptionist/me", requireAnyHospital(http.HandlerFunc(receptionistHandler.HandleReceptionistMe)))
 	// Hospital dashboard (for receptionist/MD)
