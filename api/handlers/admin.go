@@ -1250,7 +1250,28 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Cascade: delete MDs and receptionists linked to this hospital (and revoke sessions)
+	if mds, err := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), req.HospitalID); err == nil {
+		for _, md := range mds {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), md.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), md.ID)
+		}
+	}
+	if receps, err := h.AuthStore.ListReceptionistsByHospital(r.Context(), req.HospitalID); err == nil {
+		for _, rc := range receps {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), rc.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalReceptionistJWT(r.Context(), rc.ID)
+		}
+	}
+	// Delete MDs explicitly before hospital (FK SET NULL, not CASCADE)
+	if mds, err := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), req.HospitalID); err == nil {
+		for _, md := range mds {
+			_ = h.AuthStore.DeleteHospitalMD(r.Context(), md.ID)
+		}
+	}
+
 	if err := h.HospitalStore.DeleteHospital(r.Context(), req.HospitalID); err != nil {
+		logger.Log.Error().Err(err).Str("hospital_id", req.HospitalID).Msg("Hospital delete failed")
 		response.Error(w, "Hospital delete failed", http.StatusBadRequest)
 		return
 	}
@@ -1258,7 +1279,7 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 	h.EventBus.PublishEvent(eventbus.ChannelAdminHospitalDeleted, eventbus.AdminHospitalPayload{
 		HospitalID: req.HospitalID, RequestID: reqID,
 	})
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital deleted successfully"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital and associated MDs/receptionists deleted"})
 }
 
 // -------------------------
@@ -1613,11 +1634,46 @@ func (h *AdminHandler) HandleDeleteHospitalMD(w http.ResponseWriter, r *http.Req
 	if !response.Validate(w, &req) {
 		return
 	}
-	if err := h.AuthStore.DeleteHospitalMD(r.Context(), req.ID); err != nil {
-		response.Error(w, "Delete failed", http.StatusInternalServerError)
+	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), req.ID)
+	if err != nil || md == nil {
+		response.Error(w, "MD not found", http.StatusNotFound)
 		return
 	}
+	hospitalID := ""
+	if md.HospitalID != nil {
+		hospitalID = *md.HospitalID
+	}
+	// Revoke MD session first
 	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), req.ID, "deleted")
+	_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), req.ID)
+
+	// If MD linked to hospital, delete hospital and all receptionists/MDs of that hospital
+	if hospitalID != "" && ids.IsValid(hospitalID) {
+		// Capture MDs and receptionists before hospital delete (FK SET NULL would hide them)
+		mds, _ := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), hospitalID)
+		receps, _ := h.AuthStore.ListReceptionistsByHospital(r.Context(), hospitalID)
+		for _, rc := range receps {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), rc.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalReceptionistJWT(r.Context(), rc.ID)
+		}
+		for _, m := range mds {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), m.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), m.ID)
+		}
+		// Delete hospital (cascades receptionists via FK, MDs stay with SET NULL so explicit delete next)
+		_ = h.HospitalStore.DeleteHospital(r.Context(), hospitalID)
+		for _, m := range mds {
+			_ = h.AuthStore.DeleteHospitalMD(r.Context(), m.ID)
+		}
+		// Ensure requested MD deleted even if not in list (e.g., list empty)
+		_ = h.AuthStore.DeleteHospitalMD(r.Context(), req.ID)
+	} else {
+		// No hospital linked — just delete MD
+		if err := h.AuthStore.DeleteHospitalMD(r.Context(), req.ID); err != nil {
+			response.Error(w, "Delete failed", http.StatusInternalServerError)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "MD login deleted, hospital retained"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "MD, hospital and receptionists deleted"})
 }

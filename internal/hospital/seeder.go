@@ -126,6 +126,20 @@ func (s *Seeder) fetchPaginated(ctx context.Context, query string, city admin.Ho
 	return all, nil
 }
 
+// SeedCity seeds a single city (force, used by per-area sync). Returns changed count.
+func (s *Seeder) SeedCity(ctx context.Context, city admin.HospitalCity) (int, error) {
+	n, err := s.seedCity(ctx, city)
+	if err != nil {
+		return n, err
+	}
+	if n > 0 {
+		if err := s.Counters.IncrementCounter(ctx, "hospitals"); err != nil {
+			logger.Log.Error().Err(err).Msg("Failed to bump hospitals counter after city seed")
+		}
+	}
+	return n, nil
+}
+
 func (s *Seeder) seedCity(ctx context.Context, city admin.HospitalCity) (int, error) {
 	cap := clampCap(city.MaxPerCategory)
 

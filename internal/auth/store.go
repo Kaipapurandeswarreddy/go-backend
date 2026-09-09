@@ -1476,6 +1476,37 @@ func (s *Store) ListHospitalMDs(ctx context.Context) ([]HospitalMD, error) {
 	return list, nil
 }
 
+func (s *Store) ListHospitalMDsByHospitalID(ctx context.Context, hospitalID string) ([]HospitalMD, error) {
+	if !ids.IsValid(hospitalID) {
+		return nil, fmt.Errorf("invalid hospital id: %s", hospitalID)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds WHERE hospital_id=$1::uuid`, hospitalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []HospitalMD
+	for rows.Next() {
+		var md HospitalMD
+		var id, hpID, hID, username, pwHash, jwtToken, fcmToken *string
+		if err := rows.Scan(&id, &hpID, &hID, &md.Name, &md.Email, &md.Mobile, &md.OfficialNumber, &username, &pwHash, &md.Status, &jwtToken, &fcmToken, &md.CreatedAt); err != nil {
+			return nil, err
+		}
+		md.ID = *id
+		md.HospitalPendingID = hpID
+		md.HospitalID = hID
+		md.Username = username
+		md.PasswordHash = pwHash
+		md.JWTToken = jwtToken
+		md.FCMToken = fcmToken
+		list = append(list, md)
+	}
+	if list == nil {
+		list = []HospitalMD{}
+	}
+	return list, nil
+}
+
 func (s *Store) BanHospitalMD(ctx context.Context, id string) error {
 	if !ids.IsValid(id) {
 		return fmt.Errorf("invalid id: %s", id)
