@@ -134,8 +134,10 @@ func main() {
 		ambTypeNames[t.ID] = t.Name
 	}
 	matcher := dispatch.NewMatcher(locationStore, routeClient, ambTypeNames)
+	matcher.SetHospitalDeps(adminStore, authStore)
 	dispatcher := dispatch.NewDispatcher(matcher, rideStore, eventBus, wsManager)
 	dispatcher.StartStaleRideCleanup()
+	wsManager.SetSafetyDeps(rideStore, adminStore, ambTypeNames)
 
 	// Set Google Translate API URL (used by package-level var)
 	translation.TranslateAPIURL = appConfig.GoogleTranslateAPIURL
@@ -159,6 +161,7 @@ func main() {
 	}
 
 	authHandler := handlers.NewAuthHandler(authStore, eventBus, appConfig.JWTSecret, smsCfg, appConfig.AllowStaleRefreshChain, referralService)
+	authHandler.SetMDStore(adminStore)
 	profileHandler := handlers.NewProfileHandler(authStore)
 	verificationHandler := handlers.NewVerificationHandler(authStore, storageService)
 	mediaHandler := handlers.NewMediaHandler(storageService, appConfig.JWTSecret)
@@ -175,13 +178,16 @@ func main() {
 	walletHandler := handlers.NewWalletHandler(authStore, eventBus, walletStore, zwitchService)
 	feedbackHandler := handlers.NewFeedbackHandler(feedbackStore)
 	referralHandler := handlers.NewReferralHandler(referralStore, referralService)
+	mdAmbulanceHandler := handlers.NewMDAmbulanceHandler(adminStore, authStore, eventBus)
 
 	// V16: Audit persistence (Postgres, TTL 30d via periodic DELETE)
 	auditStore := admin.NewAuditStore(pool)
 
 	// Subscribe EventBus Subscribers
 	websocket.NewWSNotifier(wsManager).SubscribeTo(eventBus)
-	eventbus.NewFCMNotifier(fcmClient, authStore).SubscribeTo(eventBus)
+	fcmNotifier := eventbus.NewFCMNotifier(fcmClient, authStore)
+	fcmNotifier.SetAdminStore(adminStore)
+	fcmNotifier.SubscribeTo(eventBus)
 	eventbus.NewMetricsCollector().SubscribeTo(eventBus)
 	eventbus.NewCacheInvalidator(counterStore).SubscribeTo(eventBus)
 	eventbus.NewAuditLogger(auditStore).SubscribeTo(eventBus)
@@ -463,6 +469,11 @@ func main() {
 	mux.Handle("POST /api/v2/hospital/profile", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalProfile)))
 	mux.Handle("POST /api/v2/hospital/profile/update", requireHospitalMD(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateHospitalProfile)))
 	mux.Handle("POST /api/v2/hospital/analytics", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalAnalytics)))
+	// MD ambulances: Add Ambulance module (MD-scoped by hospital_id).
+	mux.Handle("POST /api/v2/hospital/ambulances/create", requireHospitalMD(http.HandlerFunc(mdAmbulanceHandler.HandleCreateAmbulance)))
+	mux.Handle("POST /api/v2/hospital/ambulances/list", requireHospitalMD(http.HandlerFunc(mdAmbulanceHandler.HandleListAmbulances)))
+	mux.Handle("POST /api/v2/hospital/ambulances/numbers/add", requireHospitalMD(http.HandlerFunc(mdAmbulanceHandler.HandleAddNumber)))
+	mux.Handle("POST /api/v2/hospital/ambulances/numbers/active", requireHospitalMD(http.HandlerFunc(mdAmbulanceHandler.HandleSetNumberActive)))
 	// In-ride patient condition update (ALS/BLS/Emergency/SOS) — user or attendant
 	mux.Handle("POST /api/v2/rides/condition", requireUserOrAttendant(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateRideCondition)))
 	mux.Handle("POST /api/v2/rides/{id}/condition", requireUserOrAttendant(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateRideCondition)))

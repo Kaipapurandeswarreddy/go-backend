@@ -25,6 +25,8 @@ func (n *WSNotifier) SubscribeTo(bus *eventbus.InMemoryBus) {
 	bus.Subscribe(eventbus.ChannelRideCancelled, n.handleRideCancelled)
 	bus.Subscribe(eventbus.ChannelDriverLocationUpdate, n.handleDriverLocationUpdate)
 	bus.Subscribe(eventbus.ChannelAuthSessionReplaced, n.handleSessionReplaced)
+	bus.Subscribe(eventbus.ChannelSafetyStoppedWarn, n.handleSafetyStoppedWarn)
+	bus.Subscribe(eventbus.ChannelSafetyStoppedAlarm, n.handleSafetyStoppedAlarm)
 }
 
 // handleSessionReplaced records the replacing session and kicks every live
@@ -140,4 +142,40 @@ func (n *WSNotifier) handleDriverLocationUpdate(payload []byte) {
 	n.wsManager.SendToRideWatchers(p.RideID, "LOCATION_UPDATE", map[string]float64{
 		"lat": p.Lat, "lng": p.Lng,
 	})
+}
+
+// handleSafetyStoppedWarn nudges only the driver (stage 1, 3 min stopped).
+func (n *WSNotifier) handleSafetyStoppedWarn(payload []byte) {
+	var p eventbus.SafetyStoppedWarningPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "safety:stopped_warning").Msg("Unmarshal error")
+		return
+	}
+	n.wsManager.SendToClient("driver", p.DriverID, "STOPPED_WARNING", map[string]interface{}{
+		"ride_id":         p.RideID,
+		"stopped_minutes": p.StoppedMinutes,
+		"lat":             p.Lat,
+		"lng":             p.Lng,
+	})
+}
+
+// handleSafetyStoppedAlarm escalates (stage 2, 5 min): SOS_ALERT to watchers
+// and driver, plus broadcast to connected admin apps. FCM fan-out lives in FCMNotifier.
+func (n *WSNotifier) handleSafetyStoppedAlarm(payload []byte) {
+	var p eventbus.SafetyStoppedEmergencyPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "safety:stopped_emergency").Msg("Unmarshal error")
+		return
+	}
+	msg := map[string]interface{}{
+		"ride_id":         p.RideID,
+		"driver_id":       p.DriverID,
+		"reason":          "stopped_vehicle",
+		"stopped_minutes": p.StoppedMinutes,
+		"lat":             p.Lat,
+		"lng":             p.Lng,
+	}
+	n.wsManager.SendToRideWatchers(p.RideID, EventSOSAlert, msg)
+	n.wsManager.SendToClient("driver", p.DriverID, EventSOSAlert, msg)
+	n.wsManager.BroadcastToRole("admin", EventSOSAlert, msg)
 }

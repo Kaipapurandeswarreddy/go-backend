@@ -606,6 +606,12 @@ func (h *AdminHandler) HandleAcceptDriver(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Backfill MD ambulance relation: resolve the single active link by mobile.
+	// Public drivers (zero links) keep md_ambulance_id NULL.
+	if link, err := h.Store.ActiveMDAmbulanceForMobile(r.Context(), driver.Mobile); err == nil && link != nil {
+		_ = h.AuthStore.SetDriverMDAmbulanceID(r.Context(), driver.ID, link.AmbulanceID)
+	}
+
 	// Revoke old refresh tokens so the driver must re-login with role "driver"
 	if _, revokeErr := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driver.ID, "driver_approved"); revokeErr != nil {
 		logger.Log.Error().Err(revokeErr).Str("driver_id", driver.ID).Msg("Failed to revoke driver refresh tokens after approval")
@@ -1472,7 +1478,9 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 		response.Error(w, "Already processed", http.StatusBadRequest)
 		return
 	}
-	// Create active hospital from pending details
+	// Create active hospital from pending details. If the same building already
+	// exists nearby (e.g. Google-seeded row), merge into it instead of
+	// duplicating: MD links attach to one row so dispatch priority can't miss.
 	hType := admin.ClassifyHospitalType(pending.Name, nil)
 	hospital := admin.Hospital{
 		Name:         translation.Map{"en_US": pending.Name},
@@ -1491,9 +1499,44 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 		hospital.Location = *pending.Location
 		hospital.H3Cells = admin.BuildH3Cells(pending.Location.Coordinates[0], pending.Location.Coordinates[1])
 	}
-	if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
-		response.Error(w, "Failed to create hospital", http.StatusInternalServerError)
-		return
+	merged := false
+	if len(hospital.Location.Coordinates) == 2 && !(hospital.Location.Coordinates[0] == 0 && hospital.Location.Coordinates[1] == 0) {
+		if nearby, err := h.HospitalStore.FindNearby(r.Context(), hospital.Location.Coordinates[0], hospital.Location.Coordinates[1], admin.DuplicateMergeRadiusKm); err == nil {
+			if target := admin.PickMergeTarget(nearby, pending.Name); target != nil {
+				// Survivor keeps its identity (esp. Google place_id so future
+				// seeds find it); MD-curated fields win, blanks filled.
+				if target.Name == nil {
+					target.Name = translation.Map{"en_US": pending.Name}
+				}
+				if target.Address == nil {
+					target.Address = translation.Map{"en_US": pending.Address}
+				}
+				if len(target.Location.Coordinates) == 0 {
+					target.Location = hospital.Location
+				}
+				if len(target.H3Cells) == 0 {
+					target.H3Cells = hospital.H3Cells
+				}
+				if target.Services == nil {
+					target.Services = []string{}
+				}
+				target.HospitalType = hType
+				target.Category = admin.HospitalCategoryFromType(hType)
+				target.TypeLocked = true
+				if err := h.HospitalStore.UpdateHospital(r.Context(), target); err != nil {
+					response.Error(w, "Failed to merge hospital", http.StatusInternalServerError)
+					return
+				}
+				hospital = *target
+				merged = true
+			}
+		}
+	}
+	if !merged {
+		if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
+			response.Error(w, "Failed to create hospital", http.StatusInternalServerError)
+			return
+		}
 	}
 	_ = h.CounterStore.IncrementCounter(r.Context(), "hospitals")
 	// Update pending status

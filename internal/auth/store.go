@@ -859,6 +859,58 @@ func (s *Store) UpdateUnverifiedDriverFCM(ctx context.Context, id string, token 
 	return err
 }
 
+// SetDriverMDAmbulanceID records the effective MD ambulance for a verified driver.
+// Pass "" to clear (unlinked). Column lives outside scanDriverRow so old queries keep working.
+func (s *Store) SetDriverMDAmbulanceID(ctx context.Context, driverID, ambulanceID string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	if ambulanceID == "" {
+		_, err := s.pool.Exec(ctx, `UPDATE drivers SET md_ambulance_id=NULL WHERE id=$1::uuid`, driverID)
+		return err
+	}
+	if !ids.IsValid(ambulanceID) {
+		return fmt.Errorf("invalid ambulance id: %s", ambulanceID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET md_ambulance_id=$2::uuid WHERE id=$1::uuid`, driverID, ambulanceID)
+	return err
+}
+
+// GetDriverMDAmbulanceID fetches the stored effective ambulance for a driver.
+func (s *Store) GetDriverMDAmbulanceID(ctx context.Context, driverID string) (*string, error) {
+	if !ids.IsValid(driverID) {
+		return nil, fmt.Errorf("invalid id: %s", driverID)
+	}
+	var v *string
+	err := s.pool.QueryRow(ctx, `SELECT md_ambulance_id::text FROM drivers WHERE id=$1::uuid`, driverID).Scan(&v)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return v, nil
+}
+
+// FindDriverIDsByMobiles maps mobiles to verified driver IDs, skipping
+// mobiles with no verified driver row. Used for hospital-first dispatch.
+func (s *Store) FindDriverIDsByMobiles(ctx context.Context, mobiles []string) (map[string]string, error) {
+	out := make(map[string]string, len(mobiles))
+	for _, m := range mobiles {
+		if m == "" {
+			continue
+		}
+		d, err := s.FindDriverByMobile(ctx, m)
+		if err != nil {
+			return nil, err
+		}
+		if d != nil {
+			out[m] = d.ID
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) UpdateUnverifiedDriver(ctx context.Context, driver *UnverifiedDriver) error {
 	if !ids.IsValid(driver.ID) {
 		return fmt.Errorf("invalid id: %s", driver.ID)

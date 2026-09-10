@@ -229,6 +229,44 @@ func (s *Seeder) seedCity(ctx context.Context, city admin.HospitalCity) (int, er
 				continue
 			}
 
+			// No place_id match: the same building may exist as an MD-approved
+			// row (empty place_id, real coordinates). Merge into it instead of
+			// inserting a duplicate so MD links and dispatch priority survive.
+			if nearby, nerr := s.Hospitals.FindNearby(ctx, p.Lng, p.Lat, admin.DuplicateMergeRadiusKm); nerr == nil {
+				adminOnly := nearby[:0]
+				for _, h := range nearby {
+					if h.PlaceID == "" {
+						adminOnly = append(adminOnly, h)
+					}
+				}
+				if target := admin.PickMergeTarget(adminOnly, p.DisplayName); target != nil {
+					target.PlaceID = p.ID
+					target.GoogleTypes = p.Types
+					target.FetchedAt = time.Now()
+					if target.Name == nil {
+						target.Name = translation.Map{"en_US": p.DisplayName}
+					}
+					if target.Address == nil {
+						target.Address = translation.Map{"en_US": p.FormattedAddr}
+					}
+					if len(target.Location.Coordinates) == 0 {
+						target.Location = admin.GeoJSON{Type: "Point", Coordinates: []float64{p.Lng, p.Lat}}
+					}
+					if len(target.H3Cells) == 0 {
+						target.H3Cells = admin.BuildH3Cells(p.Lng, p.Lat)
+					}
+					if target.Services == nil {
+						target.Services = []string{}
+					}
+					// Keep the curated type/category (MD rows are type-locked).
+					if uerr := s.Hospitals.UpdateHospital(ctx, target); uerr != nil {
+						return uerr
+					}
+					changed++
+					continue
+				}
+			}
+
 			doc := &admin.Hospital{
 				Name:         translation.Map{"en_US": p.DisplayName},
 				Address:      translation.Map{"en_US": p.FormattedAddr},
