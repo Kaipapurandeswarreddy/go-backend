@@ -29,6 +29,8 @@ const (
 	ChannelAdminOfferDeleted    = "admin:offer_deleted"
 	ChannelAdminDriverRejected = "admin:driver_rejected"
 	ChannelReferralCredited    = "referral:credited"
+	ChannelSafetyStoppedWarn  = "safety:stopped_warning"
+	ChannelSafetyStoppedAlarm = "safety:stopped_emergency"
 )
 
 // RideRequestedPayload is published when a user requests a ride
@@ -238,4 +240,31 @@ type ReferralCreditedPayload struct {
 	Amount        float64 `json:"amount"`
 	Reason        string  `json:"reason"` // "signup_referral", "ride_threshold_met", "welcome_bonus"
 	RequestID     string  `json:"request_id,omitempty"`
+}
+
+// SafetyStoppedWarningPayload is published when a normal IN_PROGRESS ride
+// (excluding auto/bike/cab) stays within the move threshold for 3 minutes.
+// Stage 1: nudge the driver only.
+type SafetyStoppedWarningPayload struct {
+	RideID         string  `json:"ride_id"`
+	DriverID       string  `json:"driver_id"`
+	UserID         string  `json:"user_id,omitempty"`
+	Lat            float64 `json:"lat"`
+	Lng            float64 `json:"lng"`
+	StoppedMinutes int     `json:"stopped_minutes"`
+	AmbType        string  `json:"amb_type,omitempty"`
+	RequestID      string  `json:"request_id,omitempty"`
+}
+
+// SafetyStoppedEmergencyPayload is published when the same stop reaches
+// 5 minutes total. Stage 2: emergency flag is escalated and admins are notified.
+type SafetyStoppedEmergencyPayload struct {
+	RideID         string  `json:"ride_id"`
+	DriverID       string  `json:"driver_id"`
+	UserID         string  `json:"user_id,omitempty"`
+	Lat            float64 `json:"lat"`
+	Lng            float64 `json:"lng"`
+	StoppedMinutes int     `json:"stopped_minutes"`
+	AmbType        string  `json:"amb_type,omitempty"`
+	RequestID      string  `json:"request_id,omitempty"`
 }

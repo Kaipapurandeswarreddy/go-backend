@@ -9,6 +9,7 @@ import (
 
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
+	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/ids"
@@ -26,6 +27,7 @@ type AuthHandler struct {
 	SMSCfg                 auth.SMSCountryConfig
 	AllowStaleRefreshChain bool
 	ReferralService        *referral.Service
+	MDStore                *admin.Store
 }
 
 func NewAuthHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, jwtSecret string, smsCfg auth.SMSCountryConfig, allowStaleRefreshChain bool, referralService *referral.Service) *AuthHandler {
@@ -37,6 +39,24 @@ func NewAuthHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, jwtSe
 		AllowStaleRefreshChain: allowStaleRefreshChain,
 		ReferralService:        referralService,
 	}
+}
+
+// SetMDStore wires MD ambulance link checks (nil-safe when unset, e.g. tests).
+func (h *AuthHandler) SetMDStore(store *admin.Store) {
+	h.MDStore = store
+}
+
+// blockedByMD reports whether an MD-linked mobile has no active link.
+// Public mobiles (zero links) or unset store are never blocked.
+func (h *AuthHandler) blockedByMD(ctx context.Context, mobile string) bool {
+	if h.MDStore == nil || mobile == "" {
+		return false
+	}
+	blocked, err := h.MDStore.IsMobileBlockedByMD(ctx, mobile)
+	if err != nil {
+		return false
+	}
+	return blocked
 }
 
 type otpPayload struct {
@@ -237,6 +257,12 @@ func (h *AuthHandler) HandleDriverRequestOTP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// MD-linked mobiles need an active ambulance link; public mobiles bypass.
+	if h.blockedByMD(r.Context(), payload.Mobile) {
+		response.Error(w, "Ambulance deactivated by hospital", http.StatusForbidden)
+		return
+	}
+
 	locked, err := h.AuthStore.IsOTPLocked(r.Context(), payload.Mobile)
 	if err != nil {
 		response.Error(w, "Internal error", http.StatusInternalServerError)
@@ -279,6 +305,12 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 
 	if !mobileRegex.MatchString(payload.Mobile) {
 		response.Error(w, "Invalid mobile number", http.StatusBadRequest)
+		return
+	}
+
+	// MD-linked mobiles need an active ambulance link; public mobiles bypass.
+	if h.blockedByMD(r.Context(), payload.Mobile) {
+		response.Error(w, "Ambulance deactivated by hospital", http.StatusForbidden)
 		return
 	}
 

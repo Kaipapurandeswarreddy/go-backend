@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/notification"
@@ -13,12 +14,18 @@ import (
 
 // FCMNotifier listens to ride events and sends FCM push notifications.
 type FCMNotifier struct {
-	fcmClient *notification.FCMClient
-	authStore *auth.Store
+	fcmClient  *notification.FCMClient
+	authStore  *auth.Store
+	adminStore *admin.Store
 }
 
 func NewFCMNotifier(fcmClient *notification.FCMClient, authStore *auth.Store) *FCMNotifier {
 	return &FCMNotifier{fcmClient: fcmClient, authStore: authStore}
+}
+
+// SetAdminStore wires admin tokens for stopped-vehicle escalation.
+func (n *FCMNotifier) SetAdminStore(adminStore *admin.Store) {
+	n.adminStore = adminStore
 }
 
 const fcmWorkerPoolSize = 10
@@ -32,6 +39,8 @@ func (n *FCMNotifier) SubscribeTo(bus *InMemoryBus) {
 	n.subscribeWithPool(bus, ChannelRideCancelled, n.handleRideCancelled)
 	n.subscribeWithPool(bus, ChannelAuthDriverApproved, n.handleDriverApproved)
 	n.subscribeWithPool(bus, ChannelReferralCredited, n.handleReferralCredited)
+	n.subscribeWithPool(bus, ChannelSafetyStoppedWarn, n.handleSafetyStoppedWarn)
+	n.subscribeWithPool(bus, ChannelSafetyStoppedAlarm, n.handleSafetyStoppedAlarm)
 }
 
 // subscribeWithPool creates a single shared channel via SubscribeWithChan and
@@ -398,5 +407,85 @@ func (n *FCMNotifier) handleReferralCredited(payload []byte) {
 
 	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
 		logger.Log.Error().Err(err).Str("recipient_id", p.RecipientID).Msg("Referral FCM push failed")
+	}
+}
+
+// handleSafetyStoppedWarn pushes the 3-minute nudge to the driver only,
+// reusing the driver-offer token lookup + data-message pattern.
+func (n *FCMNotifier) handleSafetyStoppedWarn(payload []byte) {
+	var p SafetyStoppedWarningPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "safety:stopped_warning").Msg("Unmarshal error")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	token, err := n.authStore.GetDriverFCMToken(ctx, p.DriverID)
+	if err != nil || token == nil || *token == "" {
+		return
+	}
+	data := map[string]string{
+		"type":            "STOPPED_WARNING",
+		"ride_id":         p.RideID,
+		"driver_id":       p.DriverID,
+		"stopped_minutes": fmt.Sprintf("%d", p.StoppedMinutes),
+		"lat":             fmt.Sprintf("%f", p.Lat),
+		"lng":             fmt.Sprintf("%f", p.Lng),
+		"title":           "Are you stopped?",
+		"body":            fmt.Sprintf("Ambulance stopped for %d min. Please confirm you are OK.", p.StoppedMinutes),
+	}
+	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Stopped-warning FCM push failed for driver")
+	}
+}
+
+// handleSafetyStoppedAlarm pushes the 5-minute escalation to driver, user,
+// and every active admin (same data-message shape as the driver offer path).
+func (n *FCMNotifier) handleSafetyStoppedAlarm(payload []byte) {
+	var p SafetyStoppedEmergencyPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "safety:stopped_emergency").Msg("Unmarshal error")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	base := map[string]string{
+		"type":            "STOPPED_EMERGENCY",
+		"ride_id":         p.RideID,
+		"driver_id":       p.DriverID,
+		"stopped_minutes": fmt.Sprintf("%d", p.StoppedMinutes),
+		"lat":             fmt.Sprintf("%f", p.Lat),
+		"lng":             fmt.Sprintf("%f", p.Lng),
+		"title":           "Stopped vehicle emergency",
+		"body":            fmt.Sprintf("Ambulance stopped for %d min on ride %s.", p.StoppedMinutes, p.RideID),
+		"is_sos":          "true",
+	}
+
+	if token, err := n.authStore.GetDriverFCMToken(ctx, p.DriverID); err == nil && token != nil && *token != "" {
+		if err := n.fcmClient.SendDataMessage(ctx, *token, base); err != nil {
+			logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Stopped-emergency FCM push failed for driver")
+		}
+	}
+	if p.UserID != "" {
+		if token, err := n.authStore.GetUserFCMToken(ctx, p.UserID); err == nil && token != nil && *token != "" {
+			if err := n.fcmClient.SendDataMessage(ctx, *token, base); err != nil {
+				logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("Stopped-emergency FCM push failed for user")
+			}
+		}
+	}
+	if n.adminStore == nil {
+		return
+	}
+	tokens, err := n.adminStore.ListActiveAdminFCMTokens(ctx)
+	if err != nil {
+		logger.Log.Error().Err(err).Msg("Stopped-emergency: failed to list admin FCM tokens")
+		return
+	}
+	for _, token := range tokens {
+		if err := n.fcmClient.SendDataMessage(ctx, token, base); err != nil {
+			logger.Log.Error().Err(err).Msg("Stopped-emergency FCM push failed for admin")
+		}
 	}
 }

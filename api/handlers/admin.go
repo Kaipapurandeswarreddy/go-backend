@@ -606,6 +606,12 @@ func (h *AdminHandler) HandleAcceptDriver(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Backfill MD ambulance relation: resolve the single active link by mobile.
+	// Public drivers (zero links) keep md_ambulance_id NULL.
+	if link, err := h.Store.ActiveMDAmbulanceForMobile(r.Context(), driver.Mobile); err == nil && link != nil {
+		_ = h.AuthStore.SetDriverMDAmbulanceID(r.Context(), driver.ID, link.AmbulanceID)
+	}
+
 	// Revoke old refresh tokens so the driver must re-login with role "driver"
 	if _, revokeErr := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driver.ID, "driver_approved"); revokeErr != nil {
 		logger.Log.Error().Err(revokeErr).Str("driver_id", driver.ID).Msg("Failed to revoke driver refresh tokens after approval")
@@ -1250,7 +1256,28 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Cascade: delete MDs and receptionists linked to this hospital (and revoke sessions)
+	if mds, err := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), req.HospitalID); err == nil {
+		for _, md := range mds {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), md.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), md.ID)
+		}
+	}
+	if receps, err := h.AuthStore.ListReceptionistsByHospital(r.Context(), req.HospitalID); err == nil {
+		for _, rc := range receps {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), rc.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalReceptionistJWT(r.Context(), rc.ID)
+		}
+	}
+	// Delete MDs explicitly before hospital (FK SET NULL, not CASCADE)
+	if mds, err := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), req.HospitalID); err == nil {
+		for _, md := range mds {
+			_ = h.AuthStore.DeleteHospitalMD(r.Context(), md.ID)
+		}
+	}
+
 	if err := h.HospitalStore.DeleteHospital(r.Context(), req.HospitalID); err != nil {
+		logger.Log.Error().Err(err).Str("hospital_id", req.HospitalID).Msg("Hospital delete failed")
 		response.Error(w, "Hospital delete failed", http.StatusBadRequest)
 		return
 	}
@@ -1258,7 +1285,7 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 	h.EventBus.PublishEvent(eventbus.ChannelAdminHospitalDeleted, eventbus.AdminHospitalPayload{
 		HospitalID: req.HospitalID, RequestID: reqID,
 	})
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital deleted successfully"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital and associated MDs/receptionists deleted"})
 }
 
 // -------------------------
@@ -1451,7 +1478,9 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 		response.Error(w, "Already processed", http.StatusBadRequest)
 		return
 	}
-	// Create active hospital from pending details
+	// Create active hospital from pending details. If the same building already
+	// exists nearby (e.g. Google-seeded row), merge into it instead of
+	// duplicating: MD links attach to one row so dispatch priority can't miss.
 	hType := admin.ClassifyHospitalType(pending.Name, nil)
 	hospital := admin.Hospital{
 		Name:         translation.Map{"en_US": pending.Name},
@@ -1470,9 +1499,44 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 		hospital.Location = *pending.Location
 		hospital.H3Cells = admin.BuildH3Cells(pending.Location.Coordinates[0], pending.Location.Coordinates[1])
 	}
-	if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
-		response.Error(w, "Failed to create hospital", http.StatusInternalServerError)
-		return
+	merged := false
+	if len(hospital.Location.Coordinates) == 2 && !(hospital.Location.Coordinates[0] == 0 && hospital.Location.Coordinates[1] == 0) {
+		if nearby, err := h.HospitalStore.FindNearby(r.Context(), hospital.Location.Coordinates[0], hospital.Location.Coordinates[1], admin.DuplicateMergeRadiusKm); err == nil {
+			if target := admin.PickMergeTarget(nearby, pending.Name); target != nil {
+				// Survivor keeps its identity (esp. Google place_id so future
+				// seeds find it); MD-curated fields win, blanks filled.
+				if target.Name == nil {
+					target.Name = translation.Map{"en_US": pending.Name}
+				}
+				if target.Address == nil {
+					target.Address = translation.Map{"en_US": pending.Address}
+				}
+				if len(target.Location.Coordinates) == 0 {
+					target.Location = hospital.Location
+				}
+				if len(target.H3Cells) == 0 {
+					target.H3Cells = hospital.H3Cells
+				}
+				if target.Services == nil {
+					target.Services = []string{}
+				}
+				target.HospitalType = hType
+				target.Category = admin.HospitalCategoryFromType(hType)
+				target.TypeLocked = true
+				if err := h.HospitalStore.UpdateHospital(r.Context(), target); err != nil {
+					response.Error(w, "Failed to merge hospital", http.StatusInternalServerError)
+					return
+				}
+				hospital = *target
+				merged = true
+			}
+		}
+	}
+	if !merged {
+		if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
+			response.Error(w, "Failed to create hospital", http.StatusInternalServerError)
+			return
+		}
 	}
 	_ = h.CounterStore.IncrementCounter(r.Context(), "hospitals")
 	// Update pending status
@@ -1613,11 +1677,46 @@ func (h *AdminHandler) HandleDeleteHospitalMD(w http.ResponseWriter, r *http.Req
 	if !response.Validate(w, &req) {
 		return
 	}
-	if err := h.AuthStore.DeleteHospitalMD(r.Context(), req.ID); err != nil {
-		response.Error(w, "Delete failed", http.StatusInternalServerError)
+	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), req.ID)
+	if err != nil || md == nil {
+		response.Error(w, "MD not found", http.StatusNotFound)
 		return
 	}
+	hospitalID := ""
+	if md.HospitalID != nil {
+		hospitalID = *md.HospitalID
+	}
+	// Revoke MD session first
 	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), req.ID, "deleted")
+	_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), req.ID)
+
+	// If MD linked to hospital, delete hospital and all receptionists/MDs of that hospital
+	if hospitalID != "" && ids.IsValid(hospitalID) {
+		// Capture MDs and receptionists before hospital delete (FK SET NULL would hide them)
+		mds, _ := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), hospitalID)
+		receps, _ := h.AuthStore.ListReceptionistsByHospital(r.Context(), hospitalID)
+		for _, rc := range receps {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), rc.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalReceptionistJWT(r.Context(), rc.ID)
+		}
+		for _, m := range mds {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), m.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), m.ID)
+		}
+		// Delete hospital (cascades receptionists via FK, MDs stay with SET NULL so explicit delete next)
+		_ = h.HospitalStore.DeleteHospital(r.Context(), hospitalID)
+		for _, m := range mds {
+			_ = h.AuthStore.DeleteHospitalMD(r.Context(), m.ID)
+		}
+		// Ensure requested MD deleted even if not in list (e.g., list empty)
+		_ = h.AuthStore.DeleteHospitalMD(r.Context(), req.ID)
+	} else {
+		// No hospital linked — just delete MD
+		if err := h.AuthStore.DeleteHospitalMD(r.Context(), req.ID); err != nil {
+			response.Error(w, "Delete failed", http.StatusInternalServerError)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "MD login deleted, hospital retained"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "MD, hospital and receptionists deleted"})
 }

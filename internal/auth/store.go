@@ -859,6 +859,58 @@ func (s *Store) UpdateUnverifiedDriverFCM(ctx context.Context, id string, token 
 	return err
 }
 
+// SetDriverMDAmbulanceID records the effective MD ambulance for a verified driver.
+// Pass "" to clear (unlinked). Column lives outside scanDriverRow so old queries keep working.
+func (s *Store) SetDriverMDAmbulanceID(ctx context.Context, driverID, ambulanceID string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	if ambulanceID == "" {
+		_, err := s.pool.Exec(ctx, `UPDATE drivers SET md_ambulance_id=NULL WHERE id=$1::uuid`, driverID)
+		return err
+	}
+	if !ids.IsValid(ambulanceID) {
+		return fmt.Errorf("invalid ambulance id: %s", ambulanceID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET md_ambulance_id=$2::uuid WHERE id=$1::uuid`, driverID, ambulanceID)
+	return err
+}
+
+// GetDriverMDAmbulanceID fetches the stored effective ambulance for a driver.
+func (s *Store) GetDriverMDAmbulanceID(ctx context.Context, driverID string) (*string, error) {
+	if !ids.IsValid(driverID) {
+		return nil, fmt.Errorf("invalid id: %s", driverID)
+	}
+	var v *string
+	err := s.pool.QueryRow(ctx, `SELECT md_ambulance_id::text FROM drivers WHERE id=$1::uuid`, driverID).Scan(&v)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return v, nil
+}
+
+// FindDriverIDsByMobiles maps mobiles to verified driver IDs, skipping
+// mobiles with no verified driver row. Used for hospital-first dispatch.
+func (s *Store) FindDriverIDsByMobiles(ctx context.Context, mobiles []string) (map[string]string, error) {
+	out := make(map[string]string, len(mobiles))
+	for _, m := range mobiles {
+		if m == "" {
+			continue
+		}
+		d, err := s.FindDriverByMobile(ctx, m)
+		if err != nil {
+			return nil, err
+		}
+		if d != nil {
+			out[m] = d.ID
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) UpdateUnverifiedDriver(ctx context.Context, driver *UnverifiedDriver) error {
 	if !ids.IsValid(driver.ID) {
 		return fmt.Errorf("invalid id: %s", driver.ID)
@@ -1450,6 +1502,37 @@ func (s *Store) SetHospitalMDHospitalID(ctx context.Context, mdID string, hospit
 
 func (s *Store) ListHospitalMDs(ctx context.Context) ([]HospitalMD, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []HospitalMD
+	for rows.Next() {
+		var md HospitalMD
+		var id, hpID, hID, username, pwHash, jwtToken, fcmToken *string
+		if err := rows.Scan(&id, &hpID, &hID, &md.Name, &md.Email, &md.Mobile, &md.OfficialNumber, &username, &pwHash, &md.Status, &jwtToken, &fcmToken, &md.CreatedAt); err != nil {
+			return nil, err
+		}
+		md.ID = *id
+		md.HospitalPendingID = hpID
+		md.HospitalID = hID
+		md.Username = username
+		md.PasswordHash = pwHash
+		md.JWTToken = jwtToken
+		md.FCMToken = fcmToken
+		list = append(list, md)
+	}
+	if list == nil {
+		list = []HospitalMD{}
+	}
+	return list, nil
+}
+
+func (s *Store) ListHospitalMDsByHospitalID(ctx context.Context, hospitalID string) ([]HospitalMD, error) {
+	if !ids.IsValid(hospitalID) {
+		return nil, fmt.Errorf("invalid hospital id: %s", hospitalID)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds WHERE hospital_id=$1::uuid`, hospitalID)
 	if err != nil {
 		return nil, err
 	}

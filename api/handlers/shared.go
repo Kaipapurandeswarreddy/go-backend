@@ -207,8 +207,43 @@ func haversineKm(lat1, lng1, lat2, lng2 float64) float64 {
 	return R * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }
 
-// HandleSyncHospitals forces a Google re-seed of all configured cities (admin
-// triggered). Bypasses MaxCacheAge to allow immediate re-seed after radius/cap changes.
+// HandleSyncHospitalCity forces a Google re-seed of a single city (per-area sync).
+// Replaces global Sync All to avoid timeout (per-area ~6s vs N*6s).
+func (h *SharedHandler) HandleSyncHospitalCity(w http.ResponseWriter, r *http.Request) {
+	if h.Seeder == nil || h.Seeder.Cities == nil {
+		response.Error(w, "Hospital seeding not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		ID string `json:"id" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	city, err := h.Seeder.Cities.GetByID(r.Context(), req.ID)
+	if err != nil {
+		response.Error(w, "Failed to fetch city", http.StatusInternalServerError)
+		return
+	}
+	if city == nil {
+		response.Error(w, "Service area not found", http.StatusNotFound)
+		return
+	}
+	if !city.Enabled {
+		response.Error(w, "Service area disabled", http.StatusBadRequest)
+		return
+	}
+	n, err := h.Seeder.SeedCity(r.Context(), *city)
+	if err != nil {
+		response.Error(w, "Hospital sync failed", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"detail": "City synced", "changed": n, "city_id": city.ID})
+}
+
+// HandleSyncHospitals kept for backwards compat but not routed (per-area is primary).
 func (h *SharedHandler) HandleSyncHospitals(w http.ResponseWriter, r *http.Request) {
 	if h.Seeder == nil {
 		response.Error(w, "Hospital seeding not configured", http.StatusServiceUnavailable)

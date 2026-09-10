@@ -53,6 +53,8 @@ type Driver struct {
 	JWTToken           *string        `db:"jwt_token" json:"jwt_token,omitempty"`
 	LastLocationUpdate *time.Time     `db:"last_location_update" json:"last_location_update,omitempty"`
 	Details            *DriverDetails `db:"details" json:"details,omitempty"`
+	// MDAmbulanceID is the effective MD ambulance (resolved live by mobile).
+	MDAmbulanceID *string `db:"md_ambulance_id" json:"md_ambulance_id,omitempty"`
 }
 
 type UnverifiedDriver struct {
