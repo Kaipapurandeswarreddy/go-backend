@@ -431,6 +431,7 @@ func main() {
 	mux.Handle("POST /api/v2/admin/hospital/cities/update", requireAdmin(http.HandlerFunc(adminHandler.HandleUpdateHospitalCity)))
 	mux.Handle("POST /api/v2/admin/hospital/cities/delete", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteHospitalCity)))
 	mux.Handle("POST /api/v2/admin/hospital/city/sync", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitalCity)))
+	mux.Handle("POST /api/v2/admin/hospital/city/sync/status", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitalCityStatus)))
 	// Hospital MD (public signup + OTP)
 	mux.HandleFunc("POST /api/v2/hospital/md/request-otp", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDRequestOTP, otpIPLimiter))
 	mux.HandleFunc("POST /api/v2/hospital/md/login/request-otp", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDLoginRequestOTP, otpIPLimiter))

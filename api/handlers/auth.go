@@ -73,6 +73,7 @@ type verifyPayload struct {
 	ReferralCode string `json:"referral_code,omitempty"`
 	DeviceID     string `json:"device_id,omitempty"`
 	DeviceName   string `json:"device_name,omitempty"`
+	FCMToken     string `json:"fcm_token,omitempty"`
 }
 
 func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +227,8 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
+	// Session-scoped push token for the single-session kill-switch.
+	_ = h.AuthStore.SetSessionFCMToken(r.Context(), user.ID, sessionID, payload.FCMToken)
 
 	h.AuthStore.UpdateUserJWT(r.Context(), user.ID, accessToken)
 
@@ -408,6 +411,8 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
+	// Session-scoped push token for the single-session kill-switch.
+	_ = h.AuthStore.SetSessionFCMToken(r.Context(), driverID, sessionID, payload.FCMToken)
 
 	if role == "driver" {
 		h.AuthStore.UpdateDriverJWT(r.Context(), driverID, accessToken)
@@ -441,6 +446,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 		RefreshToken string `json:"refresh_token"`
 		DeviceID     string `json:"device_id,omitempty"`
 		DeviceName   string `json:"device_name,omitempty"`
+		FCMToken     string `json:"fcm_token,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.RefreshToken == "" {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
@@ -462,6 +468,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 	if !tokenDoc.Revoked && time.Now().Before(tokenDoc.ExpiresAt) {
 		newRT, newTokenStr, err := h.AuthStore.RotateById(r.Context(), tokenDoc, payload.DeviceID, payload.DeviceName)
 		if err == nil {
+			_ = h.AuthStore.SetSessionFCMToken(r.Context(), newRT.UserID, newRT.SessionID, payload.FCMToken)
 			newAccessToken, err := h.generateAccessTokenForRole(r.Context(), newRT)
 			if err != nil {
 				response.Error(w, "Failed to generate token", http.StatusInternalServerError)
@@ -502,6 +509,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 			// Found live token deeper in the chain — rotate it to issue a new string
 			newRT, newTokenStr, err := h.AuthStore.RotateById(r.Context(), liveToken, payload.DeviceID, payload.DeviceName)
 			if err == nil {
+				_ = h.AuthStore.SetSessionFCMToken(r.Context(), newRT.UserID, newRT.SessionID, payload.FCMToken)
 				newAccessToken, err := h.generateAccessTokenForRole(r.Context(), newRT)
 				if err != nil {
 					response.Error(w, "Failed to generate token", http.StatusInternalServerError)

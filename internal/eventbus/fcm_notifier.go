@@ -39,6 +39,7 @@ func (n *FCMNotifier) SubscribeTo(bus *InMemoryBus) {
 	n.subscribeWithPool(bus, ChannelRideCancelled, n.handleRideCancelled)
 	n.subscribeWithPool(bus, ChannelAuthDriverApproved, n.handleDriverApproved)
 	n.subscribeWithPool(bus, ChannelReferralCredited, n.handleReferralCredited)
+	n.subscribeWithPool(bus, ChannelAuthSessionReplaced, n.handleSessionReplaced)
 	n.subscribeWithPool(bus, ChannelSafetyStoppedWarn, n.handleSafetyStoppedWarn)
 	n.subscribeWithPool(bus, ChannelSafetyStoppedAlarm, n.handleSafetyStoppedAlarm)
 }
@@ -98,21 +99,21 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 	}
 
 	data := map[string]string{
-		"type":            "RIDE_OFFERED",
-		"ride_id":         p.RideID,
-		"distance":        fmt.Sprintf("%.1f", p.TripDistanceKm),
-		"distance_km":     fmt.Sprintf("%.2f", p.TripDistanceKm),
-		"cost":            fmt.Sprintf("%.0f", p.DriverShare),
-		"fare":            fmt.Sprintf("%.2f", p.Fare),
-		"driver_share":    fmt.Sprintf("%.2f", p.DriverShare),
-		"pickup_lat":      fmt.Sprintf("%f", p.PickupLat),
-		"pickup_lng":      fmt.Sprintf("%f", p.PickupLng),
-		"pickup_address":  p.PickupAddress,
-		"dropoff_lat":     fmt.Sprintf("%f", p.DropoffLat),
-		"dropoff_lng":     fmt.Sprintf("%f", p.DropoffLng),
-		"drop_address":    p.DropAddress,
-		"payment_mode":    p.PaymentMode,
-		"body":            fmt.Sprintf("%.1f km · ₹%.0f", p.TripDistanceKm, p.DriverShare),
+		"type":           "RIDE_OFFERED",
+		"ride_id":        p.RideID,
+		"distance":       fmt.Sprintf("%.1f", p.TripDistanceKm),
+		"distance_km":    fmt.Sprintf("%.2f", p.TripDistanceKm),
+		"cost":           fmt.Sprintf("%.0f", p.DriverShare),
+		"fare":           fmt.Sprintf("%.2f", p.Fare),
+		"driver_share":   fmt.Sprintf("%.2f", p.DriverShare),
+		"pickup_lat":     fmt.Sprintf("%f", p.PickupLat),
+		"pickup_lng":     fmt.Sprintf("%f", p.PickupLng),
+		"pickup_address": p.PickupAddress,
+		"dropoff_lat":    fmt.Sprintf("%f", p.DropoffLat),
+		"dropoff_lng":    fmt.Sprintf("%f", p.DropoffLng),
+		"drop_address":   p.DropAddress,
+		"payment_mode":   p.PaymentMode,
+		"body":           fmt.Sprintf("%.1f km · ₹%.0f", p.TripDistanceKm, p.DriverShare),
 	}
 	if p.IsSOS {
 		data["title"] = "EMERGENCY ALERT"
@@ -320,6 +321,40 @@ func (n *FCMNotifier) handleRideCancelled(payload []byte) {
 		}
 		if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
 			logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("No drivers FCM push failed for user")
+		}
+	}
+}
+
+// handleSessionReplaced pushes the single-session kill-switch: every
+// superseded device's session token gets a SESSION_REVOKED data push, which
+// reaches the old phone in seconds even with no socket open or the app killed.
+func (n *FCMNotifier) handleSessionReplaced(payload []byte) {
+	var p AuthSessionReplacedPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "auth:session_replaced").Msg("Unmarshal error")
+		return
+	}
+	if p.UserID == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tokens, err := n.authStore.ListSupersededSessionFCMTokens(ctx, p.UserID, p.SessionID)
+	if err != nil {
+		logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("Kill-switch: failed to list superseded session tokens")
+		return
+	}
+	for _, token := range tokens {
+		data := map[string]string{
+			"type":   "SESSION_REVOKED",
+			"title":  "Logged in on another device",
+			"body":   "Your account was logged in on another device. You have been logged out.",
+			"is_sos": "false",
+		}
+		if err := n.fcmClient.SendDataMessage(ctx, token, data); err != nil {
+			logger.Log.Error().Err(err).Str("user_id", p.UserID).Msg("Kill-switch FCM push failed")
 		}
 	}
 }

@@ -69,6 +69,7 @@ func (h *AttendantAuthHandler) HandleAttendantVerifyOTP(w http.ResponseWriter, r
 		DeviceID   string `json:"device_id"`
 		DeviceName string `json:"device_name"`
 		Name       string `json:"name"`
+		FCMToken   string `json:"fcm_token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
@@ -113,6 +114,8 @@ func (h *AttendantAuthHandler) HandleAttendantVerifyOTP(w http.ResponseWriter, r
 		response.Error(w, "Failed to create session", http.StatusInternalServerError)
 		return
 	}
+	// Session-scoped push token for the single-session kill-switch.
+	_ = h.AuthStore.SetSessionFCMToken(r.Context(), att.ID, sessionID, req.FCMToken)
 	_ = h.AuthStore.UpdateAmbulanceAttendantJWT(r.Context(), att.ID, accessToken)
 	if revokedCount > 0 && h.EventBus != nil {
 		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
