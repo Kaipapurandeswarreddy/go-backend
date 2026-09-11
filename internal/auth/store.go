@@ -26,10 +26,10 @@ var (
 )
 
 const (
-	otpExpiry           = 5 * time.Minute
-	maxOTPAttempts      = 5
-	otpLockoutDuration  = 1 * time.Hour
-	refreshTokenExpiry  = 30 * 24 * time.Hour
+	otpExpiry          = 5 * time.Minute
+	maxOTPAttempts     = 5
+	otpLockoutDuration = 1 * time.Hour
+	refreshTokenExpiry = 30 * 24 * time.Hour
 )
 
 type Store struct {
@@ -370,16 +370,16 @@ func (s *Store) CreateRefreshToken(ctx context.Context, userID, role, sessionID,
 
 	now := time.Now()
 	rt := &RefreshToken{
-		ID:        ids.New(),
-		UserID:    userID,
-		Role:      role,
-		TokenHash: tokenHash,
-		SessionID: sessionID,
-		DeviceID:  deviceID,
+		ID:         ids.New(),
+		UserID:     userID,
+		Role:       role,
+		TokenHash:  tokenHash,
+		SessionID:  sessionID,
+		DeviceID:   deviceID,
 		DeviceName: deviceName,
-		CreatedAt: now,
-		ExpiresAt: now.Add(refreshTokenExpiry),
-		Revoked:   false,
+		CreatedAt:  now,
+		ExpiresAt:  now.Add(refreshTokenExpiry),
+		Revoked:    false,
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO refresh_tokens (id, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, false)`, rt.ID, rt.UserID, rt.Role, rt.TokenHash, rt.SessionID, rt.DeviceID, rt.DeviceName, rt.CreatedAt, rt.ExpiresAt)
 	if err != nil {
@@ -546,6 +546,40 @@ func (s *Store) RevokeAllUserRefreshTokens(ctx context.Context, userID, reason s
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// SetSessionFCMToken stamps the push token on the caller's live session row.
+// FCM tokens rotate independently of logins, so login/refresh proactively
+// report the current token; per-account fcm_token columns can't be used for
+// this because each device's report overwrites the previous one.
+func (s *Store) SetSessionFCMToken(ctx context.Context, userID, sessionID, fcmToken string) error {
+	if fcmToken == "" || sessionID == "" {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE refresh_tokens SET fcm_token=$3 WHERE user_id=$1 AND session_id=$2 AND revoked=false`, userID, sessionID, fcmToken)
+	return err
+}
+
+// ListSupersededSessionFCMTokens returns distinct push tokens of sessions
+// that were killed by a newer login (revoked with reason session_replaced),
+// excluding the just-created session. Used for the FCM kill-switch push.
+func (s *Store) ListSupersededSessionFCMTokens(ctx context.Context, userID, exceptSessionID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT fcm_token FROM refresh_tokens WHERE user_id=$1 AND revoked=true AND revoked_reason='session_replaced' AND fcm_token IS NOT NULL AND fcm_token<>'' AND (session_id IS DISTINCT FROM $2)`, userID, exceptSessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		if t != "" {
+			out = append(out, t)
+		}
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListUserSessions(ctx context.Context, userID string) ([]RefreshToken, error) {
