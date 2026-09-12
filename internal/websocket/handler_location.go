@@ -70,7 +70,9 @@ func (m *Manager) handleLocationUpdate(client *Client, payload json.RawMessage) 
 }
 
 // checkStoppedVehicle implements the two-stage stopped-vehicle trigger for
-// normal (non-SOS) IN_PROGRESS rides, excluding auto/bike/cab types:
+// IN_PROGRESS rides, excluding auto/bike/cab types (SOS included: a stopped
+// SOS ambulance is the most critical case — the flag flip is a no-op there,
+// but driver nudge and admin alarm still fire).
 // 3 min stopped -> warn driver, 5 min total -> escalate (flag + admin push).
 // It reuses Book-Any type resolution and is a no-op when deps are unset (tests).
 func (m *Manager) checkStoppedVehicle(driverID, rideID, vehicleTypeID string, lat, lng float64, now time.Time) {
@@ -96,8 +98,8 @@ func (m *Manager) checkStoppedVehicle(driverID, rideID, vehicleTypeID string, la
 		}
 		return
 	}
-	// Only normal IN_PROGRESS rides owned by this driver qualify.
-	if r.Status != ride.StatusInProgress || r.EmergencyPriority != 0 {
+	// Only IN_PROGRESS rides owned by this driver qualify (SOS included).
+	if r.Status != ride.StatusInProgress {
 		m.Safety.Reset(driverID)
 		return
 	}
@@ -105,9 +107,19 @@ func (m *Manager) checkStoppedVehicle(driverID, rideID, vehicleTypeID string, la
 		m.Safety.Reset(driverID)
 		return
 	}
-	if ambName := m.ambulanceTypeName(ctx, vehicleTypeID, r); safety.IsExcludedVehicleType(ambName) {
+	ambName := m.ambulanceTypeName(ctx, vehicleTypeID, r)
+	if safety.IsExcludedVehicleType(ambName) {
 		m.Safety.Reset(driverID)
 		return
+	}
+
+	// Contact details so every consumer (banner, push, dashboard) can act
+	// without another lookup: who, in what, which trip.
+	var driverName, driverMobile string
+	if ids.IsValid(driverID) {
+		if drv, lerr := m.AuthStore.FindDriverByID(ctx, driverID); lerr == nil && drv != nil {
+			driverName, driverMobile = drv.Name, drv.Mobile
+		}
 	}
 
 	stoppedMin := int(elapsed / time.Minute)
@@ -118,26 +130,33 @@ func (m *Manager) checkStoppedVehicle(driverID, rideID, vehicleTypeID string, la
 	if r.AmbTypeID != nil {
 		ambType = *r.AmbTypeID
 	}
+	rideRef := eventbus.ShortRideRef(rideID)
 
 	switch action {
 	case safety.ActionWarn:
 		m.EventBus.PublishEvent(eventbus.ChannelSafetyStoppedWarn, eventbus.SafetyStoppedWarningPayload{
 			RideID: rideID, DriverID: driverID, UserID: r.UserID,
 			Lat: lat, Lng: lng, StoppedMinutes: stoppedMin, AmbType: ambType,
+			AmbTypeName: ambName, DriverName: driverName, DriverMobile: driverMobile, RideRef: rideRef,
 		})
 	case safety.ActionEscalate:
-		escalated, err := m.RideStore.EscalateEmergencyForStoppedVehicle(ctx, rideID)
-		if err != nil {
-			logger.Log.Error().Err(err).Str("ride_id", rideID).Msg("Stopped-vehicle: escalation update failed")
-			return
+		if r.EmergencyPriority == 0 {
+			escalated, err := m.RideStore.EscalateEmergencyForStoppedVehicle(ctx, rideID)
+			if err != nil {
+				logger.Log.Error().Err(err).Str("ride_id", rideID).Msg("Stopped-vehicle: escalation update failed")
+				return
+			}
+			if !escalated {
+				// Ride finished concurrently; nothing more to do.
+				return
+			}
 		}
-		if !escalated {
-			// Ride became SOS/finished concurrently; nothing more to do.
-			return
-		}
+		// Already-SOS rides skip the flag write above but still raise the
+		// alarm: the notification is the point, not the flag.
 		m.EventBus.PublishEvent(eventbus.ChannelSafetyStoppedAlarm, eventbus.SafetyStoppedEmergencyPayload{
 			RideID: rideID, DriverID: driverID, UserID: r.UserID,
 			Lat: lat, Lng: lng, StoppedMinutes: stoppedMin, AmbType: ambType,
+			AmbTypeName: ambName, DriverName: driverName, DriverMobile: driverMobile, RideRef: rideRef,
 		})
 	}
 }

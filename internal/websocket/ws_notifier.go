@@ -153,9 +153,11 @@ func (n *WSNotifier) handleSafetyStoppedWarn(payload []byte) {
 	}
 	n.wsManager.SendToClient("driver", p.DriverID, "STOPPED_WARNING", map[string]interface{}{
 		"ride_id":         p.RideID,
+		"ride_ref":        p.RideRef,
 		"stopped_minutes": p.StoppedMinutes,
 		"lat":             p.Lat,
 		"lng":             p.Lng,
+		"amb_type_name":   p.AmbTypeName,
 	})
 }
 
@@ -169,7 +171,11 @@ func (n *WSNotifier) handleSafetyStoppedAlarm(payload []byte) {
 	}
 	msg := map[string]interface{}{
 		"ride_id":         p.RideID,
+		"ride_ref":        p.RideRef,
 		"driver_id":       p.DriverID,
+		"driver_name":     p.DriverName,
+		"driver_mobile":   p.DriverMobile,
+		"amb_type_name":   p.AmbTypeName,
 		"reason":          "stopped_vehicle",
 		"stopped_minutes": p.StoppedMinutes,
 		"lat":             p.Lat,

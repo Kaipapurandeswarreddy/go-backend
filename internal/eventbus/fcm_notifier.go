@@ -463,12 +463,13 @@ func (n *FCMNotifier) handleSafetyStoppedWarn(payload []byte) {
 	data := map[string]string{
 		"type":            "STOPPED_WARNING",
 		"ride_id":         p.RideID,
+		"ride_ref":        p.RideRef,
 		"driver_id":       p.DriverID,
 		"stopped_minutes": fmt.Sprintf("%d", p.StoppedMinutes),
 		"lat":             fmt.Sprintf("%f", p.Lat),
 		"lng":             fmt.Sprintf("%f", p.Lng),
 		"title":           "Are you stopped?",
-		"body":            fmt.Sprintf("Ambulance stopped for %d min. Please confirm you are OK.", p.StoppedMinutes),
+		"body":            fmt.Sprintf("Stopped %d min on trip #%s — tap OK if all good.", p.StoppedMinutes, p.RideRef),
 	}
 	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
 		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Stopped-warning FCM push failed for driver")
@@ -476,25 +477,47 @@ func (n *FCMNotifier) handleSafetyStoppedWarn(payload []byte) {
 }
 
 // handleSafetyStoppedAlarm pushes the 5-minute escalation to driver, user,
-// and every active admin (same data-message shape as the driver offer path).
+// and every active admin. Bodies carry contact details (who, in what, which
+// trip) instead of raw IDs so the admin notification is actionable on sight.
+// Admin pushes include a visible notification block so backgrounded/killed
+// admin apps still surface it in the tray; driver/user apps render their own
+// in-app banners from the data payload.
 func (n *FCMNotifier) handleSafetyStoppedAlarm(payload []byte) {
 	var p SafetyStoppedEmergencyPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		logger.Log.Error().Err(err).Str("channel", "safety:stopped_emergency").Msg("Unmarshal error")
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	who := p.DriverName
+	if who == "" {
+		who = "Driver"
+	}
+	if p.DriverMobile != "" {
+		who += " " + p.DriverMobile
+	}
+	amb := p.AmbTypeName
+	if amb == "" {
+		amb = "Ambulance"
+	}
+	title := "Stopped vehicle emergency"
+	body := fmt.Sprintf("%s • %s • stopped %d min • trip #%s.", amb, who, p.StoppedMinutes, p.RideRef)
 
 	base := map[string]string{
 		"type":            "STOPPED_EMERGENCY",
 		"ride_id":         p.RideID,
+		"ride_ref":        p.RideRef,
 		"driver_id":       p.DriverID,
+		"driver_name":     p.DriverName,
+		"driver_mobile":   p.DriverMobile,
+		"amb_type_name":   p.AmbTypeName,
 		"stopped_minutes": fmt.Sprintf("%d", p.StoppedMinutes),
 		"lat":             fmt.Sprintf("%f", p.Lat),
 		"lng":             fmt.Sprintf("%f", p.Lng),
-		"title":           "Stopped vehicle emergency",
-		"body":            fmt.Sprintf("Ambulance stopped for %d min on ride %s.", p.StoppedMinutes, p.RideID),
+		"title":           title,
+		"body":            body,
 		"is_sos":          "true",
 	}
 
@@ -519,7 +542,7 @@ func (n *FCMNotifier) handleSafetyStoppedAlarm(payload []byte) {
 		return
 	}
 	for _, token := range tokens {
-		if err := n.fcmClient.SendDataMessage(ctx, token, base); err != nil {
+		if err := n.fcmClient.SendAlertMessage(ctx, token, title, body, base); err != nil {
 			logger.Log.Error().Err(err).Msg("Stopped-emergency FCM push failed for admin")
 		}
 	}

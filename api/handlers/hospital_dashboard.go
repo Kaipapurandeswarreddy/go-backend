@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -85,35 +86,73 @@ func (h *HospitalDashboardHandler) HandleHospitalIncomingRides(w http.ResponseWr
 	if err := h.RideStore.PopulateConditionUpdates(r.Context(), rides); err != nil {
 		// non-fatal: still return rides with latest_condition only
 	}
-	// Enrich with live driver location for the map polyline / moving marker (free, same H3 store as fleet)
-	type enriched struct {
-		*ride.Ride
-		DriverLocation *admin.GeoJSON   `json:"driver_location,omitempty"`
-		Readiness      *ride.Readiness `json:"readiness,omitempty"`
-	}
-	// Batch readiness for the triage board (one query, non-fatal on error).
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.enrichRides(r.Context(), rides))
+}
+
+// enrichedRide is a ride plus desk-facing enrichments (all non-fatal,
+// all resolved server-side so the portal never shows raw IDs).
+type enrichedRide struct {
+	*ride.Ride
+	DriverLocation  *admin.GeoJSON   `json:"driver_location,omitempty"`
+	Readiness       *ride.Readiness `json:"readiness,omitempty"`
+	AmbTypeName     string          `json:"amb_type_name,omitempty"`
+	AttendantMobile string          `json:"attendant_mobile,omitempty"`
+	DriverName      string          `json:"driver_name,omitempty"`
+	DriverMobile    string          `json:"driver_mobile,omitempty"`
+}
+
+// enrichRides batches readiness, ambulance names, driver identity, attendant
+// number, and live driver location onto rides. Every lookup is non-fatal: a
+// failure leaves that field empty instead of failing the list.
+func (h *HospitalDashboardHandler) enrichRides(ctx context.Context, rides []*ride.Ride) []enrichedRide {
 	readinessByRide := map[string]*ride.Readiness{}
 	if len(rides) > 0 {
 		ids := make([]string, 0, len(rides))
 		for _, rd := range rides {
 			ids = append(ids, rd.ID)
 		}
-		if m, err := h.RideStore.GetReadinessForRides(r.Context(), ids); err == nil {
+		if m, err := h.RideStore.GetReadinessForRides(ctx, ids); err == nil {
 			readinessByRide = m
 		}
 	}
-	enrichedList := make([]enriched, 0, len(rides))
+	nameByAmbID := map[string]string{}
+	if ambTypes, err := h.AdminStore.ListAmbulanceTypes(ctx); err == nil {
+		for _, t := range ambTypes {
+			nameByAmbID[t.ID] = t.Name
+		}
+	}
+	out := make([]enrichedRide, 0, len(rides))
 	for _, rd := range rides {
-		er := enriched{Ride: rd, Readiness: readinessByRide[rd.ID]}
-		if rd.DriverID != nil && h.WSManager != nil && h.WSManager.LocStore != nil {
-			if lat, lng, err := h.WSManager.LocStore.GetLocation(*rd.DriverID); err == nil {
-				er.DriverLocation = &admin.GeoJSON{Type: "Point", Coordinates: []float64{lng, lat}}
+		er := enrichedRide{Ride: rd, Readiness: readinessByRide[rd.ID]}
+		if rd.AmbTypeID != nil {
+			er.AmbTypeName = nameByAmbID[*rd.AmbTypeID]
+		}
+		if rd.DriverID != nil && *rd.DriverID != "" {
+			if drv, err := h.AuthStore.FindDriverByID(ctx, *rd.DriverID); err == nil && drv != nil {
+				er.DriverName = drv.Name
+				er.DriverMobile = drv.Mobile
+			}
+			if atts, err := h.AuthStore.ListAttendantsByDriver(ctx, *rd.DriverID); err == nil {
+				for _, a := range atts {
+					if a.Active && a.Mobile != "" {
+						er.AttendantMobile = a.Mobile
+						break
+					}
+				}
+				if er.AttendantMobile == "" && len(atts) > 0 {
+					er.AttendantMobile = atts[0].Mobile
+				}
+			}
+			if h.WSManager != nil && h.WSManager.LocStore != nil {
+				if lat, lng, err := h.WSManager.LocStore.GetLocation(*rd.DriverID); err == nil {
+					er.DriverLocation = &admin.GeoJSON{Type: "Point", Coordinates: []float64{lng, lat}}
+				}
 			}
 		}
-		enrichedList = append(enrichedList, er)
+		out = append(out, er)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(enrichedList)
+	return out
 }
 
 func (h *HospitalDashboardHandler) HandleHospitalHistory(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +177,7 @@ func (h *HospitalDashboardHandler) HandleHospitalHistory(w http.ResponseWriter, 
 	}
 	_ = h.RideStore.PopulateConditionUpdates(r.Context(), rides)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(rides)
+	json.NewEncoder(w).Encode(h.enrichRides(r.Context(), rides))
 }
 
 func (h *HospitalDashboardHandler) HandleHospitalRideDetail(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,7 @@
 package eventbus
 
+import "strings"
+
 // Channel constants for EventBus pub/sub
 const (
 	ChannelRideRequested        = "ride:requested"
@@ -242,9 +244,9 @@ type ReferralCreditedPayload struct {
 	RequestID     string  `json:"request_id,omitempty"`
 }
 
-// SafetyStoppedWarningPayload is published when a normal IN_PROGRESS ride
-// (excluding auto/bike/cab) stays within the move threshold for 3 minutes.
-// Stage 1: nudge the driver only.
+// SafetyStoppedWarningPayload is published when an IN_PROGRESS ride
+// (excluding auto/bike/cab, SOS included) stays within the move threshold
+// for 3 minutes. Stage 1: nudge the driver only.
 type SafetyStoppedWarningPayload struct {
 	RideID         string  `json:"ride_id"`
 	DriverID       string  `json:"driver_id"`
@@ -253,11 +255,16 @@ type SafetyStoppedWarningPayload struct {
 	Lng            float64 `json:"lng"`
 	StoppedMinutes int     `json:"stopped_minutes"`
 	AmbType        string  `json:"amb_type,omitempty"`
+	AmbTypeName    string  `json:"amb_type_name,omitempty"`
+	DriverName     string  `json:"driver_name,omitempty"`
+	DriverMobile   string  `json:"driver_mobile,omitempty"`
+	RideRef        string  `json:"ride_ref,omitempty"`
 	RequestID      string  `json:"request_id,omitempty"`
 }
 
 // SafetyStoppedEmergencyPayload is published when the same stop reaches
-// 5 minutes total. Stage 2: emergency flag is escalated and admins are notified.
+// 5 minutes total. Stage 2: emergency flag is escalated (no-op if already
+// SOS) and admins are notified with actionable contact details.
 type SafetyStoppedEmergencyPayload struct {
 	RideID         string  `json:"ride_id"`
 	DriverID       string  `json:"driver_id"`
@@ -266,5 +273,25 @@ type SafetyStoppedEmergencyPayload struct {
 	Lng            float64 `json:"lng"`
 	StoppedMinutes int     `json:"stopped_minutes"`
 	AmbType        string  `json:"amb_type,omitempty"`
+	AmbTypeName    string  `json:"amb_type_name,omitempty"`
+	DriverName     string  `json:"driver_name,omitempty"`
+	DriverMobile   string  `json:"driver_mobile,omitempty"`
+	RideRef        string  `json:"ride_ref,omitempty"`
 	RequestID      string  `json:"request_id,omitempty"`
+}
+
+// ShortRideRef returns the last 6 alphanumeric chars of a ride UUID,
+// uppercase, for human reference ("quote trip 3F2A29 on a call").
+func ShortRideRef(rideID string) string {
+	var b strings.Builder
+	for _, r := range rideID {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	s := strings.ToUpper(b.String())
+	if len(s) <= 6 {
+		return s
+	}
+	return s[len(s)-6:]
 }
