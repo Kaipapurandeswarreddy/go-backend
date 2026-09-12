@@ -88,11 +88,23 @@ func (h *HospitalDashboardHandler) HandleHospitalIncomingRides(w http.ResponseWr
 	// Enrich with live driver location for the map polyline / moving marker (free, same H3 store as fleet)
 	type enriched struct {
 		*ride.Ride
-		DriverLocation *admin.GeoJSON `json:"driver_location,omitempty"`
+		DriverLocation *admin.GeoJSON   `json:"driver_location,omitempty"`
+		Readiness      *ride.Readiness `json:"readiness,omitempty"`
+	}
+	// Batch readiness for the triage board (one query, non-fatal on error).
+	readinessByRide := map[string]*ride.Readiness{}
+	if len(rides) > 0 {
+		ids := make([]string, 0, len(rides))
+		for _, rd := range rides {
+			ids = append(ids, rd.ID)
+		}
+		if m, err := h.RideStore.GetReadinessForRides(r.Context(), ids); err == nil {
+			readinessByRide = m
+		}
 	}
 	enrichedList := make([]enriched, 0, len(rides))
 	for _, rd := range rides {
-		er := enriched{Ride: rd}
+		er := enriched{Ride: rd, Readiness: readinessByRide[rd.ID]}
 		if rd.DriverID != nil && h.WSManager != nil && h.WSManager.LocStore != nil {
 			if lat, lng, err := h.WSManager.LocStore.GetLocation(*rd.DriverID); err == nil {
 				er.DriverLocation = &admin.GeoJSON{Type: "Point", Coordinates: []float64{lng, lat}}
@@ -258,8 +270,18 @@ func (h *HospitalDashboardHandler) HandleHospitalAnalytics(w http.ResponseWriter
 	}
 	byCondition := map[string]int64{"stable": 0, "serious": 0, "critical": 0, "worsening": 0}
 	byAmbulanceType := map[string]int64{}
-	byDate := map[string]int64{}
+	byDate := map[string]map[string]int64{}
+	byStatus := map[string]int64{}
+	byHour := make([]int64, 24)
+	cancelReasons := map[string]int64{}
+	var sosCount int64
+	var doorMinutesSum float64
+	var doorMinutesN int64
 	for _, ride := range rides {
+		byStatus[string(ride.Status)]++
+		if ride.EmergencyPriority > 0 {
+			sosCount++
+		}
 		if ride.LatestCondition != nil {
 			byCondition[ride.LatestCondition.Level]++
 		}
@@ -275,13 +297,42 @@ func (h *HospitalDashboardHandler) HandleHospitalAnalytics(w http.ResponseWriter
 		}
 		byAmbulanceType[displayKey]++
 		dateKey := ride.Time.CreatedAt.Format("2006-01-02")
-		byDate[dateKey]++
+		day, ok := byDate[dateKey]
+		if !ok {
+			day = map[string]int64{"total": 0, "critical": 0}
+		}
+		day["total"]++
+		if ride.LatestCondition != nil && (ride.LatestCondition.Level == "critical" || ride.LatestCondition.Level == "worsening") {
+			day["critical"]++
+		}
+		byDate[dateKey] = day
+		byHour[ride.Time.CreatedAt.Hour()]++
+		// Door time: trip start to completion, the number the desk staffs by.
+		if string(ride.Status) == "COMPLETED" && ride.Time.StartedAt != nil && ride.Time.CompletedAt != nil {
+			if mins := ride.Time.CompletedAt.Sub(*ride.Time.StartedAt).Minutes(); mins >= 0 && mins < 24*60 {
+				doorMinutesSum += mins
+				doorMinutesN++
+			}
+		}
+		if string(ride.Status) == "CANCELLED" && ride.CancellationReason != "" {
+			cancelReasons[ride.CancellationReason]++
+		}
+	}
+	var avgDoorMinutes *float64
+	if doorMinutesN > 0 {
+		v := doorMinutesSum / float64(doorMinutesN)
+		avgDoorMinutes = &v
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"byCondition":     byCondition,
 		"byAmbulanceType": byAmbulanceType,
 		"byDate":          byDate,
+		"byStatus":        byStatus,
+		"byHour":          byHour,
+		"cancelReasons":   cancelReasons,
+		"sos":             sosCount,
+		"avgDoorMinutes":  avgDoorMinutes,
 		"total":           len(rides),
 	})
 }
@@ -455,4 +506,44 @@ func (h *HospitalDashboardHandler) HandleAttendantCurrentRide(w http.ResponseWri
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"found": true, "ride": rides[0]})
+}
+
+// HandleAcknowledgeRide records the desk's triage acknowledgement for one of
+// its own hospital's incoming rides. The ack silences that ride's alarm on
+// the dashboard and survives refresh/shift change. Cross-hospital writes
+// are rejected.
+func (h *HospitalDashboardHandler) HandleAcknowledgeRide(w http.ResponseWriter, r *http.Request) {
+	hid, ok := hospitalIDFromContext(r)
+	if !ok {
+		response.Error(w, "Hospital not linked", http.StatusBadRequest)
+		return
+	}
+	userID, _ := r.Context().Value(middleware.UserIDKey).(string)
+	var req struct {
+		RideID string `json:"ride_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RideID == "" {
+		response.Error(w, "ride_id required", http.StatusBadRequest)
+		return
+	}
+	if !ids.IsValid(req.RideID) {
+		response.Error(w, "Invalid ride_id", http.StatusBadRequest)
+		return
+	}
+	rideDoc, err := h.RideStore.GetRideByID(r.Context(), req.RideID)
+	if err != nil || rideDoc == nil {
+		response.Error(w, "Ride not found", http.StatusNotFound)
+		return
+	}
+	if rideDoc.HospitalID == nil || *rideDoc.HospitalID != hid {
+		response.Error(w, "Forbidden: different hospital", http.StatusForbidden)
+		return
+	}
+	rd, err := h.RideStore.UpsertReadiness(r.Context(), req.RideID, hid, userID)
+	if err != nil {
+		response.Error(w, "Failed to save", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rd)
 }
