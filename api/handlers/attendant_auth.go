@@ -40,11 +40,11 @@ func (h *AttendantAuthHandler) HandleAttendantRequestOTP(w http.ResponseWriter, 
 	// Check if attendant exists and is active in the system before generating OTP
 	att, err := h.AuthStore.FindAmbulanceAttendantByMobile(r.Context(), req.Mobile)
 	if err != nil {
-		response.Error(w, "Failed to lookup attendant", http.StatusInternalServerError)
+		response.Error(w, "Failed to lookup paramedic", http.StatusInternalServerError)
 		return
 	}
 	if att == nil || !att.Active {
-		response.Error(w, "Mobile number not registered as an attendant. Please ask your ambulance driver to add you.", http.StatusNotFound)
+		response.Error(w, "Mobile number not registered as a paramedic. Please ask your ambulance driver to add you.", http.StatusNotFound)
 		return
 	}
 	locked, _ := h.AuthStore.IsOTPLocked(r.Context(), req.Mobile)
@@ -94,11 +94,11 @@ func (h *AttendantAuthHandler) HandleAttendantVerifyOTP(w http.ResponseWriter, r
 
 	att, err := h.AuthStore.FindAmbulanceAttendantByMobile(r.Context(), req.Mobile)
 	if err != nil {
-		response.Error(w, "Failed to lookup attendant", http.StatusInternalServerError)
+		response.Error(w, "Failed to lookup paramedic", http.StatusInternalServerError)
 		return
 	}
 	if att == nil || !att.Active {
-		response.Error(w, "Mobile number not registered as an attendant", http.StatusForbidden)
+		response.Error(w, "Mobile number not registered as a paramedic", http.StatusForbidden)
 		return
 	}
 	// Single session like driver
