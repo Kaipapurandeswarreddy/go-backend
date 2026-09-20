@@ -222,8 +222,10 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride, reqID string) {
 		driverShareVal = r.Fare.DriverShare
 	}
 	tripDistanceKm := 0.0
+	tripDurationSeconds := 0
 	if r.Route != nil {
 		tripDistanceKm = r.Route.DistanceKm
+		tripDurationSeconds = r.Route.DurationSeconds
 	}
 	isSOS := r.EmergencyPriority > 0
 
@@ -236,23 +238,27 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride, reqID string) {
 		r.DispatchMetadata.OffersSent++
 
 		d.EventBus.PublishEvent(eventbus.ChannelRideDriverOffered, eventbus.RideDriverOfferedPayload{
-			RideID:           rideIDStr,
-			DriverID:         candidate.DriverID,
-			UserID:           r.UserID,
-			PickupLat:        pickupLat2,
-			PickupLng:        pickupLng2,
-			PickupAddress:    r.PickupAddress,
-			DropoffLat:       dropoffLat,
-			DropoffLng:       dropoffLng,
-			DropAddress:      r.DropAddress,
-			ETASeconds:       candidate.ETASeconds,
-			PickupDistanceKm: candidate.DistanceKm,
-			TripDistanceKm:   tripDistanceKm,
-			Fare:             fareVal,
-			DriverShare:      driverShareVal,
-			PaymentMode:      r.PaymentMode,
-			IsSOS:            isSOS,
-			RequestID:        reqID,
+			RideID:              rideIDStr,
+			DriverID:            candidate.DriverID,
+			UserID:              r.UserID,
+			PickupLat:           pickupLat2,
+			PickupLng:           pickupLng2,
+			PickupAddress:       r.PickupAddress,
+			DropoffLat:          dropoffLat,
+			DropoffLng:          dropoffLng,
+			DropAddress:         r.DropAddress,
+			ETASeconds:          candidate.ETASeconds,
+			PickupDistanceKm:    candidate.DistanceKm,
+			TripDistanceKm:      tripDistanceKm,
+			TripDurationSeconds: tripDurationSeconds,
+			Fare:                fareVal,
+			DriverShare:         driverShareVal,
+			PaymentMode:         r.PaymentMode,
+			IsSOS:               isSOS,
+			AmbTypeID:           ambTypeID,
+			OfferedAt:           time.Now().UTC().Format(time.RFC3339),
+			OfferExpiresIn:      30,
+			RequestID:           reqID,
 		})
 
 		d.mu.RLock()

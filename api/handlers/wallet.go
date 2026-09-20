@@ -19,10 +19,11 @@ import (
 )
 
 type WalletHandler struct {
-	AuthStore     *auth.Store
-	EventBus      *eventbus.InMemoryBus
-	WalletStore   *payment.WalletStore
-	ZwitchService *payment.ZwitchService
+	AuthStore      *auth.Store
+	EventBus       *eventbus.InMemoryBus
+	WalletStore    *payment.WalletStore
+	ZwitchService  *payment.ZwitchService
+	WithdrawalFee  float64
 }
 
 func NewWalletHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, wStore *payment.WalletStore, zService *payment.ZwitchService) *WalletHandler {
@@ -31,7 +32,22 @@ func NewWalletHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, wSt
 		EventBus:      eventBus,
 		WalletStore:   wStore,
 		ZwitchService: zService,
+		WithdrawalFee: 7,
 	}
+}
+
+// SetWithdrawalFee overrides the default Rs 7 fee (from WITHDRAWAL_FEE env).
+func (h *WalletHandler) SetWithdrawalFee(fee float64) {
+	if fee >= 0 {
+		h.WithdrawalFee = fee
+	}
+}
+
+func (h *WalletHandler) fee() float64 {
+	if h.WithdrawalFee < 0 {
+		return 7
+	}
+	return h.WithdrawalFee
 }
 
 func (h *WalletHandler) HandleGetWallet(w http.ResponseWriter, r *http.Request) {
@@ -146,10 +162,11 @@ func (h *WalletHandler) HandleWithdraw(w http.ResponseWriter, r *http.Request) {
 	// Reference ID = random 10 chars, simplified here using timestamp
 	merchantRefID := fmt.Sprintf("W%d", time.Now().UnixNano())
 
-	// Rs. 7 fee for transaction
-	amountToTransfer := req.Amount - 7
+	// Platform fee for withdrawal (configurable via WITHDRAWAL_FEE, default Rs 7)
+	fee := h.fee()
+	amountToTransfer := req.Amount - fee
 	if amountToTransfer <= 0 {
-		response.Error(w, "Amount too low to cover 7rs fee", http.StatusBadRequest)
+		response.Error(w, fmt.Sprintf("Amount too low to cover %.0frs fee", fee), http.StatusBadRequest)
 		return
 	}
 

@@ -26,6 +26,8 @@ type SharedHandler struct {
 	AdminStore    *admin.Store
 	HospitalStore *admin.HospitalStore
 	Seeder        *hospital.Seeder
+	WithdrawalFee float64
+	OfferTTL      int
 
 	// citySync guards the background per-area seed: one run at a time so a
 	// retry tap can't double-seed. A disconnect can never cancel the job
@@ -45,7 +47,28 @@ func NewSharedHandler(cs *telephony.CloudshopeService, cStore *admin.CounterStor
 		AdminStore:    aStore,
 		HospitalStore: hStore,
 		Seeder:        seeder,
+		WithdrawalFee: 7,
+		OfferTTL:      30,
 	}
+}
+
+// SetAppConfig wires dynamic values (WITHDRAWAL_FEE env, offer timeout).
+func (h *SharedHandler) SetAppConfig(withdrawalFee float64, offerTTL int) {
+	if withdrawalFee >= 0 {
+		h.WithdrawalFee = withdrawalFee
+	}
+	if offerTTL > 0 {
+		h.OfferTTL = offerTTL
+	}
+}
+
+// HandleGetAppConfig exposes dynamic config so apps never hardcode fees/TTLs.
+func (h *SharedHandler) HandleGetAppConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"withdrawal_fee":   h.WithdrawalFee,
+		"offer_expires_in": h.OfferTTL,
+	})
 }
 
 func (h *SharedHandler) HandleCallMask(w http.ResponseWriter, r *http.Request) {
