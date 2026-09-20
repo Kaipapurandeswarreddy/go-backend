@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
@@ -14,10 +15,13 @@ import (
 	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/mailer"
+	"ambigo-backend/internal/payment"
 	"ambigo-backend/internal/requestid"
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/translation"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type AdminHandler struct {
@@ -29,6 +33,7 @@ type AdminHandler struct {
 	PendingHospitalStore *admin.PendingHospitalStore
 	CounterStore         *admin.CounterStore
 	RideStore            *ride.Store
+	WalletStore          *payment.WalletStore
 	JWTSecret            string
 	SMSCfg               auth.SMSCountryConfig
 	Mailer               *mailer.ResendMailer
@@ -48,6 +53,12 @@ func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventb
 		SMSCfg:               smsCfg,
 		Mailer:               mailer,
 	}
+}
+
+// SetWalletStore wires the wallet store for the delta-adjust endpoint.
+// Kept as a setter so the long constructor signature stays untouched.
+func (h *AdminHandler) SetWalletStore(s *payment.WalletStore) {
+	h.WalletStore = s
 }
 
 func (h *AdminHandler) HandleAdminLogin(w http.ResponseWriter, r *http.Request) {
@@ -425,8 +436,38 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 	if req.MyReferralCode != "" {
 		existing.MyReferralCode = req.MyReferralCode
 	}
-	if req.WalletBalance != 0 {
-		existing.WalletBalance = req.WalletBalance
+	// NOTE: direct balance sets are deprecated — use
+	// POST /api/v2/admin/drivers/wallet/adjust (delta + reason + ledger row).
+	// The legacy field is still honored for old dashboards, applied as an
+	// atomic delta+ledger transaction (never a blind overwrite, so concurrent
+	// ride credits cannot be clobbered and zero deltas are expressible via
+	// the adjust endpoint).
+	if req.WalletBalance != 0 && req.WalletBalance != existing.WalletBalance {
+		if h.WalletStore == nil {
+			response.Error(w, "Wallet service not configured", http.StatusInternalServerError)
+			return
+		}
+		delta := req.WalletBalance - existing.WalletBalance
+		derr := payment.WithTx(r.Context(), h.WalletStore.Pool(), func(tx pgx.Tx) error {
+			wTx := h.WalletStore.WithTx(tx)
+			bal, aerr := wTx.AdjustWalletBalance(r.Context(), existing.ID, delta)
+			if aerr != nil {
+				return aerr
+			}
+			existing.WalletBalance = bal
+			return wTx.InsertLedgerEntry(r.Context(), &payment.WalletTransaction{
+				DriverID:    existing.ID,
+				Amount:      absFloat(delta),
+				Direction:   map[bool]string{true: "credit", false: "debit"}[delta > 0],
+				TxnType:     "admin_adjust",
+				ReferenceID: "admin:set:" + reqID,
+				Status:      "success",
+				BalanceAfter: &bal,
+			})
+		})
+		if derr != nil {
+			logger.Log.Error().Err(derr).Str("driver_id", existing.ID).Msg("Legacy admin balance set failed")
+		}
 	}
 	if req.Location != nil {
 		existing.Location = req.Location
@@ -444,6 +485,8 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 		if existing.WalletDetails == nil {
 			existing.WalletDetails = &auth.WalletDetails{}
 		}
+		bankChanged := (req.WalletDetails.AccountNo != "" && !strings.EqualFold(req.WalletDetails.AccountNo, existing.WalletDetails.AccountNo)) ||
+			(req.WalletDetails.IFSCCode != "" && !strings.EqualFold(req.WalletDetails.IFSCCode, existing.WalletDetails.IFSCCode))
 		if req.WalletDetails.AccountNo != "" {
 			existing.WalletDetails.AccountNo = req.WalletDetails.AccountNo
 		}
@@ -455,6 +498,14 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 		}
 		if req.WalletDetails.BenfID != "" {
 			existing.WalletDetails.BenfID = req.WalletDetails.BenfID
+		}
+		// An admin-swapped account is unproven by definition: reset the
+		// first-payout gate (the driver re-verifies on next save in-app).
+		// Without this, the user-path gate is bypassable from the dashboard.
+		if bankChanged && h.WalletStore != nil {
+			if verr := h.WalletStore.SetWalletVerified(r.Context(), existing.ID, false); verr != nil {
+				logger.Log.Error().Err(verr).Str("driver_id", existing.ID).Msg("Failed to reset verification flag on admin bank edit")
+			}
 		}
 	}
 	if req.Details != nil {
@@ -494,6 +545,75 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Driver updated successfully"})
+}
+
+func absFloat(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// HandleAdjustDriverWallet applies a signed delta to a driver's wallet with
+// a mandatory reason, atomically with a ledger row. This replaces blind
+// absolute sets: concurrent ride credits cannot be clobbered, zero is
+// expressible, and every adjustment is journaled with who/why.
+func (h *AdminHandler) HandleAdjustDriverWallet(w http.ResponseWriter, r *http.Request) {
+	if h.WalletStore == nil {
+		response.Error(w, "Wallet service not configured", http.StatusInternalServerError)
+		return
+	}
+	var req struct {
+		DriverID string  `json:"driver_id" validate:"required"`
+		Delta    float64 `json:"delta"`
+		Reason   string  `json:"reason" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	if !ids.IsValid(req.DriverID) {
+		response.Error(w, "Invalid driver ID", http.StatusBadRequest)
+		return
+	}
+	if req.Delta == 0 {
+		response.Error(w, "Delta must be non-zero", http.StatusBadRequest)
+		return
+	}
+	if req.Delta < -1000000 || req.Delta > 1000000 {
+		response.Error(w, "Delta out of range", http.StatusBadRequest)
+		return
+	}
+	adminID, _ := r.Context().Value(middleware.UserIDKey).(string)
+
+	var bal float64
+	derr := payment.WithTx(r.Context(), h.WalletStore.Pool(), func(tx pgx.Tx) error {
+		wTx := h.WalletStore.WithTx(tx)
+		var aerr error
+		bal, aerr = wTx.AdjustWalletBalance(r.Context(), req.DriverID, req.Delta)
+		if aerr != nil {
+			return aerr
+		}
+		return wTx.InsertLedgerEntry(r.Context(), &payment.WalletTransaction{
+			DriverID:    req.DriverID,
+			Amount:      absFloat(req.Delta),
+			Direction:   map[bool]string{true: "credit", false: "debit"}[req.Delta > 0],
+			TxnType:     "admin_adjust",
+			ReferenceID: "admin:" + adminID + ":" + req.Reason,
+			Status:      "success",
+			BalanceAfter: &bal,
+		})
+	})
+	if derr != nil {
+		response.Error(w, "Driver not found or adjustment failed", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"detail": "Wallet adjusted", "wallet_balance": bal})
 }
 
 // HandleDeleteDriver removes a verified driver

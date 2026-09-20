@@ -40,6 +40,7 @@ type AppConfig struct {
 	ZwitchAccountID string
 	ZwitchAPIBaseURL string
 	ZwitchProxyURL  string
+	ZwitchWebhookSecret string
 
 	// Wallet (withdrawals)
 	WithdrawalFee float64
@@ -115,6 +116,7 @@ func LoadConfig() *AppConfig {
 		ZwitchAccountID:   os.Getenv("ZWITCH_ACCOUNT_ID"),
 		ZwitchAPIBaseURL:  envOrDefault("ZWITCH_API_BASE_URL", "https://api.zwitch.io/v1"),
 		ZwitchProxyURL:    os.Getenv("ZWITCH_PROXY_URL"),
+		ZwitchWebhookSecret: os.Getenv("ZWITCH_WEBHOOK_SECRET"),
 		WithdrawalFee:     envFloatOrDefault("WITHDRAWAL_FEE", 7),
 
 		CloudshopeToken:      os.Getenv("CLOUDSHOPE_TOKEN"),

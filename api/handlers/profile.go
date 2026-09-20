@@ -130,7 +130,7 @@ func (h *ProfileHandler) HandleGetDriverProfile(w http.ResponseWriter, r *http.R
 		}
 		if verifiedDriver != nil {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(enrichDriver(verifiedDriver, h.AdminStore, r))
+			json.NewEncoder(w).Encode(enrichDriver(verifiedDriver, h, r))
 			return
 		}
 
@@ -149,7 +149,7 @@ func (h *ProfileHandler) HandleGetDriverProfile(w http.ResponseWriter, r *http.R
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(enrichDriver(driver, h.AdminStore, r))
+	json.NewEncoder(w).Encode(enrichDriver(driver, h, r))
 }
 
 // HandleUpdateDriverFCM updates the driver's FCM token
@@ -196,7 +196,7 @@ func (h *ProfileHandler) HandleUpdateDriverFCM(w http.ResponseWriter, r *http.Re
 
 // enrichDriver returns the driver plus amb_type_name resolved from
 // vehicle_type (ambulance-type ID). Old apps ignore the extra key.
-func enrichDriver(driver *auth.Driver, adminStore *admin.Store, r *http.Request) map[string]interface{} {
+func enrichDriver(driver *auth.Driver, h *ProfileHandler, r *http.Request) map[string]interface{} {
 	out := map[string]interface{}{
 		"_id":                  driver.ID,
 		"name":                 driver.Name,
@@ -206,10 +206,14 @@ func enrichDriver(driver *auth.Driver, adminStore *admin.Store, r *http.Request)
 		"vehicle_registration": driver.VehicleReg,
 		"wallet_details":       driver.WalletDetails,
 		"wallet_balance":       driver.WalletBalance,
+		"wallet_verified":      driver.WalletVerified,
 		"referral_code":        driver.ReferralCode,
 	}
 	if driver.MyReferralCode != "" {
 		out["my_referral_code"] = driver.MyReferralCode
+	}
+	if driver.WalletVerifiedAt != nil {
+		out["wallet_verified_at"] = driver.WalletVerifiedAt
 	}
 	if driver.Location != nil {
 		out["location"] = driver.Location
@@ -217,11 +221,20 @@ func enrichDriver(driver *auth.Driver, adminStore *admin.Store, r *http.Request)
 	if driver.Details != nil {
 		out["details"] = driver.Details
 	}
+	if driver.LastLocationUpdate != nil {
+		out["last_location_update"] = driver.LastLocationUpdate
+	}
 	if driver.MDAmbulanceID != nil {
 		out["md_ambulance_id"] = driver.MDAmbulanceID
+	} else if h != nil && h.AuthStore != nil {
+		// MDAmbulanceID is resolved live (not stored on the scanned struct):
+		// fetch it so hospital-linked drivers see their effective ambulance.
+		if mdID, merr := h.AuthStore.GetDriverMDAmbulanceID(r.Context(), driver.ID); merr == nil && mdID != nil {
+			out["md_ambulance_id"] = mdID
+		}
 	}
-	if adminStore != nil && driver.VehicleType != "" {
-		if amb, err := adminStore.GetAmbulanceTypeByID(r.Context(), driver.VehicleType); err == nil && amb != nil {
+	if h != nil && h.AdminStore != nil && driver.VehicleType != "" {
+		if amb, err := h.AdminStore.GetAmbulanceTypeByID(r.Context(), driver.VehicleType); err == nil && amb != nil {
 			out["amb_type_name"] = amb.Name
 		}
 	}
