@@ -86,8 +86,9 @@ func scanDriverRow(row pgx.Row) (*Driver, error) {
 	var myReferralCode *string
 	var fcmToken, jwtToken *string
 	var lastLocationUpdate *time.Time
+	var verifiedAt *time.Time
 	var id string
-	err := row.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData)
+	err := row.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.WalletVerified, &verifiedAt, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +114,7 @@ func scanDriverRow(row pgx.Row) (*Driver, error) {
 	d.FCMToken = fcmToken
 	d.JWTToken = jwtToken
 	d.LastLocationUpdate = lastLocationUpdate
+	d.WalletVerifiedAt = verifiedAt
 	return &d, nil
 }
 
@@ -740,7 +742,7 @@ func (s *Store) FindUserByMobile(ctx context.Context, mobile string) (*User, err
 }
 
 func (s *Store) FindDriverByMobile(ctx context.Context, mobile string) (*Driver, error) {
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE mobile=$1`, mobile)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE mobile=$1`, mobile)
 	d, err := scanDriverRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -828,7 +830,7 @@ func (s *Store) FindDriverByID(ctx context.Context, id string) (*Driver, error) 
 	if !ids.IsValid(id) {
 		return nil, fmt.Errorf("invalid id: %s", id)
 	}
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE id=$1::uuid`, id)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE id=$1::uuid`, id)
 	d, err := scanDriverRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -978,8 +980,8 @@ func (s *Store) ApproveDriver(ctx context.Context, driver *Driver) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	_, err = tx.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb)`,
-		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
+	_, err = tx.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17::jsonb)`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.WalletVerified, driver.WalletVerifiedAt, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
 	if err != nil {
 		return err
 	}
@@ -996,7 +998,7 @@ func (s *Store) ListDrivers(ctx context.Context, skip int64) ([]Driver, int64, e
 	if err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers ORDER BY created_at DESC, id DESC OFFSET $1 LIMIT 20`, skip)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers ORDER BY created_at DESC, id DESC OFFSET $1 LIMIT 20`, skip)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1010,11 +1012,13 @@ func (s *Store) ListDrivers(ctx context.Context, skip int64) ([]Driver, int64, e
 		var myReferralCode *string
 		var fcmToken, jwtToken *string
 		var lastLocationUpdate *time.Time
+		var verifiedAt *time.Time
 		var id string
-		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData); err != nil {
+		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.WalletVerified, &verifiedAt, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData); err != nil {
 			return nil, 0, err
 		}
 		d.ID = id
+		d.WalletVerifiedAt = verifiedAt
 		if myReferralCode != nil {
 			d.MyReferralCode = *myReferralCode
 		}
@@ -1052,8 +1056,8 @@ func (s *Store) InsertDriver(ctx context.Context, driver *Driver) error {
 	}
 	locationData := marshalJSONB(driver.Location)
 	detailsData := marshalJSONB(driver.Details)
-	_, err := s.pool.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb)`,
-		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
+	_, err := s.pool.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17::jsonb)`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.WalletVerified, driver.WalletVerifiedAt, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
 	return err
 }
 
@@ -1067,8 +1071,12 @@ func (s *Store) UpdateDriver(ctx context.Context, driver *Driver) error {
 	}
 	locationData := marshalJSONB(driver.Location)
 	detailsData := marshalJSONB(driver.Details)
-	_, err := s.pool.Exec(ctx, `UPDATE drivers SET name=$2, mobile=$3, photo=$4, vehicle_type=$5, vehicle_registration=$6, wallet_details=$7::jsonb, wallet_balance=$8, referral_code=$9, my_referral_code=$10, location=$11::jsonb, fcm_token=$12, jwt_token=$13, last_location_update=$14, details=$15::jsonb WHERE id=$1::uuid`,
-		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
+	// NOTE: wallet_balance is deliberately NOT written here. Balance is only
+	// mutated via atomic delta operations (UpdateWalletBalance/DeductBalance/
+	// AdjustWalletBalance) so a stale struct can never clobber concurrent
+	// ride credits. Use WalletStore.AdjustWalletBalance for corrections.
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET name=$2, mobile=$3, photo=$4, vehicle_type=$5, vehicle_registration=$6, wallet_details=$7::jsonb, referral_code=$8, my_referral_code=$9, location=$10::jsonb, fcm_token=$11, jwt_token=$12, last_location_update=$13, details=$14::jsonb WHERE id=$1::uuid`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
 	return err
 }
 
@@ -1405,7 +1413,7 @@ func (s *Store) FindUserByReferralCode(ctx context.Context, code string) (*User,
 }
 
 func (s *Store) FindDriverByReferralCode(ctx context.Context, code string) (*Driver, error) {
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE my_referral_code=$1`, code)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE my_referral_code=$1`, code)
 	d, err := scanDriverRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
