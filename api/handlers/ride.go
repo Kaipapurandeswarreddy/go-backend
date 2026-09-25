@@ -38,9 +38,10 @@ type RideHandler struct {
 	PricingEngine   *pricing.Engine
 	WalletStore     *payment.WalletStore
 	ReferralService *referral.Service
+	RegionStore     *pricing.RegionStore
 }
 
-func NewRideHandler(dispatcher *dispatch.Dispatcher, eventBus *eventbus.InMemoryBus, paymentStore *payment.Store, rzp *payment.RazorpayService, authStore *auth.Store, adminStore *admin.Store, routeClient *dispatch.RouteClient, walletStore *payment.WalletStore, referralService *referral.Service) *RideHandler {
+func NewRideHandler(dispatcher *dispatch.Dispatcher, eventBus *eventbus.InMemoryBus, paymentStore *payment.Store, rzp *payment.RazorpayService, authStore *auth.Store, adminStore *admin.Store, routeClient *dispatch.RouteClient, walletStore *payment.WalletStore, referralService *referral.Service, regionStore *pricing.RegionStore) *RideHandler {
 	return &RideHandler{
 		Dispatcher:      dispatcher,
 		EventBus:        eventBus,
@@ -52,7 +53,25 @@ func NewRideHandler(dispatcher *dispatch.Dispatcher, eventBus *eventbus.InMemory
 		PricingEngine:   pricing.NewEngine(),
 		WalletStore:     walletStore,
 		ReferralService: referralService,
+		RegionStore:     regionStore,
 	}
+}
+
+// effectivePrice resolves V2 H3 region override for a pickup, falling back to global.
+func (h *RideHandler) effectivePrice(ctx context.Context, lat, lng float64, ambType *admin.AmbulanceType) (base float64, tiers []pricing.PricingTier, share float64, regionID *string) {
+	base, share = ambType.BaseFare, ambType.DriverShare
+	tiers = make([]pricing.PricingTier, len(ambType.PricingTier))
+	for i, t := range ambType.PricingTier {
+		tiers[i] = pricing.PricingTier{ThresholdDistance: t.ThresholdDistance, CostPerKm: t.CostPerKm}
+	}
+	if h.RegionStore == nil {
+		return base, tiers, share, nil
+	}
+	resolved, err := h.RegionStore.ResolvePriceForPickup(ctx, lat, lng, ambType.ID, ambType.BaseFare, tiers, ambType.DriverShare, ambType.ListingThreshold, ambType.HelperIncluded, ambType.OTPRequired)
+	if err != nil || resolved == nil || !resolved.IsOverride {
+		return base, tiers, share, nil
+	}
+	return resolved.BaseFare, resolved.Tiers, resolved.DriverShare, resolved.RegionID
 }
 
 // upgradeUnvrfDriverRole checks if an unverified driver has been promoted to verified.
@@ -195,31 +214,25 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 				distanceKm = newRide.Route.DistanceKm
 			}
 
-			log.Debug().Float64("base_fare", ambType.BaseFare).Float64("driver_share", ambType.DriverShare).Int("tiers", len(ambType.PricingTier)).Float64("distance", distanceKm).Msg("Fare input")
-
-			pricingTiers := make([]pricing.PricingTier, len(ambType.PricingTier))
-			for i, t := range ambType.PricingTier {
-				pricingTiers[i] = pricing.PricingTier{
-					ThresholdDistance: t.ThresholdDistance,
-					CostPerKm:         t.CostPerKm,
-				}
-			}
+			effBase, pricingTiers, effShare, regionID := h.effectivePrice(r.Context(), req.PickupLat, req.PickupLng, ambType)
+			newRide.RegionID = regionID
+			log.Debug().Float64("base_fare", effBase).Float64("driver_share", effShare).Int("tiers", len(pricingTiers)).Float64("distance", distanceKm).Msg("Fare input")
 
 			// Calculate Total Fare
-			base := h.PricingEngine.CalculateBaseAndDistanceFare(distanceKm, ambType.BaseFare, pricingTiers)
+			base := h.PricingEngine.CalculateBaseAndDistanceFare(distanceKm, effBase, pricingTiers)
 			emergency := h.PricingEngine.CalculateEmergencySurcharge(base, newRide.EmergencyPriority > 0)
 			night := h.PricingEngine.CalculateNightSurcharge(base, time.Now())
 			totalAmount := base + emergency + night
 			totalAmount = payment.RoundRupees(totalAmount)
 
 			// Calculate Driver Share (DriverShare is a percentage of whole total fare)
-			driverShareTotal := payment.RoundRupees(totalAmount * ambType.DriverShare / 100.0)
+			driverShareTotal := payment.RoundRupees(totalAmount * effShare / 100.0)
 
 			log.Debug().Float64("total", totalAmount).Float64("driver_share", driverShareTotal).Msg("Fare computed")
 
 			newRide.Fare = &ride.Fare{
-				BaseFare:           ambType.BaseFare,
-				DistanceFare:       base - ambType.BaseFare,
+				BaseFare:           effBase,
+				DistanceFare:       base - effBase,
 				EmergencySurcharge: emergency,
 				NightSurcharge:     night,
 				Total:              totalAmount,
@@ -504,20 +517,35 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 					billKm = estimateKm
 				}
 				if ambType, aerr := h.AdminStore.GetAmbulanceTypeByID(r.Context(), *rideData.AmbTypeID); aerr == nil && ambType != nil {
-					tiers := make([]pricing.PricingTier, len(ambType.PricingTier))
-					for i, t := range ambType.PricingTier {
-						tiers[i] = pricing.PricingTier{ThresholdDistance: t.ThresholdDistance, CostPerKm: t.CostPerKm}
+					effBase, tiers, effShare := ambType.BaseFare, func() []pricing.PricingTier {
+						ts := make([]pricing.PricingTier, len(ambType.PricingTier))
+						for i, t := range ambType.PricingTier {
+							ts[i] = pricing.PricingTier{ThresholdDistance: t.ThresholdDistance, CostPerKm: t.CostPerKm}
+						}
+						return ts
+					}(), ambType.DriverShare
+					// Prefer saved ride region (pickup region locked at request).
+					if h.RegionStore != nil {
+						if rid, rerr := h.Dispatcher.RideStore.GetRideRegionID(r.Context(), rideID); rerr == nil && rid != nil && *rid != "" {
+							if rp, perr := h.RegionStore.GetRegionPrice(r.Context(), *rid, ambType.ID); perr == nil && rp != nil {
+								effBase, tiers, effShare = rp.BaseFare, rp.PricingTier, rp.DriverShare
+							}
+						} else if len(rideData.Pickup.Coordinates) == 2 {
+							if res, rerr := h.RegionStore.ResolvePriceForPickup(r.Context(), rideData.Pickup.Coordinates[1], rideData.Pickup.Coordinates[0], ambType.ID, effBase, tiers, effShare, ambType.ListingThreshold, ambType.HelperIncluded, ambType.OTPRequired); rerr == nil && res != nil && res.IsOverride {
+								effBase, tiers, effShare = res.BaseFare, res.Tiers, res.DriverShare
+							}
+						}
 					}
-					base := h.PricingEngine.CalculateBaseAndDistanceFare(billKm, ambType.BaseFare, tiers)
+					base := h.PricingEngine.CalculateBaseAndDistanceFare(billKm, effBase, tiers)
 					emg := h.PricingEngine.CalculateEmergencySurcharge(base, rideData.EmergencyPriority > 0)
 					ngt := h.PricingEngine.CalculateNightSurcharge(base, time.Now())
 					total := payment.RoundRupees(base + emg + ngt)
-					share := payment.RoundRupees(total * ambType.DriverShare / 100.0)
+					share := payment.RoundRupees(total * effShare / 100.0)
 					if total > 0 {
 						finalAmount = total
 						lockedShare = share
 						recalcFare = &ride.Fare{
-							BaseFare: ambType.BaseFare, DistanceFare: base - ambType.BaseFare,
+							BaseFare: effBase, DistanceFare: base - effBase,
 							EmergencySurcharge: emg, NightSurcharge: ngt,
 							Total: total, DriverShare: share, Currency: "INR",
 						}
@@ -1020,6 +1048,8 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 		DistanceKm float64 `json:"distance_km" validate:"required,gt=0"`
 		AmbTypeID  string  `json:"amb_type_id"`
 		IsSOS      bool    `json:"is_sos"`
+		PickupLat  float64 `json:"pickup_lat"`
+		PickupLng  float64 `json:"pickup_lng"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
@@ -1037,20 +1067,14 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
-		pricingTiers := make([]pricing.PricingTier, len(ambType.PricingTier))
-		for i, t := range ambType.PricingTier {
-			pricingTiers[i] = pricing.PricingTier{
-				ThresholdDistance: t.ThresholdDistance,
-				CostPerKm:         t.CostPerKm,
-			}
-		}
+		effBase, pricingTiers, effShare, _ := h.effectivePrice(r.Context(), req.PickupLat, req.PickupLng, ambType)
 
-		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, ambType.BaseFare, pricingTiers)
+		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, effBase, pricingTiers)
 		emergency := h.PricingEngine.CalculateEmergencySurcharge(base, req.IsSOS)
 		night := h.PricingEngine.CalculateNightSurcharge(base, time.Now())
 		total := payment.RoundRupees(base+emergency+night)
 
-		driverShare := payment.RoundRupees(total * ambType.DriverShare / 100.0)
+		driverShare := payment.RoundRupees(total * effShare / 100.0)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1058,7 +1082,7 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 				{
 					"amb_type_id":  ambType.ID,
 					"name":         ambType.Name,
-					"base_fare":    ambType.BaseFare,
+					"base_fare":    effBase,
 					"total":        total,
 					"driver_share": driverShare,
 				},
@@ -1083,25 +1107,20 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 	}
 	estimates := make([]estimate, 0, len(allTypes))
 	for _, ambType := range allTypes {
-		pricingTiers := make([]pricing.PricingTier, len(ambType.PricingTier))
-		for i, t := range ambType.PricingTier {
-			pricingTiers[i] = pricing.PricingTier{
-				ThresholdDistance: t.ThresholdDistance,
-				CostPerKm:         t.CostPerKm,
-			}
-		}
+		ambType := ambType
+		effBase, pricingTiers, effShare, _ := h.effectivePrice(r.Context(), req.PickupLat, req.PickupLng, &ambType)
 
-		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, ambType.BaseFare, pricingTiers)
+		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, effBase, pricingTiers)
 		emergency := h.PricingEngine.CalculateEmergencySurcharge(base, req.IsSOS)
 		night := h.PricingEngine.CalculateNightSurcharge(base, time.Now())
 		total := payment.RoundRupees(base+emergency+night)
 
-		driverShare := payment.RoundRupees(total * ambType.DriverShare / 100.0)
+		driverShare := payment.RoundRupees(total * effShare / 100.0)
 
 		estimates = append(estimates, estimate{
 			AmbTypeID:   ambType.ID,
 			Name:        ambType.Name,
-			BaseFare:    ambType.BaseFare,
+			BaseFare:    effBase,
 			Total:       total,
 			DriverShare: driverShare,
 		})

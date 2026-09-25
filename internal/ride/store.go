@@ -707,9 +707,13 @@ func (s *Store) CreateRide(ctx context.Context, ride *Ride) error {
 		conditionOnArrivalArg = data
 	}
 
+	var regionIDArg interface{}
+	if ride.RegionID != nil && *ride.RegionID != "" {
+		regionIDArg = *ride.RegionID
+	}
 	_, err = s.db.Exec(ctx,
-		`INSERT INTO rides (id, user_id, driver_id, amb_type_id, hospital_id, start_otp, status, pickup, pickup_address, pickup_h3_cell, drop, drop_address, route_distance_km, route_duration_seconds, route_polyline, fare_base, fare_distance, fare_emergency, fare_night, fare_waiting, fare_total, fare_driver_share, fare_referral_discount, fare_currency, emergency_type, emergency_priority, payment_mode, payment_id, created_at, assigned_at, arrived_at, started_at, completed_at, cancelled_at, dispatch_candidates_searched, dispatch_offers_sent, dispatch_offers_declined, dispatch_offers_timed_out, dispatch_assignment_latency_ms, cancellation_reason, available_types, latest_condition, condition_on_arrival)
-		 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::uuid, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41::jsonb, $42::jsonb, $43::jsonb)`,
+		`INSERT INTO rides (id, user_id, driver_id, amb_type_id, hospital_id, start_otp, status, pickup, pickup_address, pickup_h3_cell, drop, drop_address, route_distance_km, route_duration_seconds, route_polyline, fare_base, fare_distance, fare_emergency, fare_night, fare_waiting, fare_total, fare_driver_share, fare_referral_discount, fare_currency, emergency_type, emergency_priority, payment_mode, payment_id, created_at, assigned_at, arrived_at, started_at, completed_at, cancelled_at, dispatch_candidates_searched, dispatch_offers_sent, dispatch_offers_declined, dispatch_offers_timed_out, dispatch_assignment_latency_ms, cancellation_reason, available_types, latest_condition, condition_on_arrival, region_id)
+		 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::uuid, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41::jsonb, $42::jsonb, $43::jsonb, $44::uuid)`,
 		ride.ID,
 		ride.UserID,
 		driverIDArg,
@@ -753,8 +757,19 @@ func (s *Store) CreateRide(ctx context.Context, ride *Ride) error {
 		availableTypesArg,
 		latestConditionArg,
 		conditionOnArrivalArg,
+		regionIDArg,
 	)
 	return err
+}
+
+// GetRideRegionID returns the saved pricing region for a ride (nil = global).
+func (s *Store) GetRideRegionID(ctx context.Context, rideID string) (*string, error) {
+	var v *string
+	err := s.db.QueryRow(ctx, `SELECT region_id::text FROM rides WHERE id=$1::uuid`, rideID).Scan(&v)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // AtomicAssignDriver safely assigns a driver to a ride ONLY if the ride is still SEARCHING.
