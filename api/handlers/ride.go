@@ -255,12 +255,18 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	regionIDStr := ""
+	if newRide.RegionID != nil {
+		regionIDStr = *newRide.RegionID
+	}
+	log.Info().Str("ride_id", newRide.ID).Str("region_id", regionIDStr).Msg("Ride requested with region")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Ride requested successfully",
-		"ride_id": newRide.ID,
-		"otp":     otp, // Returning OTP so the user's app can display it
+		"message":   "Ride requested successfully",
+		"ride_id":   newRide.ID,
+		"otp":       otp, // Returning OTP so the user's app can display it
+		"region_id": regionIDStr,
 	})
 }
 
@@ -1067,7 +1073,7 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
-		effBase, pricingTiers, effShare, _ := h.effectivePrice(r.Context(), req.PickupLat, req.PickupLng, ambType)
+		effBase, pricingTiers, effShare, regionID := h.effectivePrice(r.Context(), req.PickupLat, req.PickupLng, ambType)
 
 		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, effBase, pricingTiers)
 		emergency := h.PricingEngine.CalculateEmergencySurcharge(base, req.IsSOS)
@@ -1075,9 +1081,14 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 		total := payment.RoundRupees(base+emergency+night)
 
 		driverShare := payment.RoundRupees(total * effShare / 100.0)
+		regionIDStr := ""
+		if regionID != nil {
+			regionIDStr = *regionID
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
+			"region_id": regionIDStr,
 			"estimates": []map[string]interface{}{
 				{
 					"amb_type_id":  ambType.ID,
@@ -1085,6 +1096,7 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 					"base_fare":    effBase,
 					"total":        total,
 					"driver_share": driverShare,
+					"region_id":    regionIDStr,
 				},
 			},
 		})
