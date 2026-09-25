@@ -46,6 +46,11 @@ type Driver struct {
 	VehicleReg         string         `db:"vehicle_registration" json:"vehicle_registration" validate:"required"`
 	WalletDetails      *WalletDetails `db:"wallet_details" json:"wallet_details,omitempty"`
 	WalletBalance      float64        `db:"wallet_balance" json:"wallet_balance"`
+	// WalletVerified gates the first payout: set only after bank-account
+	// verification (penny-drop / name-match) succeeds. Unverified drivers
+	// can save details but cannot withdraw.
+	WalletVerified   bool       `db:"wallet_verified" json:"wallet_verified"`
+	WalletVerifiedAt *time.Time `db:"wallet_verified_at" json:"wallet_verified_at,omitempty"`
 	ReferralCode       string         `db:"referral_code" json:"referral_code"`
 	MyReferralCode     string         `db:"my_referral_code" json:"my_referral_code,omitempty"`
 	Location           *GeoJSONPoint  `db:"location" json:"location,omitempty"`
@@ -53,6 +58,8 @@ type Driver struct {
 	JWTToken           *string        `db:"jwt_token" json:"jwt_token,omitempty"`
 	LastLocationUpdate *time.Time     `db:"last_location_update" json:"last_location_update,omitempty"`
 	Details            *DriverDetails `db:"details" json:"details,omitempty"`
+	// MDAmbulanceID is the effective MD ambulance (resolved live by mobile).
+	MDAmbulanceID *string `db:"md_ambulance_id" json:"md_ambulance_id,omitempty"`
 }
 
 type UnverifiedDriver struct {
@@ -141,16 +148,20 @@ type HospitalMD struct {
 }
 
 type HospitalReceptionist struct {
-	ID            string    `db:"id" json:"_id"`
-	HospitalID    string    `db:"hospital_id" json:"hospital_id"`
-	CreatedByMDID string    `db:"created_by_md_id" json:"created_by_md_id"`
-	Name          string    `db:"name" json:"name"`
-	Username      string    `db:"username" json:"username"`
-	PasswordHash  string    `db:"password_hash" json:"-"`
-	Mobile        *string   `db:"mobile" json:"mobile,omitempty"`
-	Active        bool      `db:"active" json:"active"`
-	CreatedAt     time.Time `db:"created_at" json:"created_at"`
-	JWTToken      *string   `db:"jwt_token" json:"jwt_token,omitempty"`
+	ID                 string    `db:"id" json:"_id"`
+	HospitalID         string    `db:"hospital_id" json:"hospital_id"`
+	CreatedByMDID      string    `db:"created_by_md_id" json:"created_by_md_id"`
+	Name               string    `db:"name" json:"name"`
+	Username           string    `db:"username" json:"username"`
+	Email              *string   `db:"email" json:"email,omitempty"`
+	PasswordHash       string    `db:"password_hash" json:"-"`
+	Mobile             *string   `db:"mobile" json:"mobile,omitempty"`
+	Active             bool      `db:"active" json:"active"`
+	Status             string    `db:"status" json:"status"`
+	MustChangePassword bool      `db:"must_change_password" json:"must_change_password"`
+	InvitedAt          time.Time `db:"invited_at" json:"invited_at"`
+	CreatedAt          time.Time `db:"created_at" json:"created_at"`
+	JWTToken           *string   `db:"jwt_token" json:"jwt_token,omitempty"`
 }
 
 type AmbulanceAttendant struct {

@@ -893,6 +893,22 @@ func (s *Store) UpdateRideFare(ctx context.Context, rideID string, fare *Fare) e
 	return err
 }
 
+// EscalateEmergencyForStoppedVehicle flips a normal IN_PROGRESS ride to
+// emergency priority after a confirmed 5-minute stop. The guarded WHERE
+// clause makes it idempotent: SOS rides, finished rides, or repeat calls
+// affect 0 rows and report escalated=false. Fare is intentionally untouched
+// (locked at booking time).
+func (s *Store) EscalateEmergencyForStoppedVehicle(ctx context.Context, rideID string) (bool, error) {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE rides SET emergency_priority=10, emergency_type=COALESCE(NULLIF(emergency_type,''),'stopped_vehicle') WHERE id=$1::uuid AND status='IN_PROGRESS' AND emergency_priority=0`,
+		rideID,
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // CancelStaleSearchingRides cancels all rides in SEARCHING state older than maxAge.
 // Returns the count of cancelled rides.
 func (s *Store) CancelStaleSearchingRides(ctx context.Context, maxAge time.Duration) (int64, error) {
@@ -1091,6 +1107,19 @@ func (s *Store) ListConditionUpdatesBatch(ctx context.Context, rideIDs []string)
 		}
 	}
 	return m, nil
+}
+
+// UpdateRideActuals persists gated re-rate results: actual drop/route + new fare.
+// Estimate stays in route_*/drop; actuals go to actual_* for dispute audit.
+func (s *Store) UpdateRideActuals(ctx context.Context, rideID string, actualDrop []byte, actualKm float64, actualSecs int, polyline string, fare *Fare, reason string) error {
+	if fare == nil {
+		return errors.New("nil fare")
+	}
+	_, err := s.db.Exec(ctx,
+		`UPDATE rides SET actual_drop=$2::jsonb, actual_distance_km=$3, actual_duration_seconds=$4, actual_polyline=$5, fare_base=$6, fare_distance=$7, fare_emergency=$8, fare_night=$9, fare_waiting=$10, fare_total=$11, fare_driver_share=$12, fare_referral_discount=$13, fare_currency=$14, fare_recalc_reason=$15 WHERE id=$1::uuid`,
+		rideID, actualDrop, actualKm, actualSecs, polyline,
+		fare.BaseFare, fare.DistanceFare, fare.EmergencySurcharge, fare.NightSurcharge, fare.WaitingCharge, fare.Total, fare.DriverShare, fare.ReferralDiscount, fare.Currency, reason)
+	return err
 }
 
 // PopulateConditionUpdates fills Ride.ConditionUpdates for each ride in slice.
