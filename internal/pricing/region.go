@@ -229,7 +229,7 @@ func FillCellsForCircle(lat, lng, radiusM float64) ([]string, error) {
 
 func (s *RegionStore) CreateRegion(ctx context.Context, name string, osmID int64, polygonJSON []byte, cells []string) (*Region, error) {
 	r := &Region{ID: ids.New(), Name: name, OsmID: osmID, Cells: cells, CellRes: RegionCellRes}
-	var polyArg interface{}
+	polyArg := []byte(`{}`)
 	if len(polygonJSON) > 0 {
 		polyArg = polygonJSON
 	}
