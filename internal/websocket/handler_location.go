@@ -56,6 +56,17 @@ func (m *Manager) handleLocationUpdate(client *Client, payload json.RawMessage) 
 		}
 	}
 
+	// Persist trail for gated re-rate (same-drop detour detection).
+	// Fire-and-forget: never block the WS read pump on DB.
+	if rideID != "" && m.RideStore != nil {
+		lat, lng := update.Lat, update.Lng
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = m.RideStore.InsertTrailPoint(ctx, rideID, lat, lng)
+		}()
+	}
+
 	// Publish driver location event (subscriber handles onward relay to ride watchers)
 	if m.EventBus != nil {
 		m.EventBus.PublishEvent(eventbus.ChannelDriverLocationUpdate, eventbus.DriverLocationUpdatePayload{

@@ -1109,6 +1109,19 @@ func (s *Store) ListConditionUpdatesBatch(ctx context.Context, rideIDs []string)
 	return m, nil
 }
 
+// UpdateRideActuals persists gated re-rate results: actual drop/route + new fare.
+// Estimate stays in route_*/drop; actuals go to actual_* for dispute audit.
+func (s *Store) UpdateRideActuals(ctx context.Context, rideID string, actualDrop []byte, actualKm float64, actualSecs int, polyline string, fare *Fare, reason string) error {
+	if fare == nil {
+		return errors.New("nil fare")
+	}
+	_, err := s.db.Exec(ctx,
+		`UPDATE rides SET actual_drop=$2::jsonb, actual_distance_km=$3, actual_duration_seconds=$4, actual_polyline=$5, fare_base=$6, fare_distance=$7, fare_emergency=$8, fare_night=$9, fare_waiting=$10, fare_total=$11, fare_driver_share=$12, fare_referral_discount=$13, fare_currency=$14, fare_recalc_reason=$15 WHERE id=$1::uuid`,
+		rideID, actualDrop, actualKm, actualSecs, polyline,
+		fare.BaseFare, fare.DistanceFare, fare.EmergencySurcharge, fare.NightSurcharge, fare.WaitingCharge, fare.Total, fare.DriverShare, fare.ReferralDiscount, fare.Currency, reason)
+	return err
+}
+
 // PopulateConditionUpdates fills Ride.ConditionUpdates for each ride in slice.
 // Call after ListRidesByHospital / ListRidesByHospitalSince to avoid N+1 on hospital pages.
 func (s *Store) PopulateConditionUpdates(ctx context.Context, rides []*Ride) error {
