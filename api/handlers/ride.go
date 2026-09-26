@@ -69,8 +69,10 @@ func (h *RideHandler) effectivePrice(ctx context.Context, lat, lng float64, ambT
 	}
 	resolved, err := h.RegionStore.ResolvePriceForPickup(ctx, lat, lng, ambType.ID, ambType.BaseFare, tiers, ambType.DriverShare, ambType.ListingThreshold, ambType.HelperIncluded, ambType.OTPRequired)
 	if err != nil || resolved == nil || !resolved.IsOverride {
+		logger.Log.Debug().Err(err).Float64("lat", lat).Float64("lng", lng).Str("amb_type", ambType.ID).Msg("Region fallback to global")
 		return base, tiers, share, nil
 	}
+	logger.Log.Debug().Str("region_id", *resolved.RegionID).Float64("lat", lat).Float64("lng", lng).Msg("Region override applied")
 	return resolved.BaseFare, resolved.Tiers, resolved.DriverShare, resolved.RegionID
 }
 

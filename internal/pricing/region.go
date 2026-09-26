@@ -21,6 +21,11 @@ import (
 // V2 H3 region pricing. Polygons come from OSM Nominatim once per city
 // (admin time), stored as H3 cell sets at RegionCellRes. Per-ride lookup is
 // a local GIN set-membership check — zero external cost.
+var (
+	errNoRegion = errors.New("no region contains pickup")
+	errNoPrice  = errors.New("region has no price for type")
+)
+
 const (
 	RegionCellRes = 7
 	RegionMaxCells = 20000
@@ -109,14 +114,20 @@ func FetchPolygonFromOSM(ctx context.Context, cityQuery string) (int64, []byte, 
 }
 
 // FillCellsForGeometry converts a GeoJSON geometry (Polygon/MultiPolygon,
-// coordinates as [lng,lat]) to H3 cells at RegionCellRes via PolygonToCells.
+// coordinates as [lng,lat]) to H3 cells via PolygonToCells. Tries res 7
+// (cities); falls back to res 6 for large states exceeding the cap.
 func FillCellsForGeometry(geomJSON []byte) ([]string, error) {
+	cells, _, err := FillCellsForGeometryRes(geomJSON)
+	return cells, err
+}
+
+func FillCellsForGeometryRes(geomJSON []byte) ([]string, int, error) {
 	var g struct {
 		Type        string          `json:"type"`
 		Coordinates json.RawMessage `json:"coordinates"`
 	}
 	if err := json.Unmarshal(geomJSON, &g); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	toLoop := func(ring [][]float64) h3.GeoLoop {
 		loop := make(h3.GeoLoop, 0, len(ring))
@@ -133,10 +144,10 @@ func FillCellsForGeometry(geomJSON []byte) ([]string, error) {
 	case "Polygon":
 		var rings [][][]float64
 		if err := json.Unmarshal(g.Coordinates, &rings); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if len(rings) == 0 {
-			return nil, errors.New("empty polygon")
+			return nil, 0, errors.New("empty polygon")
 		}
 		p := h3.GeoPolygon{GeoLoop: toLoop(rings[0])}
 		for _, h := range rings[1:] {
@@ -146,7 +157,7 @@ func FillCellsForGeometry(geomJSON []byte) ([]string, error) {
 	case "MultiPolygon":
 		var multi [][][][]float64
 		if err := json.Unmarshal(g.Coordinates, &multi); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		for _, rings := range multi {
 			if len(rings) == 0 {
@@ -159,30 +170,41 @@ func FillCellsForGeometry(geomJSON []byte) ([]string, error) {
 			polys = append(polys, p)
 		}
 	default:
-		return nil, fmt.Errorf("unsupported geometry %s", g.Type)
+		return nil, 0, fmt.Errorf("unsupported geometry %s", g.Type)
 	}
-	seen := make(map[string]bool)
-	var out []string
-	for _, p := range polys {
-		cells, err := h3.PolygonToCells(p, RegionCellRes)
-		if err != nil {
-			return nil, err
-		}
-		for _, c := range cells {
-			s := c.String()
-			if !seen[s] {
-				seen[s] = true
-				out = append(out, s)
+	fill := func(res int) ([]string, error) {
+		seen := make(map[string]bool)
+		var out []string
+		for _, p := range polys {
+			cells, err := h3.PolygonToCells(p, res)
+			if err != nil {
+				return nil, err
 			}
-			if len(out) > RegionMaxCells {
-				return nil, fmt.Errorf("region too large (%d cells), simplify polygon or lower res", len(out))
+			for _, c := range cells {
+				s := c.String()
+				if !seen[s] {
+					seen[s] = true
+					out = append(out, s)
+				}
+				if len(out) > RegionMaxCells {
+					return nil, fmt.Errorf("too large")
+				}
 			}
 		}
+		if len(out) == 0 {
+			return nil, errors.New("no cells filled")
+		}
+		return out, nil
 	}
-	if len(out) == 0 {
-		return nil, errors.New("no cells filled")
+	if out, err := fill(RegionCellRes); err == nil {
+		return out, RegionCellRes, nil
 	}
-	return out, nil
+	// Large state (e.g. Andhra Pradesh): fall back to res 6.
+	out, err := fill(RegionCellRes - 1)
+	if err != nil {
+		return nil, 0, fmt.Errorf("region too large even at res %d, split into districts", RegionCellRes-1)
+	}
+	return out, RegionCellRes - 1, nil
 }
 
 // FillCellsForCircle fallback when OSM has no boundary: GridDisk cover filtered by haversine.
@@ -228,7 +250,14 @@ func FillCellsForCircle(lat, lng, radiusM float64) ([]string, error) {
 // ---- CRUD ----
 
 func (s *RegionStore) CreateRegion(ctx context.Context, name string, osmID int64, polygonJSON []byte, cells []string) (*Region, error) {
-	r := &Region{ID: ids.New(), Name: name, OsmID: osmID, Cells: cells, CellRes: RegionCellRes}
+	return s.CreateRegionRes(ctx, name, osmID, polygonJSON, cells, RegionCellRes)
+}
+
+func (s *RegionStore) CreateRegionRes(ctx context.Context, name string, osmID int64, polygonJSON []byte, cells []string, res int) (*Region, error) {
+	if res <= 0 {
+		res = RegionCellRes
+	}
+	r := &Region{ID: ids.New(), Name: name, OsmID: osmID, Cells: cells, CellRes: res}
 	polyArg := []byte(`{}`)
 	if len(polygonJSON) > 0 {
 		polyArg = polygonJSON
@@ -268,22 +297,41 @@ func (s *RegionStore) DeleteRegion(ctx context.Context, id string) error {
 }
 
 // FindRegionForPickup returns smallest matching region (smallest wins on overlap).
+// Matches in Go with per-region resolution so states (res 6) and cities (res 7)
+// can coexist. Region count is small (<100), so full scan is cheap and avoids
+// GIN resolution mismatch.
 func (s *RegionStore) FindRegionForPickup(ctx context.Context, lat, lng float64) (*Region, error) {
-	cell, err := h3.LatLngToCell(h3.NewLatLng(lat, lng), RegionCellRes)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, osm_id, cells, cell_res FROM pricing_regions`)
 	if err != nil {
 		return nil, err
 	}
-	row := s.pool.QueryRow(ctx,
-		`SELECT id::text, name, osm_id, cells, cell_res FROM pricing_regions WHERE cells @> $1::text[] ORDER BY array_length(cells, 1) ASC LIMIT 1`,
-		[]string{cell.String()})
-	var r Region
-	if err := row.Scan(&r.ID, &r.Name, &r.OsmID, &r.Cells, &r.CellRes); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
+	defer rows.Close()
+	var best *Region
+	for rows.Next() {
+		var r Region
+		if err := rows.Scan(&r.ID, &r.Name, &r.OsmID, &r.Cells, &r.CellRes); err != nil {
+			return nil, err
 		}
-		return nil, err
+		res := r.CellRes
+		if res <= 0 {
+			res = RegionCellRes
+		}
+		cell, err := h3.LatLngToCell(h3.NewLatLng(lat, lng), res)
+		if err != nil {
+			continue
+		}
+		want := cell.String()
+		for _, c := range r.Cells {
+			if c == want {
+				if best == nil || len(r.Cells) < len(best.Cells) {
+					cp := r
+					best = &cp
+				}
+				break
+			}
+		}
 	}
-	return &r, nil
+	return best, rows.Err()
 }
 
 func (s *RegionStore) UpsertRegionPrice(ctx context.Context, p *RegionPrice) error {
@@ -338,12 +386,18 @@ func (s *RegionStore) ResolvePriceForPickup(ctx context.Context, lat, lng float6
 		ListingThreshold: globalListing, HelperIncluded: globalHelper, OTPRequired: globalOTP,
 	}
 	region, err := s.FindRegionForPickup(ctx, lat, lng)
-	if err != nil || region == nil {
+	if err != nil {
 		return base, err
 	}
+	if region == nil {
+		return base, errNoRegion
+	}
 	override, err := s.GetRegionPrice(ctx, region.ID, ambTypeID)
-	if err != nil || override == nil {
+	if err != nil {
 		return base, err
+	}
+	if override == nil {
+		return base, errNoPrice
 	}
 	rid := region.ID
 	return &ResolvedPrice{

@@ -46,6 +46,7 @@ func (h *RegionHandler) HandleFetchRegionFromOSM(w http.ResponseWriter, r *http.
 	var cells []string
 	var osmID int64
 	var geom []byte
+	res := pricing.RegionCellRes
 	name := req.Name
 	if name == "" {
 		name = req.CityQuery
@@ -53,8 +54,8 @@ func (h *RegionHandler) HandleFetchRegionFromOSM(w http.ResponseWriter, r *http.
 	if req.CityQuery != "" {
 		id, g, _, err := pricing.FetchPolygonFromOSM(ctx, req.CityQuery)
 		if err == nil {
-			if c, ferr := pricing.FillCellsForGeometry(g); ferr == nil && len(c) > 0 {
-				cells, osmID, geom = c, id, g
+			if c, cr, ferr := pricing.FillCellsForGeometryRes(g); ferr == nil && len(c) > 0 {
+				cells, osmID, geom, res = c, id, g, cr
 			}
 		}
 	}
@@ -73,7 +74,7 @@ func (h *RegionHandler) HandleFetchRegionFromOSM(w http.ResponseWriter, r *http.
 		response.Error(w, "name/city_query required", http.StatusBadRequest)
 		return
 	}
-	region, err := h.Regions.CreateRegion(ctx, name, osmID, geom, cells)
+	region, err := h.Regions.CreateRegionRes(ctx, name, osmID, geom, cells, res)
 	if err != nil {
 		response.Error(w, err.Error(), http.StatusInternalServerError)
 		return
