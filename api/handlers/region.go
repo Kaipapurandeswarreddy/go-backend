@@ -1,10 +1,8 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"ambigo-backend/api/response"
 	"ambigo-backend/internal/pricing"
@@ -27,8 +25,8 @@ func (h *RegionHandler) HandleListRegions(w http.ResponseWriter, r *http.Request
 	response.Success(w, http.StatusOK, map[string]interface{}{"regions": list})
 }
 
-// HandleSearchRegions: {query} -> ranked OSM candidates for the admin picker.
-// Debounce client-side (~500ms); no polygons fetched here.
+// HandleSearchRegions is a local text search over seeded regions — instant,
+// no network. Used by the admin picker.
 func (h *RegionHandler) HandleSearchRegions(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Query string `json:"query"`
@@ -37,101 +35,55 @@ func (h *RegionHandler) HandleSearchRegions(w http.ResponseWriter, r *http.Reque
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	places, err := pricing.SearchOSMPlaces(ctx, req.Query)
+	places, err := h.Regions.SearchRegions(r.Context(), req.Query)
 	if err != nil {
-		response.Error(w, err.Error(), http.StatusBadGateway)
+		response.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	response.Success(w, http.StatusOK, map[string]interface{}{"places": places})
 }
 
-// HandleFetchRegionFromOSM saves a region. Preferred: exact {osm_type, osm_id}
-// from the search picker (deterministic lookup, no ranking). Legacy:
-// {city_query} ranked fetch. Circle fallback via {lat,lng,radius_m}.
-// {name} defaults to matched display name / query.
+// HandleFetchRegionFromOSM now creates circle regions only (villages without a
+// seeded border). Seeded state/district borders come from data/areas_ap_tg.geojson
+// via cmd/seed_regions — no live map calls, so rate limits are impossible.
 func (h *RegionHandler) HandleFetchRegionFromOSM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		CityQuery string  `json:"city_query"`
-		OsmType   string  `json:"osm_type"`
-		OsmID     int64   `json:"osm_id"`
-		Name      string  `json:"name"`
-		Lat       float64 `json:"lat"`
-		Lng       float64 `json:"lng"`
-		RadiusM   float64 `json:"radius_m"`
+		Name    string  `json:"name"`
+		Lat     float64 `json:"lat"`
+		Lng     float64 `json:"lng"`
+		RadiusM float64 `json:"radius_m"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
-	defer cancel()
-	var cells []string
-	var osmID int64
-	var osmType string
-	var geom []byte
-	matched := ""
-	res := pricing.RegionCellRes
-	name := req.Name
-	if req.OsmType != "" && req.OsmID != 0 {
-		g, _, display, err := pricing.FetchPolygonByOsmID(ctx, req.OsmType, req.OsmID)
-		if err != nil {
-			response.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		c, cr, ferr := pricing.FillCellsForGeometryRes(g)
-		if ferr != nil || len(c) == 0 {
-			response.Error(w, "Could not build H3 cover: "+ferr.Error(), http.StatusBadGateway)
-			return
-		}
-		cells, osmID, osmType, geom, res, matched = c, req.OsmID, req.OsmType, g, cr, display
-		if name == "" {
-			name = display
-		}
-	} else {
-		if name == "" {
-			name = req.CityQuery
-		}
-		if req.CityQuery != "" {
-			id, g, _, display, err := pricing.FetchPolygonFromOSM(ctx, req.CityQuery)
-			if err == nil {
-				if c, cr, ferr := pricing.FillCellsForGeometryRes(g); ferr == nil && len(c) > 0 {
-					cells, osmID, geom, res, matched = c, id, g, cr, display
-				}
-			}
-		}
-	}
-	if len(cells) == 0 {
-		if req.Lat == 0 && req.Lng == 0 {
-			response.Error(w, "OSM found no border for that query and no lat/lng given — retry as 'City, State, IN' or fill lat/lng/radius circle", http.StatusBadRequest)
-			return
-		}
-		if req.RadiusM <= 0 {
-			req.RadiusM = 30000
-		}
-		c, err := pricing.FillCellsForCircle(req.Lat, req.Lng, req.RadiusM)
-		if err != nil {
-			response.Error(w, "Could not resolve region (OSM miss + circle failed): "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		cells = c
-	}
-	if name == "" {
-		response.Error(w, "name/city_query required", http.StatusBadRequest)
+	if req.Name == "" {
+		response.Error(w, "name required", http.StatusBadRequest)
 		return
 	}
-	region, err := h.Regions.CreateRegionFull(ctx, name, osmType, osmID, matched, geom, cells, res)
+	if req.Lat == 0 && req.Lng == 0 {
+		response.Error(w, "lat/lng required for circle regions", http.StatusBadRequest)
+		return
+	}
+	if req.RadiusM <= 0 {
+		req.RadiusM = 30000
+	}
+	cells, err := pricing.FillCellsForCircle(req.Lat, req.Lng, req.RadiusM)
+	if err != nil {
+		response.Error(w, "Could not build circle: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	region, err := h.Regions.CreateRegionFull(r.Context(), req.Name, "", 0, "", nil, cells, pricing.RegionCellRes, "circle", nil, "circle")
 	if err != nil {
 		response.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	response.Success(w, http.StatusCreated, map[string]interface{}{"region": region, "cells": len(cells), "res": res, "matched": matched})
+	response.Success(w, http.StatusCreated, map[string]interface{}{"region": region, "cells": len(cells), "res": pricing.RegionCellRes, "matched": "circle"})
 }
 
-// HandleRefreshRegion re-pulls the stored OSM object (stale borders after
-// bifurcations/merges) and rewrites cells. Circle regions (osm_id=0) cannot
-// refresh — delete + re-add.
+// HandleRefreshRegion recomputes H3 cells from the stored polygon — fully
+// local (e.g. after a resolution change). Circle regions have no polygon:
+// delete + re-add.
 func (h *RegionHandler) HandleRefreshRegion(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID string `json:"id"`
@@ -140,33 +92,32 @@ func (h *RegionHandler) HandleRefreshRegion(w http.ResponseWriter, r *http.Reque
 		response.Error(w, "id required", http.StatusBadRequest)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
-	defer cancel()
-	existing, err := h.Regions.GetRegion(ctx, req.ID)
+	existing, err := h.Regions.GetRegion(r.Context(), req.ID)
 	if err != nil || existing == nil {
 		response.Error(w, "region not found", http.StatusNotFound)
 		return
 	}
-	if existing.OsmID == 0 || existing.OsmType == "" {
-		response.Error(w, "circle region has no OSM source — delete + re-add", http.StatusBadRequest)
+	if existing.OsmID == 0 && len(existing.Cells) > 0 {
+		// Circle or legacy row without polygon — nothing to recompute from.
+		response.Success(w, http.StatusOK, map[string]interface{}{"region": existing, "cells": len(existing.Cells), "res": existing.CellRes, "matched": "unchanged"})
 		return
 	}
-	g, _, display, err := pricing.FetchPolygonByOsmID(ctx, existing.OsmType, existing.OsmID)
-	if err != nil {
-		response.Error(w, err.Error(), http.StatusBadGateway)
+	rows, err := h.Regions.PolygonFor(r.Context(), req.ID)
+	if err != nil || len(rows) == 0 {
+		response.Error(w, "no stored polygon — delete + re-add", http.StatusBadRequest)
 		return
 	}
-	cells, res, err := pricing.FillCellsForGeometryRes(g)
+	cells, res, err := pricing.FillCellsForGeometryRes(rows)
 	if err != nil || len(cells) == 0 {
 		response.Error(w, "Could not build H3 cover: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	updated, err := h.Regions.RefreshRegionCells(ctx, req.ID, cells, res, g)
+	updated, err := h.Regions.RefreshRegionCells(r.Context(), req.ID, cells, res, rows)
 	if err != nil {
 		response.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	response.Success(w, http.StatusOK, map[string]interface{}{"region": updated, "cells": len(cells), "res": res, "matched": display})
+	response.Success(w, http.StatusOK, map[string]interface{}{"region": updated, "cells": len(cells), "res": res, "matched": updated.DisplayName})
 }
 
 func (h *RegionHandler) HandleDeleteRegion(w http.ResponseWriter, r *http.Request) {
@@ -215,6 +166,13 @@ func (h *RegionHandler) HandleGetRegionPrice(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if p == nil {
+		// Parent-state fallback for the editor preview (mirrors ride pricing).
+		if region, rerr := h.Regions.GetRegion(r.Context(), regionID); rerr == nil && region != nil && region.ParentID != nil && *region.ParentID != "" {
+			if pp, perr := h.Regions.GetRegionPrice(r.Context(), *region.ParentID, ambTypeID); perr == nil && pp != nil {
+				response.Success(w, http.StatusOK, map[string]interface{}{"price": pp, "inherited_from": *region.ParentID})
+				return
+			}
+		}
 		response.Error(w, "not found, using global", http.StatusNotFound)
 		return
 	}
