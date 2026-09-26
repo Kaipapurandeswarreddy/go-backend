@@ -38,6 +38,67 @@ const (
 
 var osmClient = &http.Client{Timeout: 15 * time.Second}
 
+// doOSMGet performs a Nominatim GET with retry on 429 (shared egress IP across
+// instances can exceed the 1 req/s policy even with client debounce).
+// Honors Retry-After, backs off 1.5s/3s, then gives up with a friendly error.
+func doOSMGet(ctx context.Context, u string) (*http.Response, []byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			wait := time.Duration(attempt) * 1500 * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		} else {
+			throttleOSM()
+		}
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("User-Agent", "AmbigoBackend/1.0 (pricing-region)")
+		req.Header.Set("Accept", "application/json")
+		resp, err := osmClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter := resp.Header.Get("Retry-After")
+			_ = resp.Body.Close()
+			if secs, perr := strconv.Atoi(strings.TrimSpace(retryAfter)); perr == nil && secs > 0 && secs <= 30 {
+				select {
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				case <-time.After(time.Duration(secs) * time.Second):
+				}
+			}
+			lastErr = fmt.Errorf("nominatim status 429")
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			return nil, nil, fmt.Errorf("nominatim status %d", resp.StatusCode)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		_ = resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return resp, body, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("OSM busy — wait a few seconds and retry")
+	}
+	if lastErr.Error() == "nominatim status 429" {
+		return nil, nil, errors.New("OSM rate limit — wait ~10 seconds and retry")
+	}
+	return nil, nil, lastErr
+}
+
 // throttleOSM keeps us inside Nominatim's usage policy (1 req/s).
 // Admin-scale traffic only; single-process mutex is enough.
 var (
@@ -107,21 +168,7 @@ type osmFeature struct {
 func FetchPolygonFromOSM(ctx context.Context, cityQuery string) (int64, []byte, string, string, error) {
 	q := url.QueryEscape(cityQuery)
 	u := fmt.Sprintf("%s?q=%s&format=geojson&polygon_geojson=1&limit=5", osmSearchURL, q)
-	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-	if err != nil {
-		return 0, nil, "", "", err
-	}
-	req.Header.Set("User-Agent", "AmbigoBackend/1.0 (pricing-region-fetch)")
-	req.Header.Set("Accept", "application/json")
-	resp, err := osmClient.Do(req)
-	if err != nil {
-		return 0, nil, "", "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, nil, "", "", fmt.Errorf("nominatim status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	_, body, err := doOSMGet(ctx, u)
 	if err != nil {
 		return 0, nil, "", "", err
 	}
@@ -197,24 +244,9 @@ func SearchOSMPlaces(ctx context.Context, query string) ([]OSMPlace, error) {
 	if len([]rune(strings.TrimSpace(query))) < 3 {
 		return nil, errors.New("type at least 3 letters")
 	}
-	throttleOSM()
 	q := url.QueryEscape(query)
 	u := fmt.Sprintf("%s?q=%s&format=json&addressdetails=1&limit=8", osmSearchURL, q)
-	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "AmbigoBackend/1.0 (pricing-region-search)")
-	req.Header.Set("Accept", "application/json")
-	resp, err := osmClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("nominatim status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_, body, err := doOSMGet(ctx, u)
 	if err != nil {
 		return nil, err
 	}
@@ -251,23 +283,8 @@ func FetchPolygonByOsmID(ctx context.Context, osmType string, osmID int64) (geom
 	default:
 		return nil, "", "", fmt.Errorf("osm_type must be node, way or relation")
 	}
-	throttleOSM()
 	u := fmt.Sprintf("%s?osm_ids=%s%d&format=geojson&polygon_geojson=1", osmLookupURL, prefix, osmID)
-	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-	if err != nil {
-		return nil, "", "", err
-	}
-	req.Header.Set("User-Agent", "AmbigoBackend/1.0 (pricing-region-fetch)")
-	req.Header.Set("Accept", "application/json")
-	resp, err := osmClient.Do(req)
-	if err != nil {
-		return nil, "", "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", "", fmt.Errorf("nominatim status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	_, body, err := doOSMGet(ctx, u)
 	if err != nil {
 		return nil, "", "", err
 	}
