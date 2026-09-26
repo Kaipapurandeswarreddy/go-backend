@@ -9,6 +9,9 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"ambigo-backend/internal/ids"
@@ -29,17 +32,37 @@ var (
 const (
 	RegionCellRes = 7
 	RegionMaxCells = 20000
-	osmSearchURL = "https://nominatim.openstreetmap.org/search"
+	osmSearchURL  = "https://nominatim.openstreetmap.org/search"
+	osmLookupURL  = "https://nominatim.openstreetmap.org/lookup"
 )
 
 var osmClient = &http.Client{Timeout: 15 * time.Second}
 
+// throttleOSM keeps us inside Nominatim's usage policy (1 req/s).
+// Admin-scale traffic only; single-process mutex is enough.
+var (
+	osmMu   sync.Mutex
+	osmLast time.Time
+)
+
+func throttleOSM() {
+	osmMu.Lock()
+	defer osmMu.Unlock()
+	if wait := 1100*time.Millisecond - time.Since(osmLast); wait > 0 {
+		time.Sleep(wait)
+	}
+	osmLast = time.Now()
+}
+
 type Region struct {
-	ID     string   `json:"_id"`
-	Name   string   `json:"name"`
-	OsmID  int64    `json:"osm_id"`
-	Cells  []string `json:"cells"`
-	CellRes int     `json:"cell_res"`
+	ID          string     `json:"_id"`
+	Name        string     `json:"name"`
+	OsmType     string     `json:"osm_type,omitempty"`
+	OsmID       int64      `json:"osm_id"`
+	DisplayName string     `json:"display_name,omitempty"`
+	Cells       []string   `json:"cells"`
+	CellRes     int        `json:"cell_res"`
+	FetchedAt   *time.Time `json:"fetched_at,omitempty"`
 }
 
 type RegionPrice struct {
@@ -69,48 +92,207 @@ type osmFeature struct {
 		Coordinates json.RawMessage `json:"coordinates"`
 	} `json:"geometry"`
 	Properties struct {
-		OsmID int64 `json:"osm_id"`
+		OsmID       int64  `json:"osm_id"`
+		Category    string `json:"category"`
+		Addresstype string `json:"addresstype"`
+		DisplayName string `json:"display_name"`
 	} `json:"properties"`
 }
 
-// FetchPolygonFromOSM queries Nominatim for "<city>,<state>,IN" and returns
-// the raw geometry JSON + OSM id. Caller converts to H3 via FillCellsForGeometry.
-func FetchPolygonFromOSM(ctx context.Context, cityQuery string) (int64, []byte, string, error) {
+// FetchPolygonFromOSM queries Nominatim for e.g. "Andhra Pradesh, India" and
+// returns the raw geometry JSON + OSM id + display name. It scans up to 5
+// candidates and prefers boundary-class features (state/city/county) so a
+// bare query like "Andhrapradesh" matches the state instead of a forest
+// office or building that happens to contain the word.
+func FetchPolygonFromOSM(ctx context.Context, cityQuery string) (int64, []byte, string, string, error) {
 	q := url.QueryEscape(cityQuery)
-	u := fmt.Sprintf("%s?q=%s&format=geojson&polygon_geojson=1&limit=1", osmSearchURL, q)
+	u := fmt.Sprintf("%s?q=%s&format=geojson&polygon_geojson=1&limit=5", osmSearchURL, q)
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
-		return 0, nil, "", err
+		return 0, nil, "", "", err
 	}
 	req.Header.Set("User-Agent", "AmbigoBackend/1.0 (pricing-region-fetch)")
 	req.Header.Set("Accept", "application/json")
 	resp, err := osmClient.Do(req)
 	if err != nil {
-		return 0, nil, "", err
+		return 0, nil, "", "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, nil, "", fmt.Errorf("nominatim status %d", resp.StatusCode)
+		return 0, nil, "", "", fmt.Errorf("nominatim status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return 0, nil, "", err
+		return 0, nil, "", "", err
 	}
 	var fc struct {
 		Features []osmFeature `json:"features"`
 	}
 	if err := json.Unmarshal(body, &fc); err != nil {
-		return 0, nil, "", err
+		return 0, nil, "", "", err
 	}
-	if len(fc.Features) == 0 {
-		return 0, nil, "", errors.New("no boundary found for query")
+	// Pick best polygon candidate: must be Polygon/MultiPolygon; prefer
+	// boundary category, then state/county/city rank. Falls back to first
+	// polygon so small towns without boundary tags still work.
+	best := -1
+	bestScore := -1
+	for i, f := range fc.Features {
+		if f.Geometry.Type != "Polygon" && f.Geometry.Type != "MultiPolygon" {
+			continue
+		}
+		score := 0
+		if f.Properties.Category == "boundary" {
+			score += 2
+		}
+		switch f.Properties.Addresstype {
+		case "state", "county", "city", "town", "village", "suburb":
+			score++
+		}
+		if score > bestScore {
+			best, bestScore = i, score
+		}
 	}
-	f := fc.Features[0]
+	if best < 0 {
+		return 0, nil, "", "", errors.New("no polygon boundary found for query — try 'City, State, IN' or use circle fallback with lat/lng")
+	}
+	f := fc.Features[best]
+	if f.Properties.Addresstype == "country" {
+		return 0, nil, "", "", errors.New("country is too large — add states or cities instead")
+	}
 	geomJSON, err := json.Marshal(f.Geometry)
 	if err != nil {
-		return 0, nil, "", err
+		return 0, nil, "", "", err
 	}
-	return f.Properties.OsmID, geomJSON, f.Geometry.Type, nil
+	return f.Properties.OsmID, geomJSON, f.Geometry.Type, f.Properties.DisplayName, nil
+}
+
+// osmSearchHit is one Nominatim search candidate (light, no polygon).
+type osmSearchHit struct {
+	OsmType     string  `json:"osm_type"`
+	OsmID       int64   `json:"osm_id"`
+	DisplayName string  `json:"display_name"`
+	Category    string  `json:"category"`
+	Type        string  `json:"type"`
+	Addresstype string  `json:"addresstype"`
+	Lat         string  `json:"lat"`
+	Lon         string  `json:"lon"`
+}
+
+// OSMPlace is a ranked search candidate for the admin picker.
+type OSMPlace struct {
+	OsmType     string `json:"osm_type"`
+	OsmID       int64  `json:"osm_id"`
+	DisplayName string `json:"display_name"`
+	Category    string `json:"category"`
+	Type        string `json:"type"`
+	Addresstype string `json:"addresstype"`
+	Lat         string `json:"lat"`
+	Lon         string `json:"lon"`
+}
+
+// SearchOSMPlaces returns ranked candidates for the admin search bar.
+// Boundary features first, then importance order as returned by Nominatim.
+// No polygons fetched — light call, safe for debounced typing.
+func SearchOSMPlaces(ctx context.Context, query string) ([]OSMPlace, error) {
+	if len([]rune(strings.TrimSpace(query))) < 3 {
+		return nil, errors.New("type at least 3 letters")
+	}
+	throttleOSM()
+	q := url.QueryEscape(query)
+	u := fmt.Sprintf("%s?q=%s&format=json&addressdetails=1&limit=8", osmSearchURL, q)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "AmbigoBackend/1.0 (pricing-region-search)")
+	req.Header.Set("Accept", "application/json")
+	resp, err := osmClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("nominatim status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	var hits []osmSearchHit
+	if err := json.Unmarshal(body, &hits); err != nil {
+		return nil, err
+	}
+	out := make([]OSMPlace, 0, len(hits))
+	var bounds, rest []OSMPlace
+	for _, h := range hits {
+		p := OSMPlace{OsmType: h.OsmType, OsmID: h.OsmID, DisplayName: h.DisplayName, Category: h.Category, Type: h.Type, Addresstype: h.Addresstype, Lat: h.Lat, Lon: h.Lon}
+		if h.Category == "boundary" {
+			bounds = append(bounds, p)
+		} else {
+			rest = append(rest, p)
+		}
+	}
+	out = append(out, bounds...)
+	out = append(out, rest...)
+	return out, nil
+}
+
+// FetchPolygonByOsmID pulls the exact OSM object's polygon via the lookup API.
+// osmType is one of node|way|relation (Nominatim prefix R/N/W also accepted).
+func FetchPolygonByOsmID(ctx context.Context, osmType string, osmID int64) (geomJSON []byte, geomType, display string, err error) {
+	prefix := "R"
+	switch strings.ToLower(osmType) {
+	case "node", "n":
+		prefix = "N"
+	case "way", "w":
+		prefix = "W"
+	case "relation", "r":
+		prefix = "R"
+	default:
+		return nil, "", "", fmt.Errorf("osm_type must be node, way or relation")
+	}
+	throttleOSM()
+	u := fmt.Sprintf("%s?osm_ids=%s%d&format=geojson&polygon_geojson=1", osmLookupURL, prefix, osmID)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, "", "", err
+	}
+	req.Header.Set("User-Agent", "AmbigoBackend/1.0 (pricing-region-fetch)")
+	req.Header.Set("Accept", "application/json")
+	resp, err := osmClient.Do(req)
+	if err != nil {
+		return nil, "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", "", fmt.Errorf("nominatim status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, "", "", err
+	}
+	var fc struct {
+		Features []osmFeature `json:"features"`
+	}
+	if err := json.Unmarshal(body, &fc); err != nil {
+		return nil, "", "", err
+	}
+	if len(fc.Features) == 0 {
+		return nil, "", "", errors.New("OSM object not found — it may have been deleted; search again")
+	}
+	f := fc.Features[0]
+	if f.Geometry.Type != "Polygon" && f.Geometry.Type != "MultiPolygon" {
+		return nil, "", "", fmt.Errorf("%s has no area border (it is a point) — pick the city/state entry or use circle fallback", f.Properties.DisplayName)
+	}
+	if f.Properties.Addresstype == "country" {
+		return nil, "", "", errors.New("country is too large — add states or cities instead")
+	}
+	geomJSON, err = json.Marshal(f.Geometry)
+	if err != nil {
+		return nil, "", "", err
+	}
+	_ = strconv.FormatInt(osmID, 10)
+	return geomJSON, f.Geometry.Type, f.Properties.DisplayName, nil
 }
 
 // FillCellsForGeometry converts a GeoJSON geometry (Polygon/MultiPolygon,
@@ -254,17 +436,23 @@ func (s *RegionStore) CreateRegion(ctx context.Context, name string, osmID int64
 }
 
 func (s *RegionStore) CreateRegionRes(ctx context.Context, name string, osmID int64, polygonJSON []byte, cells []string, res int) (*Region, error) {
+	return s.CreateRegionFull(ctx, name, "", osmID, "", polygonJSON, cells, res)
+}
+
+func (s *RegionStore) CreateRegionFull(ctx context.Context, name, osmType string, osmID int64, display string, polygonJSON []byte, cells []string, res int) (*Region, error) {
 	if res <= 0 {
 		res = RegionCellRes
 	}
-	r := &Region{ID: ids.New(), Name: name, OsmID: osmID, Cells: cells, CellRes: res}
+	r := &Region{ID: ids.New(), Name: name, OsmType: osmType, OsmID: osmID, DisplayName: display, Cells: cells, CellRes: res}
+	now := time.Now()
+	r.FetchedAt = &now
 	polyArg := []byte(`{}`)
 	if len(polygonJSON) > 0 {
 		polyArg = polygonJSON
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO pricing_regions (id, name, osm_id, polygon, cells, cell_res) VALUES ($1::uuid, $2, $3, $4::jsonb, $5::text[], $6)`,
-		r.ID, r.Name, r.OsmID, polyArg, r.Cells, r.CellRes)
+		`INSERT INTO pricing_regions (id, name, osm_type, osm_id, display_name, polygon, cells, cell_res, fetched_at) VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7::text[], $8, now())`,
+		r.ID, r.Name, r.OsmType, r.OsmID, r.DisplayName, polyArg, r.Cells, r.CellRes)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +460,7 @@ func (s *RegionStore) CreateRegionRes(ctx context.Context, name string, osmID in
 }
 
 func (s *RegionStore) ListRegions(ctx context.Context) ([]Region, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text, name, osm_id, cells, cell_res FROM pricing_regions ORDER BY name`)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, COALESCE(osm_type,''), osm_id, COALESCE(display_name,''), cells, cell_res, fetched_at FROM pricing_regions ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +468,7 @@ func (s *RegionStore) ListRegions(ctx context.Context) ([]Region, error) {
 	var out []Region
 	for rows.Next() {
 		var r Region
-		if err := rows.Scan(&r.ID, &r.Name, &r.OsmID, &r.Cells, &r.CellRes); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.OsmType, &r.OsmID, &r.DisplayName, &r.Cells, &r.CellRes, &r.FetchedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -300,8 +488,38 @@ func (s *RegionStore) DeleteRegion(ctx context.Context, id string) error {
 // Matches in Go with per-region resolution so states (res 6) and cities (res 7)
 // can coexist. Region count is small (<100), so full scan is cheap and avoids
 // GIN resolution mismatch.
+func (s *RegionStore) GetRegion(ctx context.Context, id string) (*Region, error) {
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, COALESCE(osm_type,''), osm_id, COALESCE(display_name,''), cells, cell_res, fetched_at FROM pricing_regions WHERE id=$1::uuid`, id)
+	var r Region
+	if err := row.Scan(&r.ID, &r.Name, &r.OsmType, &r.OsmID, &r.DisplayName, &r.Cells, &r.CellRes, &r.FetchedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &r, nil
+}
+
+// RefreshRegionCells re-pulls the stored OSM object and rewrites cells/polygon.
+func (s *RegionStore) RefreshRegionCells(ctx context.Context, id string, cells []string, res int, polygonJSON []byte) (*Region, error) {
+	if res <= 0 {
+		res = RegionCellRes
+	}
+	polyArg := []byte(`{}`)
+	if len(polygonJSON) > 0 {
+		polyArg = polygonJSON
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE pricing_regions SET cells=$2::text[], cell_res=$3, polygon=$4::jsonb, fetched_at=now() WHERE id=$1::uuid`,
+		id, cells, res, polyArg)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetRegion(ctx, id)
+}
+
 func (s *RegionStore) FindRegionForPickup(ctx context.Context, lat, lng float64) (*Region, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text, name, osm_id, cells, cell_res FROM pricing_regions`)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, COALESCE(osm_type,''), osm_id, COALESCE(display_name,''), cells, cell_res, fetched_at FROM pricing_regions`)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +527,7 @@ func (s *RegionStore) FindRegionForPickup(ctx context.Context, lat, lng float64)
 	var best *Region
 	for rows.Next() {
 		var r Region
-		if err := rows.Scan(&r.ID, &r.Name, &r.OsmID, &r.Cells, &r.CellRes); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.OsmType, &r.OsmID, &r.DisplayName, &r.Cells, &r.CellRes, &r.FetchedAt); err != nil {
 			return nil, err
 		}
 		res := r.CellRes

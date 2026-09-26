@@ -412,7 +412,9 @@ func main() {
 	mux.Handle("DELETE /api/v2/admin/ambulance_types/{id}", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteAmbulanceType)))
 	// V2 H3 region pricing
 	mux.Handle("GET /api/v2/admin/regions", requireAdmin(http.HandlerFunc(regionHandler.HandleListRegions)))
+	mux.Handle("POST /api/v2/admin/regions/search", requireAdmin(http.HandlerFunc(regionHandler.HandleSearchRegions)))
 	mux.Handle("POST /api/v2/admin/regions/fetch", requireAdmin(http.HandlerFunc(regionHandler.HandleFetchRegionFromOSM)))
+	mux.Handle("POST /api/v2/admin/regions/refresh", requireAdmin(http.HandlerFunc(regionHandler.HandleRefreshRegion)))
 	mux.Handle("DELETE /api/v2/admin/regions/{id}", requireAdmin(http.HandlerFunc(regionHandler.HandleDeleteRegion)))
 	mux.Handle("POST /api/v2/admin/regions/prices", requireAdmin(http.HandlerFunc(regionHandler.HandleUpsertRegionPrice)))
 	mux.Handle("GET /api/v2/admin/regions/price", requireAdmin(http.HandlerFunc(regionHandler.HandleGetRegionPrice)))
