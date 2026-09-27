@@ -213,7 +213,7 @@ func (m *Manager) Run() {
 			for oldClient := range m.clients[client.Role][client.ID] {
 				if oldClient.SessionID == client.SessionID {
 					m.removeClientLocked(oldClient)
-					logger.Log.Info().Str("role", client.Role).Str("id", client.ID).Msg("Replaced stale duplicate connection")
+					logger.Log.Debug().Str("role", client.Role).Str("id", client.ID).Msg("Replaced stale duplicate connection")
 				}
 			}
 			// Eviction above may have deleted the now-empty inner map.
