@@ -207,19 +207,9 @@ func (m *Manager) Run() {
 			if m.clients[client.Role][client.ID] == nil {
 				m.clients[client.Role][client.ID] = make(map[*Client]bool)
 			}
-			// Same-session reconnect: the old connection is a stale duplicate
-			// (e.g. app re-dialed before the old TCP timeout). Evict it so one
-			// device never accumulates watchers that multiply every fan-out.
-			for oldClient := range m.clients[client.Role][client.ID] {
-				if oldClient.SessionID == client.SessionID {
-					m.removeClientLocked(oldClient)
-					logger.Log.Debug().Str("role", client.Role).Str("id", client.ID).Msg("Replaced stale duplicate connection")
-				}
-			}
-			// Eviction above may have deleted the now-empty inner map.
-			if m.clients[client.Role][client.ID] == nil {
-				m.clients[client.Role][client.ID] = make(map[*Client]bool)
-			}
+			// NOTE (operator decision): no same-session eviction here. Reconnects
+			// accumulate until their read deadlines expire so a live connection
+			// holding an undelivered offer is never killed mid-delivery.
 			m.clients[client.Role][client.ID][client] = true
 			m.mu.Unlock()
 			metrics.ActiveConnections.Inc()
