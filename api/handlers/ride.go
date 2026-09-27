@@ -1103,7 +1103,11 @@ func (h *RideHandler) HandleRoutePreview(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	route, err := h.RouteClient.CalculateETA(r.Context(), req.OriginLat, req.OriginLng, req.DestLat, req.DestLng)
+	// Cap upstream Google latency: one slow routing call must never wedge
+	// every client polling ETAs on live ride screens.
+	rctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	route, err := h.RouteClient.CalculateETA(rctx, req.OriginLat, req.OriginLng, req.DestLat, req.DestLng)
 	if err != nil {
 		response.Error(w, "Failed to compute route: "+err.Error(), http.StatusInternalServerError)
 		return
