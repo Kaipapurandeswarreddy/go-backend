@@ -1,0 +1,139 @@
+package storage
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+
+	"cloud.google.com/go/storage"
+	"google.golang.org/api/option"
+)
+
+type StorageService struct {
+	client     *storage.Client
+	bucketName string
+}
+
+func NewStorageService(ctx context.Context, bucketName string) (*StorageService, error) {
+	if bucketName == "" {
+		bucketName = "ambigo-driver-docs"
+	}
+
+	var client *storage.Client
+	var err error
+
+	// Check if explicit service account JSON is provided in env var (e.g. for Render or dev deployment)
+	credsJSON := os.Getenv("GCP_SERVICE_ACCOUNT_JSON")
+	if credsJSON == "" {
+		credsJSON = os.Getenv("GCS_SERVICE_ACCOUNT_JSON")
+	}
+	if credsJSON == "" {
+		credsJSON = os.Getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+	}
+
+	if credsJSON != "" {
+		client, err = storage.NewClient(ctx, option.WithCredentialsJSON([]byte(credsJSON)))
+	} else if credsFile := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credsFile != "" {
+		client, err = storage.NewClient(ctx, option.WithCredentialsFile(credsFile))
+	} else {
+		// Fallback to ADC / GCP Cloud Run environment credentials
+		client, err = storage.NewClient(ctx)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize gcs client: %w", err)
+	}
+	return &StorageService{
+		client:     client,
+		bucketName: bucketName,
+	}, nil
+}
+
+// UploadBase64IfImage checks if data is a base64 string.
+// If it is base64, decodes it, uploads it to GCS at objectPath, and returns the public HTTPS URL.
+// If it is already an http/https URL or empty, returns data unchanged.
+func (s *StorageService) UploadBase64IfImage(ctx context.Context, objectPath string, data string) (string, error) {
+	data = strings.TrimSpace(data)
+	if data == "" {
+		return "", nil
+	}
+	// Skip upload if already a URL
+	if strings.HasPrefix(data, "http://") || strings.HasPrefix(data, "https://") {
+		return data, nil
+	}
+
+	// Handle optional data URI prefix (e.g. data:image/jpeg;base64,...)
+	rawBase64 := data
+	contentType := "image/jpeg"
+	if idx := strings.Index(data, ";base64,"); idx != -1 {
+		header := data[:idx]
+		if strings.HasPrefix(header, "data:") {
+			contentType = strings.TrimPrefix(header, "data:")
+		}
+		rawBase64 = data[idx+8:]
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(rawBase64)
+	if err != nil {
+		// Fallback to URL-safe base64 decoding
+		decoded, err = base64.URLEncoding.DecodeString(rawBase64)
+		if err != nil {
+			return "", fmt.Errorf("invalid base64 image data: %w", err)
+		}
+	}
+
+	// Detect MIME type if not specified
+	if contentType == "" || contentType == "image/jpeg" {
+		mime := http.DetectContentType(decoded)
+		if strings.HasPrefix(mime, "image/") {
+			contentType = mime
+		}
+	}
+
+	bucket := s.client.Bucket(s.bucketName)
+	obj := bucket.Object(objectPath)
+
+	writer := obj.NewWriter(ctx)
+	writer.ContentType = contentType
+	writer.CacheControl = "public, max-age=31536000"
+
+	if _, err := io.Copy(writer, bytes.NewReader(decoded)); err != nil {
+		_ = writer.Close()
+		return "", fmt.Errorf("failed to upload image bytes to GCS: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("failed to complete GCS upload: %w", err)
+	}
+
+	url := fmt.Sprintf("/api/v2/media/view?path=%s", objectPath)
+	return url, nil
+}
+
+// StreamObject opens a reader for an object in the private GCS bucket and returns the reader, contentType, and error.
+func (s *StorageService) StreamObject(ctx context.Context, objectPath string) (io.ReadCloser, string, error) {
+	objectPath = strings.TrimPrefix(objectPath, "/")
+	bucket := s.client.Bucket(s.bucketName)
+	obj := bucket.Object(objectPath)
+
+	attrs, err := obj.Attrs(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to fetch object attributes from GCS: %w", err)
+	}
+
+	reader, err := obj.NewReader(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to open object reader from GCS: %w", err)
+	}
+
+	contentType := attrs.ContentType
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+
+	return reader, contentType, nil
+}

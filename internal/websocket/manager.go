@@ -7,11 +7,14 @@ import (
 	"sync"
 	"time"
 
+	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/location"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/metrics"
+	"ambigo-backend/internal/ride"
+	"ambigo-backend/internal/safety"
 
 	"github.com/gorilla/websocket"
 )
@@ -79,6 +82,73 @@ type Manager struct {
 
 	// EventBus for publishing driver location updates
 	EventBus *eventbus.InMemoryBus
+
+	// RideStore validates stopped-vehicle eligibility (IN_PROGRESS + normal).
+	RideStore *ride.Store
+
+	// AdminStore resolves ambulance type names for auto/bike/cab exclusion.
+	AdminStore *admin.Store
+
+	// AmbTypeNames caches amb_type_id -> display name (same map as dispatcher matcher).
+	AmbTypeNames map[string]string
+
+	// Safety tracks per-driver stopped state for the 3/5-minute stages.
+	Safety *safety.Tracker
+
+	// locThrottle caps location fan-out: max 1 bus event per driver per
+	// interval (giants: ~1 per 3s). Extra pings still update the store.
+	locThrottleMu sync.Mutex
+	locThrottle   map[string]time.Time
+}
+
+// LocationPublishInterval is the minimum gap between location bus events for
+// one driver. Stale points are dropped, latest wins — same rule as Uber RAMEN.
+const LocationPublishInterval = 3 * time.Second
+
+// allowLocPublish reports whether a location event for driverID may be
+// published now, and records the attempt.
+func (m *Manager) allowLocPublish(driverID string) bool {
+	now := time.Now()
+	m.locThrottleMu.Lock()
+	defer m.locThrottleMu.Unlock()
+	if m.locThrottle == nil {
+		m.locThrottle = make(map[string]time.Time)
+	}
+	if last, ok := m.locThrottle[driverID]; ok && now.Sub(last) < LocationPublishInterval {
+		return false
+	}
+	m.locThrottle[driverID] = now
+	// Opportunistic cleanup so the map can't grow with logged-out drivers.
+	if len(m.locThrottle) > 10000 {
+		for id, ts := range m.locThrottle {
+			if now.Sub(ts) > time.Hour {
+				delete(m.locThrottle, id)
+			}
+		}
+	}
+	return true
+}
+
+// removeClientLocked evicts one connection from all maps, closes its Send
+// channel and socket. Caller must hold m.mu.
+func (m *Manager) removeClientLocked(client *Client) {
+	if clientsForID, ok := m.clients[client.Role][client.ID]; ok {
+		if _, exists := clientsForID[client]; exists {
+			delete(clientsForID, client)
+			close(client.Send)
+			metrics.ActiveConnections.Dec()
+		}
+		if len(clientsForID) == 0 {
+			delete(m.clients[client.Role], client.ID)
+		}
+	}
+	for rideID, watchers := range m.rideWatchers {
+		delete(watchers, client)
+		if len(watchers) == 0 {
+			delete(m.rideWatchers, rideID)
+		}
+	}
+	client.Conn.Close()
 }
 
 func NewManager(locStore *location.MemoryStore, authStore *auth.Store, eventBus *eventbus.InMemoryBus) *Manager {
@@ -95,6 +165,19 @@ func NewManager(locStore *location.MemoryStore, authStore *auth.Store, eventBus 
 		LocStore:         locStore,
 		AuthStore:        authStore,
 		EventBus:         eventBus,
+		Safety:           safety.NewTracker(),
+	}
+}
+
+// SetSafetyDeps wires stopped-vehicle dependencies (called from main after stores exist).
+func (m *Manager) SetSafetyDeps(rideStore *ride.Store, adminStore *admin.Store, ambTypeNames map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.RideStore = rideStore
+	m.AdminStore = adminStore
+	m.AmbTypeNames = ambTypeNames
+	if m.Safety == nil {
+		m.Safety = safety.NewTracker()
 	}
 }
 
@@ -110,7 +193,7 @@ func (m *Manager) Run() {
 			// Session gate: reject stale-session connections for single-session
 			// roles before they can be registered. Only applies when the client
 			// actually sent a session_id (legacy clients are not gated).
-			if (client.Role == "driver" || client.Role == "unvrf_driver") && client.SessionID != "" {
+			if (client.Role == "driver" || client.Role == "unvrf_driver" || client.Role == "user" || client.Role == "attendant") && client.SessionID != "" {
 				if cur, ok := m.currentSessions[client.Role+":"+client.ID]; ok && cur != "" && cur != client.SessionID {
 					m.mu.Unlock()
 					m.rejectClient(client)
@@ -121,6 +204,19 @@ func (m *Manager) Run() {
 			if m.clients[client.Role] == nil {
 				m.clients[client.Role] = make(map[string]map[*Client]bool)
 			}
+			if m.clients[client.Role][client.ID] == nil {
+				m.clients[client.Role][client.ID] = make(map[*Client]bool)
+			}
+			// Same-session reconnect: the old connection is a stale duplicate
+			// (e.g. app re-dialed before the old TCP timeout). Evict it so one
+			// device never accumulates watchers that multiply every fan-out.
+			for oldClient := range m.clients[client.Role][client.ID] {
+				if oldClient.SessionID == client.SessionID {
+					m.removeClientLocked(oldClient)
+					logger.Log.Debug().Str("role", client.Role).Str("id", client.ID).Msg("Replaced stale duplicate connection")
+				}
+			}
+			// Eviction above may have deleted the now-empty inner map.
 			if m.clients[client.Role][client.ID] == nil {
 				m.clients[client.Role][client.ID] = make(map[*Client]bool)
 			}
@@ -162,19 +258,8 @@ func (m *Manager) Run() {
 			m.mu.Lock()
 			if clientsForID, ok := m.clients[client.Role][client.ID]; ok {
 				if _, exists := clientsForID[client]; exists {
-					delete(clientsForID, client)
-					close(client.Send)
-					metrics.ActiveConnections.Dec()
+					m.removeClientLocked(client)
 					logger.Log.Info().Str("role", client.Role).Str("id", client.ID).Msg("WebSocket unregistered")
-				}
-				if len(clientsForID) == 0 {
-					delete(m.clients[client.Role], client.ID)
-				}
-			}
-			for rideID, watchers := range m.rideWatchers {
-				delete(watchers, client)
-				if len(watchers) == 0 {
-					delete(m.rideWatchers, rideID)
 				}
 			}
 			m.mu.Unlock()
@@ -332,6 +417,9 @@ func (m *Manager) SetActiveRide(driverID, rideID string) {
 	if m.LocStore != nil {
 		m.LocStore.SetDriverStatus(driverID, "BUSY")
 	}
+	if m.Safety != nil {
+		m.Safety.Reset(driverID)
+	}
 }
 
 func (m *Manager) ClearActiveRide(driverID string) {
@@ -341,12 +429,45 @@ func (m *Manager) ClearActiveRide(driverID string) {
 	if m.LocStore != nil {
 		m.LocStore.SetDriverStatus(driverID, "AVAILABLE")
 	}
+	if m.Safety != nil {
+		m.Safety.Reset(driverID)
+	}
+}
+
+// BroadcastToRole sends a message to every connected client with the given
+// role (e.g. all "admin" app connections). Used for stopped-vehicle
+// escalation where no single admin ID is the target.
+func (m *Manager) BroadcastToRole(role, msgType string, payload interface{}) {
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		logger.Log.Error().Err(err).Str("role", role).Msg("failed to marshal broadcast payload")
+		return
+	}
+	finalMsg, err := json.Marshal(BaseMessage{Type: msgType, Payload: rawPayload})
+	if err != nil {
+		return
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, clientsForID := range m.clients[role] {
+		for client := range clientsForID {
+			select {
+			case client.Send <- finalMsg:
+			default:
+				metrics.WSMessagesDropped.WithLabelValues(client.Role, msgType, "send_buffer_full").Inc()
+			}
+		}
+	}
 }
 
 // HandleIncomingMessage parses messages sent from a client to the server
 func (m *Manager) HandleIncomingMessage(client *Client, message []byte) {
-	// Support raw text ping from frontend without JSON parsing errors
-	if string(message) == "ping" {
+	// Support raw text ping from frontend without JSON parsing errors.
+	// Text pings MUST refresh the read deadline: gorilla only extends it on
+	// pong control frames, so without this every healthy app connection was
+	// killed at ~60s, causing endless reconnect churn and duplicate watchers.
+	if string(message) == "ping" || string(message) == "PING" {
+		_ = client.Conn.SetReadDeadline(time.Now().Add(pongWait))
 		return
 	}
 
@@ -385,7 +506,7 @@ func (m *Manager) HandleIncomingMessage(client *Client, message []byte) {
 			m.DeclineHandler.HandleDriverDecline(context.Background(), payload.RideID, client.ID)
 		}
 	case "PING":
-		// Ignore ping messages
+		// Ignore ping messages (deadline already refreshed above)
 	default:
 		logger.Log.Warn().Str("type", baseMsg.Type).Str("role", client.Role).Str("id", client.ID).Msg("Unknown event type")
 	}

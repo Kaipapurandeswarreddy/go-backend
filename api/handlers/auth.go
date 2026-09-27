@@ -9,6 +9,7 @@ import (
 
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
+	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/ids"
@@ -26,6 +27,7 @@ type AuthHandler struct {
 	SMSCfg                 auth.SMSCountryConfig
 	AllowStaleRefreshChain bool
 	ReferralService        *referral.Service
+	MDStore                *admin.Store
 }
 
 func NewAuthHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, jwtSecret string, smsCfg auth.SMSCountryConfig, allowStaleRefreshChain bool, referralService *referral.Service) *AuthHandler {
@@ -37,6 +39,24 @@ func NewAuthHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, jwtSe
 		AllowStaleRefreshChain: allowStaleRefreshChain,
 		ReferralService:        referralService,
 	}
+}
+
+// SetMDStore wires MD ambulance link checks (nil-safe when unset, e.g. tests).
+func (h *AuthHandler) SetMDStore(store *admin.Store) {
+	h.MDStore = store
+}
+
+// blockedByMD reports whether an MD-linked mobile has no active link.
+// Public mobiles (zero links) or unset store are never blocked.
+func (h *AuthHandler) blockedByMD(ctx context.Context, mobile string) bool {
+	if h.MDStore == nil || mobile == "" {
+		return false
+	}
+	blocked, err := h.MDStore.IsMobileBlockedByMD(ctx, mobile)
+	if err != nil {
+		return false
+	}
+	return blocked
 }
 
 type otpPayload struct {
@@ -53,6 +73,7 @@ type verifyPayload struct {
 	ReferralCode string `json:"referral_code,omitempty"`
 	DeviceID     string `json:"device_id,omitempty"`
 	DeviceName   string `json:"device_name,omitempty"`
+	FCMToken     string `json:"fcm_token,omitempty"`
 }
 
 func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Request) {
@@ -190,6 +211,9 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Single-device: revoke previous sessions like driver (user strict single-device)
+	revokedCount, _ := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), user.ID, "session_replaced")
+
 	// V8: Generate access token + refresh token
 	accessToken, err := auth.GenerateAccessToken(user.ID, "user", h.JWTSecret)
 	if err != nil {
@@ -203,12 +227,19 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
+	// Session-scoped push token for the single-session kill-switch.
+	_ = h.AuthStore.SetSessionFCMToken(r.Context(), user.ID, sessionID, payload.FCMToken)
 
 	h.AuthStore.UpdateUserJWT(r.Context(), user.ID, accessToken)
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthUserLoggedIn, eventbus.AuthUserLoggedInPayload{
 		UserID: user.ID, Mobile: payload.Mobile, RequestID: reqID,
 	})
+	if revokedCount > 0 {
+		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
+			UserID: user.ID, Role: "user", SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
+		})
+	}
 
 	response.Success(w, http.StatusOK, map[string]string{
 		"access_token":  accessToken,
@@ -226,6 +257,12 @@ func (h *AuthHandler) HandleDriverRequestOTP(w http.ResponseWriter, r *http.Requ
 
 	if !mobileRegex.MatchString(payload.Mobile) {
 		response.Error(w, "Invalid mobile number", http.StatusBadRequest)
+		return
+	}
+
+	// MD-linked mobiles need an active ambulance link; public mobiles bypass.
+	if h.blockedByMD(r.Context(), payload.Mobile) {
+		response.Error(w, "Ambulance deactivated by hospital", http.StatusForbidden)
 		return
 	}
 
@@ -271,6 +308,12 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 
 	if !mobileRegex.MatchString(payload.Mobile) {
 		response.Error(w, "Invalid mobile number", http.StatusBadRequest)
+		return
+	}
+
+	// MD-linked mobiles need an active ambulance link; public mobiles bypass.
+	if h.blockedByMD(r.Context(), payload.Mobile) {
+		response.Error(w, "Ambulance deactivated by hospital", http.StatusForbidden)
 		return
 	}
 
@@ -368,6 +411,8 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
+	// Session-scoped push token for the single-session kill-switch.
+	_ = h.AuthStore.SetSessionFCMToken(r.Context(), driverID, sessionID, payload.FCMToken)
 
 	if role == "driver" {
 		h.AuthStore.UpdateDriverJWT(r.Context(), driverID, accessToken)
@@ -401,6 +446,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 		RefreshToken string `json:"refresh_token"`
 		DeviceID     string `json:"device_id,omitempty"`
 		DeviceName   string `json:"device_name,omitempty"`
+		FCMToken     string `json:"fcm_token,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.RefreshToken == "" {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
@@ -422,6 +468,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 	if !tokenDoc.Revoked && time.Now().Before(tokenDoc.ExpiresAt) {
 		newRT, newTokenStr, err := h.AuthStore.RotateById(r.Context(), tokenDoc, payload.DeviceID, payload.DeviceName)
 		if err == nil {
+			_ = h.AuthStore.SetSessionFCMToken(r.Context(), newRT.UserID, newRT.SessionID, payload.FCMToken)
 			newAccessToken, err := h.generateAccessTokenForRole(r.Context(), newRT)
 			if err != nil {
 				response.Error(w, "Failed to generate token", http.StatusInternalServerError)
@@ -462,6 +509,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 			// Found live token deeper in the chain — rotate it to issue a new string
 			newRT, newTokenStr, err := h.AuthStore.RotateById(r.Context(), liveToken, payload.DeviceID, payload.DeviceName)
 			if err == nil {
+				_ = h.AuthStore.SetSessionFCMToken(r.Context(), newRT.UserID, newRT.SessionID, payload.FCMToken)
 				newAccessToken, err := h.generateAccessTokenForRole(r.Context(), newRT)
 				if err != nil {
 					response.Error(w, "Failed to generate token", http.StatusInternalServerError)
@@ -512,6 +560,12 @@ func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 			_ = h.AuthStore.ClearDriverJWT(r.Context(), userID)
 		case "unvrf_driver":
 			_ = h.AuthStore.ClearUnverifiedDriverJWT(r.Context(), userID)
+		case "attendant":
+			_ = h.AuthStore.ClearAmbulanceAttendantJWT(r.Context(), userID)
+		case "hospital_md":
+			_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), userID)
+		case "hospital_receptionist":
+			_ = h.AuthStore.ClearHospitalReceptionistJWT(r.Context(), userID)
 		}
 	}
 
