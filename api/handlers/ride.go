@@ -304,15 +304,11 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Resolve once: stamps the flag for clients and decides minting.
-	// No OTP needed for this type+region: don't mint a secret at all so
-	// clients have nothing to display and nothing leaks.
+	// Resolve once: stamps the flag for clients. The secret is ALWAYS minted
+	// so a price edit between booking and start can never leave a ride that
+	// requires an OTP it doesn't have. Display + enforcement stay flag-gated.
 	otpNeeded := h.rideNeedsOTP(r.Context(), newRide)
 	newRide.OtpRequired = &otpNeeded
-	if !otpNeeded {
-		newRide.StartOTP = ""
-		otp = ""
-	}
 
 	// Reject if user already has an active ride
 	existing, _ := h.Dispatcher.RideStore.GetCurrentRide(r.Context(), uidStr, "user")
@@ -447,6 +443,26 @@ func (h *RideHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 		otp := req.OTP
 		if otp == "" {
 			otp = req.UserOTP
+		}
+		if rideData.StartOTP == "" {
+			// Gap ride (booked before its price row demanded OTP): mint now,
+			// persist, and ask the driver to retry once the customer refreshes
+			// (their app re-reads the ride and the box appears).
+			fresh := fmt.Sprintf("%04d", rand.Intn(10000))
+			rideData.StartOTP = fresh
+			if _, uerr := h.Dispatcher.RideStore.Pool().Exec(r.Context(), `UPDATE rides SET start_otp=$2 WHERE id=$1::uuid`, rideID, fresh); uerr != nil {
+				response.Error(w, "Failed to re-issue OTP, retry", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":       http.StatusText(http.StatusConflict),
+				"detail":      "OTP was missing and has been re-issued — ask the customer to refresh their screen, then retry",
+				"code":        http.StatusConflict,
+				"otp_issued":  true,
+			})
+			return
 		}
 		if otp == "" || rideData.StartOTP != otp {
 			response.Error(w, "Invalid OTP", http.StatusBadRequest)
