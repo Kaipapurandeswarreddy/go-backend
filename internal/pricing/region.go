@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"ambigo-backend/internal/ids"
@@ -66,10 +67,57 @@ type RegionPrice struct {
 
 type RegionStore struct {
 	pool *pgxpool.Pool
+
+	// regionCache holds all regions in memory: 61 rows, ~55k H3 strings.
+	// Per-ride lookups (fares, OTP, scrub) must never scan the table.
+	// TTL-bounded (stale ≤60s across instances); writes invalidate locally.
+	cacheMu  sync.Mutex
+	cacheAt  time.Time
+	cacheAll []Region
 }
+
+const regionCacheTTL = 60 * time.Second
 
 func NewRegionStore(pool *pgxpool.Pool) *RegionStore {
 	return &RegionStore{pool: pool}
+}
+
+func (s *RegionStore) invalidateRegionCache() {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cacheAt = time.Time{}
+	s.cacheAll = nil
+}
+
+func (s *RegionStore) cachedRegions(ctx context.Context) ([]Region, error) {
+	s.cacheMu.Lock()
+	if time.Since(s.cacheAt) < regionCacheTTL && s.cacheAll != nil {
+		out := s.cacheAll
+		s.cacheMu.Unlock()
+		return out, nil
+	}
+	s.cacheMu.Unlock()
+	rows, err := s.pool.Query(ctx, `SELECT `+regionCols+` FROM pricing_regions`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Region
+	for rows.Next() {
+		r, err := scanRegion(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	s.cacheMu.Lock()
+	s.cacheAll = out
+	s.cacheAt = time.Now()
+	s.cacheMu.Unlock()
+	return out, nil
 }
 
 // FillCellsForGeometry converts a GeoJSON geometry (Polygon/MultiPolygon,
@@ -237,6 +285,7 @@ func (s *RegionStore) CreateRegionFull(ctx context.Context, name, osmType string
 	if err != nil {
 		return nil, err
 	}
+	s.invalidateRegionCache()
 	return r, nil
 }
 
@@ -284,6 +333,9 @@ func (s *RegionStore) ListRegions(ctx context.Context) ([]Region, error) {
 
 func (s *RegionStore) DeleteRegion(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM pricing_regions WHERE id=$1::uuid`, id)
+	if err == nil {
+		s.invalidateRegionCache()
+	}
 	return err
 }
 
@@ -327,21 +379,18 @@ func (s *RegionStore) RefreshRegionCells(ctx context.Context, id string, cells [
 	if err != nil {
 		return nil, err
 	}
+	s.invalidateRegionCache()
 	return s.GetRegion(ctx, id)
 }
 
 func (s *RegionStore) FindRegionForPickup(ctx context.Context, lat, lng float64) (*Region, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+regionCols+` FROM pricing_regions`)
+	all, err := s.cachedRegions(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var best *Region
-	for rows.Next() {
-		r, err := scanRegion(rows)
-		if err != nil {
-			return nil, err
-		}
+	for i := range all {
+		r := &all[i]
 		res := r.CellRes
 		if res <= 0 {
 			res = RegionCellRes
@@ -361,7 +410,7 @@ func (s *RegionStore) FindRegionForPickup(ctx context.Context, lat, lng float64)
 			}
 		}
 	}
-	return best, rows.Err()
+	return best, nil
 }
 
 func (s *RegionStore) UpsertRegionPrice(ctx context.Context, p *RegionPrice) error {
@@ -374,6 +423,9 @@ func (s *RegionStore) UpsertRegionPrice(ctx context.Context, p *RegionPrice) err
 		 VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5, $6, $7, $8, now())
 		 ON CONFLICT (region_id, amb_type_id) DO UPDATE SET base_fare=EXCLUDED.base_fare, pricing_tier=EXCLUDED.pricing_tier, driver_share=EXCLUDED.driver_share, listing_threshold=EXCLUDED.listing_threshold, helper_included=EXCLUDED.helper_included, otp_required=EXCLUDED.otp_required, updated_at=now()`,
 		p.RegionID, p.AmbTypeID, p.BaseFare, tiersJSON, p.DriverShare, p.ListingThreshold, p.HelperIncluded, p.OTPRequired)
+	if err == nil {
+		s.invalidateRegionCache()
+	}
 	return err
 }
 
