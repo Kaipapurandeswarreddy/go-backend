@@ -76,6 +76,63 @@ func (h *RideHandler) effectivePrice(ctx context.Context, lat, lng float64, ambT
 	return resolved.BaseFare, resolved.Tiers, resolved.DriverShare, resolved.RegionID
 }
 
+// rideNeedsOTP resolves the region-aware OTP requirement for a ride:
+// saved-region price -> parent state price -> pickup resolve -> global type.
+// Defaults to true (secure) when the type can't be determined.
+func (h *RideHandler) rideNeedsOTP(ctx context.Context, rd *ride.Ride) bool {
+	if rd == nil || rd.AmbTypeID == nil || *rd.AmbTypeID == "" {
+		return true
+	}
+	ambType, err := h.AdminStore.GetAmbulanceTypeByID(ctx, *rd.AmbTypeID)
+	if err != nil || ambType == nil {
+		return true
+	}
+	if h.RegionStore == nil {
+		return ambType.OTPRequired
+	}
+	// Prefer the region locked at request time (in-memory for new rides,
+	// persisted for stored ones).
+	regionID := rd.RegionID
+	if regionID == nil {
+		if rid, err := h.Dispatcher.RideStore.GetRideRegionID(ctx, rd.ID); err == nil && rid != nil && *rid != "" {
+			regionID = rid
+		}
+	}
+	if regionID != nil && *regionID != "" {
+		if rp, err := h.RegionStore.GetRegionPrice(ctx, *regionID, ambType.ID); err == nil && rp != nil {
+			return rp.OTPRequired
+		}
+		if region, err := h.RegionStore.GetRegion(ctx, *regionID); err == nil && region != nil && region.ParentID != nil && *region.ParentID != "" {
+			if rp, err := h.RegionStore.GetRegionPrice(ctx, *region.ParentID, ambType.ID); err == nil && rp != nil {
+				return rp.OTPRequired
+			}
+		}
+		return ambType.OTPRequired
+	}
+	if len(rd.Pickup.Coordinates) == 2 {
+		if res, err := h.RegionStore.ResolvePriceForPickup(ctx, rd.Pickup.Coordinates[1], rd.Pickup.Coordinates[0], ambType.ID, ambType.BaseFare, nil, ambType.DriverShare, ambType.ListingThreshold, ambType.HelperIncluded, ambType.OTPRequired); err == nil && res != nil {
+			return res.OTPRequired
+		}
+	}
+	return ambType.OTPRequired
+}
+
+// scrubStartOTP removes the start OTP from a ride payload unless the caller
+// is allowed to see it: user/admin role AND the ride actually needs OTP.
+// Drivers verify OTP server-side in HandleStart and must never read it.
+func (h *RideHandler) scrubStartOTP(ctx context.Context, callerRole string, rd *ride.Ride) {
+	if rd == nil {
+		return
+	}
+	if callerRole != "user" && callerRole != "admin" {
+		rd.StartOTP = ""
+		return
+	}
+	if !h.rideNeedsOTP(ctx, rd) {
+		rd.StartOTP = ""
+	}
+}
+
 // upgradeUnvrfDriverRole checks if an unverified driver has been promoted to verified.
 // If so, returns "driver" so they can query rides without re-logging in.
 func (h *RideHandler) upgradeUnvrfDriverRole(uidStr, role string) string {
@@ -244,6 +301,13 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// No OTP needed for this type+region: don't mint a secret at all so
+	// clients have nothing to display and nothing leaks.
+	if !h.rideNeedsOTP(r.Context(), newRide) {
+		newRide.StartOTP = ""
+		otp = ""
+	}
+
 	// Reject if user already has an active ride
 	existing, _ := h.Dispatcher.RideStore.GetCurrentRide(r.Context(), uidStr, "user")
 	if existing != nil {
@@ -371,14 +435,8 @@ func (h *RideHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify OTP if ambulance type requires it
-	otpRequired := true
-	if rideData.AmbTypeID != nil {
-		ambType, err := h.AdminStore.GetAmbulanceTypeByID(r.Context(), *rideData.AmbTypeID)
-		if err == nil && ambType != nil {
-			otpRequired = ambType.OTPRequired
-		}
-	}
+	// Verify OTP if the resolved type+region requires it
+	otpRequired := h.rideNeedsOTP(r.Context(), rideData)
 	if otpRequired {
 		otp := req.OTP
 		if otp == "" {
@@ -860,6 +918,10 @@ func (h *RideHandler) HandleGetHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	for _, rd := range rides {
+		h.scrubStartOTP(r.Context(), role, rd)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rides)
 }
@@ -901,6 +963,15 @@ func (h *RideHandler) HandleGetCurrentRide(w http.ResponseWriter, r *http.Reques
 		w.Write([]byte(`{"found": false}`))
 		return
 	}
+
+	// Explicit-ID fetch bypasses the scoped current-ride query: enforce
+	// ownership so strangers can't pull other rides (incl. their OTP).
+	if req.RideID != "" && role != "admin" && uidStr != rideData.UserID && (rideData.DriverID == nil || uidStr != *rideData.DriverID) {
+		response.Error(w, "Forbidden: you do not own this ride", http.StatusForbidden)
+		return
+	}
+
+	h.scrubStartOTP(r.Context(), role, rideData)
 
 	// Flutter expects legacy status strings (searching_rides, accepted_rides, ongoing_rides)
 	statusStr := string(rideData.Status)
