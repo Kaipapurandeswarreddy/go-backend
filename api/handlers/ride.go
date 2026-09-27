@@ -120,15 +120,18 @@ func (h *RideHandler) rideNeedsOTP(ctx context.Context, rd *ride.Ride) bool {
 // scrubStartOTP removes the start OTP from a ride payload unless the caller
 // is allowed to see it: user/admin role AND the ride actually needs OTP.
 // Drivers verify OTP server-side in HandleStart and must never read it.
+// Always stamps the resolved flag so all apps share one source of truth.
 func (h *RideHandler) scrubStartOTP(ctx context.Context, callerRole string, rd *ride.Ride) {
 	if rd == nil {
 		return
 	}
+	needs := h.rideNeedsOTP(ctx, rd)
+	rd.OtpRequired = &needs
 	if callerRole != "user" && callerRole != "admin" {
 		rd.StartOTP = ""
 		return
 	}
-	if !h.rideNeedsOTP(ctx, rd) {
+	if !needs {
 		rd.StartOTP = ""
 	}
 }
@@ -301,9 +304,12 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// Resolve once: stamps the flag for clients and decides minting.
 	// No OTP needed for this type+region: don't mint a secret at all so
 	// clients have nothing to display and nothing leaks.
-	if !h.rideNeedsOTP(r.Context(), newRide) {
+	otpNeeded := h.rideNeedsOTP(r.Context(), newRide)
+	newRide.OtpRequired = &otpNeeded
+	if !otpNeeded {
 		newRide.StartOTP = ""
 		otp = ""
 	}

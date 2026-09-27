@@ -216,6 +216,10 @@ func (m *Manager) Run() {
 					logger.Log.Info().Str("role", client.Role).Str("id", client.ID).Msg("Replaced stale duplicate connection")
 				}
 			}
+			// Eviction above may have deleted the now-empty inner map.
+			if m.clients[client.Role][client.ID] == nil {
+				m.clients[client.Role][client.ID] = make(map[*Client]bool)
+			}
 			m.clients[client.Role][client.ID][client] = true
 			m.mu.Unlock()
 			metrics.ActiveConnections.Inc()
