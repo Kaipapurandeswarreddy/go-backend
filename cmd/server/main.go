@@ -149,8 +149,9 @@ func main() {
 
 	// Initialize Handlers
 	regionStore := pricing.NewRegionStore(pool)
-	rideHandler := handlers.NewRideHandler(dispatcher, eventBus, paymentStore, rzpService, authStore, adminStore, routeClient, walletStore, referralService, regionStore)
-	regionHandler := handlers.NewRegionHandler(regionStore)
+	settingsStore := pricing.NewSettingsStore(pool)
+	rideHandler := handlers.NewRideHandler(dispatcher, eventBus, paymentStore, rzpService, authStore, adminStore, routeClient, walletStore, referralService, regionStore, settingsStore)
+	regionHandler := handlers.NewRegionHandler(regionStore, settingsStore)
 	smsCfg := auth.SMSCountryConfig{
 		APIKey:     os.Getenv("SMS_COUNTRY_KEY"),
 		APIToken:   os.Getenv("SMS_COUNTRY_TOKEN"),
@@ -418,6 +419,9 @@ func main() {
 	mux.Handle("DELETE /api/v2/admin/regions/{id}", requireAdmin(http.HandlerFunc(regionHandler.HandleDeleteRegion)))
 	mux.Handle("POST /api/v2/admin/regions/prices", requireAdmin(http.HandlerFunc(regionHandler.HandleUpsertRegionPrice)))
 	mux.Handle("GET /api/v2/admin/regions/price", requireAdmin(http.HandlerFunc(regionHandler.HandleGetRegionPrice)))
+	// Global surcharge settings (SOS % + night %)
+	mux.Handle("GET /api/v2/admin/pricing/settings", requireAdmin(http.HandlerFunc(regionHandler.HandleGetSurchargeSettings)))
+	mux.Handle("POST /api/v2/admin/pricing/settings", requireAdmin(http.HandlerFunc(regionHandler.HandleUpsertSurchargeSettings)))
 	// Admin: Verified Driver CRUD
 	mux.Handle("POST /api/v2/admin/drivers/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListDrivers)))
 	mux.Handle("POST /api/v2/admin/drivers/details", requireAdmin(http.HandlerFunc(adminHandler.HandleGetDriverDetails)))
