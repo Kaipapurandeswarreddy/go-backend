@@ -32,6 +32,7 @@ const fcmWorkerPoolSize = 10
 
 func (n *FCMNotifier) SubscribeTo(bus *InMemoryBus) {
 	n.subscribeWithPool(bus, ChannelRideDriverOffered, n.handleRideOffered)
+	n.subscribeWithPool(bus, ChannelRideWithdrawn, n.handleRideWithdrawn)
 	n.subscribeWithPool(bus, ChannelRideAccepted, n.handleRideAccepted)
 	n.subscribeWithPool(bus, ChannelRideArrived, n.handleRideArrived)
 	n.subscribeWithPool(bus, ChannelRideStarted, n.handleRideStarted)
@@ -131,6 +132,35 @@ func (n *FCMNotifier) handleRideOffered(payload []byte) {
 
 	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
 		ll.Error().Err(err).Str("driver_id", p.DriverID).Msg("FCM push failed for driver")
+	}
+}
+
+// handleRideWithdrawn tells a broadcast loser (background/killed app) that
+// the ride was won by someone else.
+func (n *FCMNotifier) handleRideWithdrawn(payload []byte) {
+	var p RideWithdrawnPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "ride:withdrawn").Msg("Unmarshal error")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	token, err := n.authStore.GetDriverFCMToken(ctx, p.DriverID)
+	if err != nil {
+		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("Failed to get FCM token for withdraw")
+		return
+	}
+	if token == nil || *token == "" {
+		return
+	}
+	data := map[string]string{
+		"type":    "RIDE_WITHDRAWN",
+		"ride_id": p.RideID,
+		"title":   "Ride taken",
+	}
+	if err := n.fcmClient.SendDataMessage(ctx, *token, data); err != nil {
+		logger.Log.Error().Err(err).Str("driver_id", p.DriverID).Msg("FCM withdraw failed")
 	}
 }
 

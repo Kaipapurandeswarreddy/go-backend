@@ -6,6 +6,7 @@ import "strings"
 const (
 	ChannelRideRequested        = "ride:requested"
 	ChannelRideDriverOffered    = "ride:driver_offered"
+	ChannelRideWithdrawn        = "ride:withdrawn"
 	ChannelRideAccepted         = "ride:accepted"
 	ChannelRideArrived          = "ride:arrived"
 	ChannelRideStarted          = "ride:started"
@@ -78,6 +79,14 @@ type RideDriverOfferedPayload struct {
 	OfferedAt           string  `json:"offered_at,omitempty"`
 	OfferExpiresIn      int     `json:"offer_expires_in,omitempty"`
 	RequestID           string  `json:"request_id,omitempty"`
+}
+
+// RideWithdrawnPayload is published to losing drivers when a broadcast
+// offer is won by someone else — their offer card must disappear.
+type RideWithdrawnPayload struct {
+	RideID    string `json:"ride_id"`
+	DriverID  string `json:"driver_id"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // RideAcceptedPayload is published when a driver accepts a ride
