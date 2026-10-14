@@ -8,8 +8,11 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"ambigo-backend/internal/mailer"
 
@@ -58,6 +61,19 @@ func main() {
 
 	// 1. Load Configuration
 	appConfig := config.LoadConfig()
+
+	// Load-test override: longer-lived access tokens so multi-hour suites
+	// never outlive their mint (e.g. JWT_VALIDITY_MS=8h). Production default
+	// stays 15 minutes when unset.
+	if v := os.Getenv("JWT_VALIDITY_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			auth.AccessTokenExpiry = time.Duration(ms) * time.Millisecond
+			log.Info().Dur("access_token_expiry", auth.AccessTokenExpiry).Msg("JWT validity override active")
+		} else if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			auth.AccessTokenExpiry = d
+			log.Info().Dur("access_token_expiry", auth.AccessTokenExpiry).Msg("JWT validity override active")
+		}
+	}
 
 	// 2. Initialize PostgreSQL (primary) — replaces MongoDB
 	pgCfg := config.PostgresConfig{
@@ -229,10 +245,27 @@ func main() {
 	}
 
 	// Rate limiters
-	otpIPLimiter := middleware.NewIPLimiter(3, 5)                     // V1: IP-based for OTP request
-	verifyMobileLimiter := middleware.NewMobileRateLimiter(3, 5)      // V1: mobile-based for OTP verify
-	adminLoginLimiter := middleware.NewIPLimiter(5, 10)               // V7: IP-based for admin login
-	globalRateLimiter := middleware.NewIPLimiter(100, 200)            // A5: Global per-IP limit for all authenticated routes
+	otpIPLimiter := middleware.NewIPLimiter(3, 5)                // V1: IP-based for OTP request
+	verifyMobileLimiter := middleware.NewMobileRateLimiter(3, 5) // V1: mobile-based for OTP verify
+	adminLoginLimiter := middleware.NewIPLimiter(5, 10)          // V7: IP-based for admin login
+	// A5: Global per-IP limit for all authenticated routes. Load-test
+	// override via GLOBAL_RPS_LIMIT / GLOBAL_RPS_BURST (single-IP k6 would
+	// otherwise measure the limiter, not capacity). Production default 100/200.
+	globalRPS, globalBurst := 100, 200
+	if v := os.Getenv("GLOBAL_RPS_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			globalRPS = n
+		}
+	}
+	if v := os.Getenv("GLOBAL_RPS_BURST"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			globalBurst = n
+		}
+	}
+	globalRateLimiter := middleware.NewIPLimiter(rate.Limit(globalRPS), globalBurst)
+	if globalRPS != 100 || globalBurst != 200 {
+		log.Info().Int("rps", globalRPS).Int("burst", globalBurst).Msg("Global rate limiter override active")
+	}
 
 	mux := http.NewServeMux()
 
