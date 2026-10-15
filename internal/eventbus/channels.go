@@ -34,7 +34,27 @@ const (
 	ChannelReferralCredited    = "referral:credited"
 	ChannelSafetyStoppedWarn  = "safety:stopped_warning"
 	ChannelSafetyStoppedAlarm = "safety:stopped_emergency"
+	// ChannelRideDestinationChanged is published when a hospital desk
+	// declines a mid-ride patient and the ride is rerouted to the nearest
+	// other hospital. The user must learn the new destination even with
+	// the app in background (FCM) — no re-fetch required (full payload).
+	ChannelRideDestinationChanged = "ride:destination_changed"
 )
+
+// RideDestinationChangedPayload carries the complete new destination so the
+// user app can update its screen without an extra detail fetch.
+type RideDestinationChangedPayload struct {
+	RideID       string  `json:"ride_id"`
+	UserID       string  `json:"user_id"`
+	DriverID     string  `json:"driver_id,omitempty"`
+	HospitalID   string  `json:"hospital_id"`
+	HospitalName string  `json:"hospital_name"`
+	DropLat      float64 `json:"drop_lat"`
+	DropLng      float64 `json:"drop_lng"`
+	DropAddress  string  `json:"drop_address"`
+	FromHospital string  `json:"from_hospital_id,omitempty"`
+	Status       string  `json:"status,omitempty"`
+}
 
 // RideRequestedPayload is published when a user requests a ride
 type RideRequestedPayload struct {
