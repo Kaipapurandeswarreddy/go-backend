@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -37,9 +38,11 @@ type RideHandler struct {
 	PricingEngine   *pricing.Engine
 	WalletStore     *payment.WalletStore
 	ReferralService *referral.Service
+	RegionStore     *pricing.RegionStore
+	SettingsStore   *pricing.SettingsStore
 }
 
-func NewRideHandler(dispatcher *dispatch.Dispatcher, eventBus *eventbus.InMemoryBus, paymentStore *payment.Store, rzp *payment.RazorpayService, authStore *auth.Store, adminStore *admin.Store, routeClient *dispatch.RouteClient, walletStore *payment.WalletStore, referralService *referral.Service) *RideHandler {
+func NewRideHandler(dispatcher *dispatch.Dispatcher, eventBus *eventbus.InMemoryBus, paymentStore *payment.Store, rzp *payment.RazorpayService, authStore *auth.Store, adminStore *admin.Store, routeClient *dispatch.RouteClient, walletStore *payment.WalletStore, referralService *referral.Service, regionStore *pricing.RegionStore, settingsStore *pricing.SettingsStore) *RideHandler {
 	return &RideHandler{
 		Dispatcher:      dispatcher,
 		EventBus:        eventBus,
@@ -51,6 +54,97 @@ func NewRideHandler(dispatcher *dispatch.Dispatcher, eventBus *eventbus.InMemory
 		PricingEngine:   pricing.NewEngine(),
 		WalletStore:     walletStore,
 		ReferralService: referralService,
+		RegionStore:     regionStore,
+		SettingsStore:   settingsStore,
+	}
+}
+
+// surcharges resolves the admin-configured SOS/night multipliers for one fare
+// computation. Falls back to the built-in defaults (1.5x / 1.2x) when the
+// settings store is unavailable — fare computation must never block on it.
+func (h *RideHandler) surcharges(ctx context.Context) (emgMult, nightMult float64) {
+	if h.SettingsStore == nil {
+		return 1.5, 1.2
+	}
+	return h.SettingsStore.Get(ctx).Multipliers()
+}
+
+// effectivePrice resolves V2 H3 region override for a pickup, falling back to global.
+func (h *RideHandler) effectivePrice(ctx context.Context, lat, lng float64, ambType *admin.AmbulanceType) (base float64, tiers []pricing.PricingTier, share float64, regionID *string) {
+	base, share = ambType.BaseFare, ambType.DriverShare
+	tiers = make([]pricing.PricingTier, len(ambType.PricingTier))
+	for i, t := range ambType.PricingTier {
+		tiers[i] = pricing.PricingTier{ThresholdDistance: t.ThresholdDistance, CostPerKm: t.CostPerKm}
+	}
+	if h.RegionStore == nil {
+		return base, tiers, share, nil
+	}
+	resolved, err := h.RegionStore.ResolvePriceForPickup(ctx, lat, lng, ambType.ID, ambType.BaseFare, tiers, ambType.DriverShare, ambType.ListingThreshold, ambType.HelperIncluded, ambType.OTPRequired)
+	if err != nil || resolved == nil || !resolved.IsOverride {
+		logger.Log.Debug().Err(err).Float64("lat", lat).Float64("lng", lng).Str("amb_type", ambType.ID).Msg("Region fallback to global")
+		return base, tiers, share, nil
+	}
+	logger.Log.Debug().Str("region_id", *resolved.RegionID).Float64("lat", lat).Float64("lng", lng).Msg("Region override applied")
+	return resolved.BaseFare, resolved.Tiers, resolved.DriverShare, resolved.RegionID
+}
+
+// rideNeedsOTP resolves the region-aware OTP requirement for a ride:
+// saved-region price -> parent state price -> pickup resolve -> global type.
+// Defaults to true (secure) when the type can't be determined.
+func (h *RideHandler) rideNeedsOTP(ctx context.Context, rd *ride.Ride) bool {
+	if rd == nil || rd.AmbTypeID == nil || *rd.AmbTypeID == "" {
+		return true
+	}
+	ambType, err := h.AdminStore.GetAmbulanceTypeByID(ctx, *rd.AmbTypeID)
+	if err != nil || ambType == nil {
+		return true
+	}
+	if h.RegionStore == nil {
+		return ambType.OTPRequired
+	}
+	// Prefer the region locked at request time (in-memory for new rides,
+	// persisted for stored ones).
+	regionID := rd.RegionID
+	if regionID == nil {
+		if rid, err := h.Dispatcher.RideStore.GetRideRegionID(ctx, rd.ID); err == nil && rid != nil && *rid != "" {
+			regionID = rid
+		}
+	}
+	if regionID != nil && *regionID != "" {
+		if rp, err := h.RegionStore.GetRegionPrice(ctx, *regionID, ambType.ID); err == nil && rp != nil {
+			return rp.OTPRequired
+		}
+		if region, err := h.RegionStore.GetRegion(ctx, *regionID); err == nil && region != nil && region.ParentID != nil && *region.ParentID != "" {
+			if rp, err := h.RegionStore.GetRegionPrice(ctx, *region.ParentID, ambType.ID); err == nil && rp != nil {
+				return rp.OTPRequired
+			}
+		}
+		return ambType.OTPRequired
+	}
+	if len(rd.Pickup.Coordinates) == 2 {
+		if res, err := h.RegionStore.ResolvePriceForPickup(ctx, rd.Pickup.Coordinates[1], rd.Pickup.Coordinates[0], ambType.ID, ambType.BaseFare, nil, ambType.DriverShare, ambType.ListingThreshold, ambType.HelperIncluded, ambType.OTPRequired); err == nil && res != nil {
+			return res.OTPRequired
+		}
+	}
+	return ambType.OTPRequired
+}
+
+// scrubStartOTP removes the start OTP from a ride payload unless the caller
+// is allowed to see it: user/admin role AND the ride actually needs OTP.
+// Drivers verify OTP server-side in HandleStart and must never read it.
+// Always stamps the resolved flag so all apps share one source of truth.
+func (h *RideHandler) scrubStartOTP(ctx context.Context, callerRole string, rd *ride.Ride) {
+	if rd == nil {
+		return
+	}
+	needs := h.rideNeedsOTP(ctx, rd)
+	rd.OtpRequired = &needs
+	if callerRole != "user" && callerRole != "admin" {
+		rd.StartOTP = ""
+		return
+	}
+	if !needs {
+		rd.StartOTP = ""
 	}
 }
 
@@ -108,9 +202,9 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":          http.StatusText(http.StatusNotFound),
-				"detail":         "No ambulances available nearby",
-				"code":           http.StatusNotFound,
+				"error":           http.StatusText(http.StatusNotFound),
+				"detail":          "No ambulances available nearby",
+				"code":            http.StatusNotFound,
 				"available_types": availableTypes,
 			})
 			return
@@ -131,9 +225,9 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":          http.StatusText(http.StatusNotFound),
-				"detail":         "No eligible ambulances available nearby",
-				"code":           http.StatusNotFound,
+				"error":           http.StatusText(http.StatusNotFound),
+				"detail":          "No eligible ambulances available nearby",
+				"code":            http.StatusNotFound,
 				"available_types": availableTypes,
 			})
 			return
@@ -194,36 +288,26 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 				distanceKm = newRide.Route.DistanceKm
 			}
 
-			log.Debug().Float64("base_fare", ambType.BaseFare).Float64("driver_share", ambType.DriverShare).Int("tiers", len(ambType.PricingTier)).Float64("distance", distanceKm).Msg("Fare input")
-
-			pricingTiers := make([]pricing.PricingTier, len(ambType.PricingTier))
-			for i, t := range ambType.PricingTier {
-				pricingTiers[i] = pricing.PricingTier{
-					ThresholdDistance: t.ThresholdDistance,
-					CostPerKm:         t.CostPerKm,
-				}
-			}
+			effBase, pricingTiers, effShare, regionID := h.effectivePrice(r.Context(), req.PickupLat, req.PickupLng, ambType)
+			newRide.RegionID = regionID
+			log.Debug().Float64("base_fare", effBase).Float64("driver_share", effShare).Int("tiers", len(pricingTiers)).Float64("distance", distanceKm).Msg("Fare input")
 
 			// Calculate Total Fare
-			base := h.PricingEngine.CalculateBaseAndDistanceFare(distanceKm, ambType.BaseFare, pricingTiers)
-			emergency := h.PricingEngine.CalculateEmergencySurcharge(base, newRide.EmergencyPriority > 0)
-			night := h.PricingEngine.CalculateNightSurcharge(base, time.Now())
+			base := h.PricingEngine.CalculateBaseAndDistanceFare(distanceKm, effBase, pricingTiers)
+			emgMult, nightMult := h.surcharges(r.Context())
+			emergency := h.PricingEngine.CalculateEmergencySurcharge(base, newRide.EmergencyPriority > 0, emgMult)
+			night := h.PricingEngine.CalculateNightSurcharge(base, time.Now(), nightMult)
 			totalAmount := base + emergency + night
-			totalAmount = float64(int(totalAmount*100)) / 100
+			totalAmount = payment.RoundRupees(totalAmount)
 
-			// Calculate Driver Share (DriverShare is a percentage of BaseFare)
-			driverBaseFare := ambType.BaseFare * ambType.DriverShare / 100.0
-			dBase := h.PricingEngine.CalculateBaseAndDistanceFare(distanceKm, driverBaseFare, pricingTiers)
-			dEmergency := h.PricingEngine.CalculateEmergencySurcharge(dBase, newRide.EmergencyPriority > 0)
-			dNight := h.PricingEngine.CalculateNightSurcharge(dBase, time.Now())
-			driverShareTotal := dBase + dEmergency + dNight
-			driverShareTotal = float64(int(driverShareTotal*100)) / 100
+			// Calculate Driver Share (DriverShare is a percentage of whole total fare)
+			driverShareTotal := payment.RoundRupees(totalAmount * effShare / 100.0)
 
 			log.Debug().Float64("total", totalAmount).Float64("driver_share", driverShareTotal).Msg("Fare computed")
 
 			newRide.Fare = &ride.Fare{
-				BaseFare:           ambType.BaseFare,
-				DistanceFare:       base - ambType.BaseFare,
+				BaseFare:           effBase,
+				DistanceFare:       base - effBase,
 				EmergencySurcharge: emergency,
 				NightSurcharge:     night,
 				Total:              totalAmount,
@@ -232,6 +316,12 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
+
+	// Resolve once: stamps the flag for clients. The secret is ALWAYS minted
+	// so a price edit between booking and start can never leave a ride that
+	// requires an OTP it doesn't have. Display + enforcement stay flag-gated.
+	otpNeeded := h.rideNeedsOTP(r.Context(), newRide)
+	newRide.OtpRequired = &otpNeeded
 
 	// Reject if user already has an active ride
 	existing, _ := h.Dispatcher.RideStore.GetCurrentRide(r.Context(), uidStr, "user")
@@ -246,12 +336,18 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	regionIDStr := ""
+	if newRide.RegionID != nil {
+		regionIDStr = *newRide.RegionID
+	}
+	log.Info().Str("ride_id", newRide.ID).Str("region_id", regionIDStr).Msg("Ride requested with region")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Ride requested successfully",
-		"ride_id": newRide.ID,
-		"otp":     otp, // Returning OTP so the user's app can display it
+		"message":   "Ride requested successfully",
+		"ride_id":   newRide.ID,
+		"otp":       otp, // Returning OTP so the user's app can display it
+		"region_id": regionIDStr,
 	})
 }
 
@@ -354,18 +450,32 @@ func (h *RideHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify OTP if ambulance type requires it
-	otpRequired := true
-	if rideData.AmbTypeID != nil {
-		ambType, err := h.AdminStore.GetAmbulanceTypeByID(r.Context(), *rideData.AmbTypeID)
-		if err == nil && ambType != nil {
-			otpRequired = ambType.OTPRequired
-		}
-	}
+	// Verify OTP if the resolved type+region requires it
+	otpRequired := h.rideNeedsOTP(r.Context(), rideData)
 	if otpRequired {
 		otp := req.OTP
 		if otp == "" {
 			otp = req.UserOTP
+		}
+		if rideData.StartOTP == "" {
+			// Gap ride (booked before its price row demanded OTP): mint now,
+			// persist, and ask the driver to retry once the customer refreshes
+			// (their app re-reads the ride and the box appears).
+			fresh := fmt.Sprintf("%04d", rand.Intn(10000))
+			rideData.StartOTP = fresh
+			if _, uerr := h.Dispatcher.RideStore.Pool().Exec(r.Context(), `UPDATE rides SET start_otp=$2 WHERE id=$1::uuid`, rideID, fresh); uerr != nil {
+				response.Error(w, "Failed to re-issue OTP, retry", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":      http.StatusText(http.StatusConflict),
+				"detail":     "OTP was missing and has been re-issued — ask the customer to refresh their screen, then retry",
+				"code":       http.StatusConflict,
+				"otp_issued": true,
+			})
+			return
 		}
 		if otp == "" || rideData.StartOTP != otp {
 			response.Error(w, "Invalid OTP", http.StatusBadRequest)
@@ -395,15 +505,22 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 	reqID := requestid.FromContext(r.Context())
 
 	var req struct {
-		DropAddress string `json:"drop_address"`
-		PaymentMode string `json:"payment_mode"`
+		DropAddress string  `json:"drop_address"`
+		PaymentMode string  `json:"payment_mode"`
+		DropLat     float64 `json:"drop_lat"`
+		DropLng     float64 `json:"drop_lng"`
+		// Nested GeoJSON drop {type, coordinates:[lng,lat]} sent by driver
+		// apps (old builds send only this). Flat fields win when present.
+		Drop struct {
+			Coordinates []float64 `json:"coordinates"`
+		} `json:"drop"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	if req.PaymentMode == "" {
-		req.PaymentMode = "cash"
+	if req.DropLat == 0 && req.DropLng == 0 && len(req.Drop.Coordinates) == 2 {
+		req.DropLng, req.DropLat = req.Drop.Coordinates[0], req.Drop.Coordinates[1]
 	}
 
 	rideData, err := h.Dispatcher.RideStore.GetRideByID(r.Context(), rideID)
@@ -418,10 +535,46 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use the pre-calculated fare from when the ride was requested
+	// The payment mode chosen by the user at booking is authoritative. Driver
+	// builds may omit it or send their own default; trusting the request let a
+	// cash-only client mark an online ride as pre-paid cash.
+	paymentMode := rideData.PaymentMode
+	if paymentMode != string(payment.ModeCash) && paymentMode != string(payment.ModeOnline) {
+		paymentMode = req.PaymentMode
+	}
+	if paymentMode != string(payment.ModeCash) && paymentMode != string(payment.ModeOnline) {
+		paymentMode = string(payment.ModeCash)
+	}
+
+	// Idempotent replay: a client that timed out after the commit retries the
+	// same complete call. Return the existing bill instead of a 409 that
+	// strands the driver and the user's post-ride flow.
+	if rideData.Status == ride.StatusCompleted {
+		existing, perr := h.PaymentStore.FindPaymentByRideID(r.Context(), rideID)
+		if perr != nil {
+			response.Error(w, "Failed to complete ride: "+perr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if existing == nil {
+			response.Error(w, "Ride already completed", http.StatusConflict)
+			return
+		}
+		encodeRideCompletion(w, existing, existing.OriginalAmount, routeDistanceKm(rideData), 0, 0, "", "", nil)
+		return
+	}
+	if rideData.Status != ride.StatusInProgress {
+		response.Error(w, "Ride is not in progress", http.StatusConflict)
+		return
+	}
+
+	// Use the pre-calculated fare from when the ride was requested.
+	// Gated re-rate below may override it when the actual trip differs
+	// (moved drop >=500m, or trail detour >=20% AND >=0.5km).
 	finalAmount := 0.0
+	lockedShare := 0.0
 	if rideData.Fare != nil && rideData.Fare.Total > 0 {
 		finalAmount = rideData.Fare.Total
+		lockedShare = rideData.Fare.DriverShare
 	} else if rideData.AmbTypeID != nil && *rideData.AmbTypeID != "" {
 		// Fallback in case Fare was somehow not computed (e.g. old rides)
 		ambType, err := h.AdminStore.GetAmbulanceTypeByID(r.Context(), *rideData.AmbTypeID)
@@ -440,19 +593,128 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 			}
 
 			base := h.PricingEngine.CalculateBaseAndDistanceFare(distanceKm, ambType.BaseFare, pricingTiers)
-			emergency := h.PricingEngine.CalculateEmergencySurcharge(base, rideData.EmergencyPriority > 0)
-			night := h.PricingEngine.CalculateNightSurcharge(base, time.Now())
+			emgMult, nightMult := h.surcharges(r.Context())
+			emergency := h.PricingEngine.CalculateEmergencySurcharge(base, rideData.EmergencyPriority > 0, emgMult)
+			night := h.PricingEngine.CalculateNightSurcharge(base, time.Now(), nightMult)
 			finalAmount = base + emergency + night
-			finalAmount = float64(int(finalAmount*100)) / 100
+			finalAmount = payment.RoundRupees(finalAmount)
+			lockedShare = payment.RoundRupees(finalAmount * ambType.DriverShare / 100.0)
+		}
+	}
+
+	// ---- Gated re-rate: estimate vs actual ----
+	var recalcFare *ride.Fare
+	var recalcDropJSON []byte
+	recalcKm := 0.0
+	recalcSecs := 0
+	recalcPoly := ""
+	recalcReason := ""
+	// Locked estimate, kept for the receipt ("you were told X, you drove Y").
+	lockedTotal := finalAmount
+	lockedKm := 0.0
+	if rideData.Route != nil {
+		lockedKm = rideData.Route.DistanceKm
+	}
+	if rideData.AmbTypeID != nil && *rideData.AmbTypeID != "" && len(rideData.Pickup.Coordinates) == 2 && len(rideData.Drop.Coordinates) == 2 {
+		estimateKm := 0.0
+		if rideData.Route != nil {
+			estimateKm = rideData.Route.DistanceKm
+		}
+		// Final point: request coords win, else planned drop (trail covers the path).
+		finalLat, finalLng := 0.0, 0.0
+		if req.DropLat != 0 && req.DropLng != 0 {
+			finalLat, finalLng = req.DropLat, req.DropLng
+		} else {
+			finalLng, finalLat = rideData.Drop.Coordinates[0], rideData.Drop.Coordinates[1]
+		}
+		plannedLng, plannedLat := rideData.Drop.Coordinates[0], rideData.Drop.Coordinates[1]
+		dropMovedM := ride.HaversineKm(plannedLat, plannedLng, finalLat, finalLng) * 1000.0
+
+		trailKm := 0.0
+		if points, terr := h.Dispatcher.RideStore.ListTrail(r.Context(), rideID); terr == nil {
+			trailKm = ride.TrailDistanceKm(points)
+		}
+
+		if ok, reason := ride.ShouldRecalc(dropMovedM, trailKm, estimateKm); ok {
+			if ride.ExceedsCap(trailKm, estimateKm) && dropMovedM < ride.DropGateMeters {
+				// Fraud-level trail with same drop: keep lock, flag for ops.
+				recalcReason = "fare_review"
+				logger.Log.Warn().Str("ride_id", rideID).Float64("trail_km", trailKm).Float64("estimate_km", estimateKm).Msg("Trail exceeds cap, keeping locked fare for review")
+			} else {
+				billKm := trailKm
+				billSecs := 0
+				// Moved drop: need road distance pickup->final (1 Routes call).
+				// Same-drop detour: trail already proves it, no API cost.
+				if dropMovedM >= ride.DropGateMeters && h.RouteClient != nil {
+					pickupLng, pickupLat := rideData.Pickup.Coordinates[0], rideData.Pickup.Coordinates[1]
+					rctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+					route, rerr := h.RouteClient.CalculateETA(rctx, pickupLat, pickupLng, finalLat, finalLng)
+					cancel()
+					if rerr == nil && route != nil && route.DistanceKm > 0 {
+						if route.DistanceKm > billKm {
+							billKm = route.DistanceKm
+						}
+						billSecs = route.DurationSeconds
+						recalcPoly = route.Polyline
+					}
+				}
+				if billKm <= 0 {
+					billKm = estimateKm
+				}
+				if ambType, aerr := h.AdminStore.GetAmbulanceTypeByID(r.Context(), *rideData.AmbTypeID); aerr == nil && ambType != nil {
+					effBase, tiers, effShare := ambType.BaseFare, func() []pricing.PricingTier {
+						ts := make([]pricing.PricingTier, len(ambType.PricingTier))
+						for i, t := range ambType.PricingTier {
+							ts[i] = pricing.PricingTier{ThresholdDistance: t.ThresholdDistance, CostPerKm: t.CostPerKm}
+						}
+						return ts
+					}(), ambType.DriverShare
+					// Prefer saved ride region (pickup region locked at request).
+					if h.RegionStore != nil {
+						if rid, rerr := h.Dispatcher.RideStore.GetRideRegionID(r.Context(), rideID); rerr == nil && rid != nil && *rid != "" {
+							if rp, perr := h.RegionStore.GetRegionPrice(r.Context(), *rid, ambType.ID); perr == nil && rp != nil {
+								effBase, tiers, effShare = rp.BaseFare, rp.PricingTier, rp.DriverShare
+							}
+						} else if len(rideData.Pickup.Coordinates) == 2 {
+							if res, rerr := h.RegionStore.ResolvePriceForPickup(r.Context(), rideData.Pickup.Coordinates[1], rideData.Pickup.Coordinates[0], ambType.ID, effBase, tiers, effShare, ambType.ListingThreshold, ambType.HelperIncluded, ambType.OTPRequired); rerr == nil && res != nil && res.IsOverride {
+								effBase, tiers, effShare = res.BaseFare, res.Tiers, res.DriverShare
+							}
+						}
+					}
+					base := h.PricingEngine.CalculateBaseAndDistanceFare(billKm, effBase, tiers)
+					emgMult, nightMult := h.surcharges(r.Context())
+					emg := h.PricingEngine.CalculateEmergencySurcharge(base, rideData.EmergencyPriority > 0, emgMult)
+					ngt := h.PricingEngine.CalculateNightSurcharge(base, time.Now(), nightMult)
+					total := payment.RoundRupees(base + emg + ngt)
+					share := payment.RoundRupees(total * effShare / 100.0)
+					if total > 0 {
+						finalAmount = total
+						lockedShare = share
+						recalcFare = &ride.Fare{
+							BaseFare: effBase, DistanceFare: base - effBase,
+							EmergencySurcharge: emg, NightSurcharge: ngt,
+							Total: total, DriverShare: share, Currency: "INR",
+						}
+						recalcKm, recalcSecs, recalcReason = billKm, billSecs, reason
+						if drop, merr := json.Marshal(ride.GeoJSONPoint{Type: "Point", Coordinates: []float64{finalLng, finalLat}}); merr == nil {
+							recalcDropJSON = drop
+						}
+					}
+				}
+			}
 		}
 	}
 
 	if finalAmount <= 0 {
-		finalAmount = 50.0
+		logger.Log.Error().Str("ride_id", rideID).Str("request_id", reqID).Msg("Ride completed with non-positive fare and no fallback available")
+		response.Error(w, "Cannot complete ride: fare could not be determined", http.StatusUnprocessableEntity)
+		return
 	}
 
-	// Apply referral credit discount — kept outside Tx (outbox pattern per 03 §6)
-	// The discount is consumed from offers (separate table) and must not hold ride row lock during external logic.
+	// Apply referral credit discount. The claim is atomic (single-statement
+	// DELETE...RETURNING): concurrent completions cannot spend the same
+	// credit twice. Claimed value is restored on every failure below, so the
+	// user never loses credit for a ride that did not complete.
 	referralDiscount := 0.0
 	if h.ReferralService != nil {
 		discount, err := h.ReferralService.ConsumeUserReferralCredit(r.Context(), rideData.UserID)
@@ -462,17 +724,41 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 			logger.Log.Error().Err(err).Str("user_id", rideData.UserID).Str("request_id", reqID).Msg("Failed to consume referral credit")
 		}
 	}
+	restoreDiscount := func() {
+		if h.ReferralService != nil && referralDiscount > 0 {
+			h.ReferralService.RestoreUserReferralCredit(r.Context(), rideData.UserID, referralDiscount)
+		}
+	}
 
 	userAmount := finalAmount - referralDiscount
 	if userAmount < 0 {
 		userAmount = 0
 	}
 
-	paymentDesc := fmt.Sprintf("Charges for ride to %s", req.DropAddress)
-	driverShare := 0.0
-	if rideData.Fare != nil {
-		driverShare = rideData.Fare.DriverShare
+	// Human-readable fare-change note for receipts ("price rose by X km").
+	extraKm := 0.0
+	fareNote := ""
+	if recalcFare != nil && recalcReason != "" && recalcReason != "fare_review" {
+		extraKm = recalcKm - lockedKm
+		if extraKm < 0 {
+			extraKm = 0
+		}
+		extraKm = payment.RoundRupees(extraKm*10) / 10 // 1 decimal
+		switch recalcReason {
+		case "drop_moved":
+			fareNote = fmt.Sprintf("Ended %.1f km past the planned drop", extraKm)
+		case "detour":
+			fareNote = fmt.Sprintf("Route was %.1f km longer than estimated", extraKm)
+		default:
+			fareNote = fmt.Sprintf("Adjusted for %.1f km extra travel", extraKm)
+		}
 	}
+
+	paymentDesc := fmt.Sprintf("Charges for ride to %s", req.DropAddress)
+	if fareNote != "" {
+		paymentDesc += " (" + fareNote + ")"
+	}
+	driverShare := lockedShare
 	pmt := &payment.Payment{
 		UserID:         rideData.UserID,
 		PartnerID:      driverID,
@@ -481,13 +767,40 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		OriginalAmount: finalAmount,
 		ChargedAmount:  userAmount,
 		DriverShare:    driverShare,
-		PaymentMode:    payment.PaymentMode(req.PaymentMode),
+		PaymentMode:    payment.PaymentMode(paymentMode),
 		CreatedAt:      time.Now(),
 	}
 
-	if req.PaymentMode == "online" {
-		orderID, err := h.RazorpayService.CreateOrder(userAmount, rideID)
-		if err == nil {
+	// Idempotency: a retried complete (client timeout after commit) must not
+	// mint a second bill. If a bill already exists, the discount (if any) was
+	// consumed for nothing — restore it before answering the conflict.
+	if existing, err := h.PaymentStore.FindPaymentByRideID(r.Context(), rideID); err != nil {
+		logger.Log.Error().Err(err).Str("ride_id", rideID).Str("request_id", reqID).Msg("Duplicate-payment check failed")
+		restoreDiscount()
+		response.Error(w, "Failed to complete ride: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else if existing != nil {
+		restoreDiscount()
+		encodeRideCompletion(w, existing, lockedTotal, lockedKm, recalcKm, 0, "", "", nil)
+		return
+	}
+
+	if paymentMode == string(payment.ModeOnline) {
+		if userAmount <= 0 {
+			// Fully discounted: nothing to collect. Settle immediately as
+			// paid so the bill never sticks unpaid; the platform absorbs
+			// the driver share (same rule as referral discounts).
+			pmt.Paid = true
+			now := time.Now()
+			pmt.PaidAt = &now
+		} else {
+			orderID, err := h.RazorpayService.CreateOrder(userAmount, rideID)
+			if err != nil {
+				logger.Log.Error().Err(err).Str("ride_id", rideID).Str("request_id", reqID).Msg("Razorpay order creation failed; ride not completed")
+				restoreDiscount()
+				response.Error(w, "Failed to create online payment order, please retry", http.StatusBadGateway)
+				return
+			}
 			pmt.RazorpayOrderID = &orderID
 		}
 	} else {
@@ -496,9 +809,13 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		pmt.PaidAt = &now
 	}
 
-	// Prepare fare update payload if referral discount applied
+	// Prepare fare update payload: recalc wins, else referral discount patch.
 	var fareToUpdate *ride.Fare
-	if referralDiscount > 0 && rideData.Fare != nil {
+	if recalcFare != nil {
+		recalcFare.ReferralDiscount = referralDiscount
+		// Total stays pre-discount actual; ChargedAmount carries discount.
+		fareToUpdate = recalcFare
+	} else if referralDiscount > 0 && rideData.Fare != nil {
 		rideData.Fare.ReferralDiscount = referralDiscount
 		rideData.Fare.Total = userAmount
 		fareToUpdate = rideData.Fare
@@ -514,7 +831,11 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		if err := rTx.UpdateRideStatus(r.Context(), rideID, ride.StatusInProgress, ride.StatusCompleted); err != nil {
 			return err
 		}
-		if fareToUpdate != nil {
+		if recalcFare != nil {
+			if err := rTx.UpdateRideActuals(r.Context(), rideID, recalcDropJSON, recalcKm, recalcSecs, recalcPoly, fareToUpdate, recalcReason); err != nil {
+				return err
+			}
+		} else if fareToUpdate != nil {
 			if err := rTx.UpdateRideFare(r.Context(), rideID, fareToUpdate); err != nil {
 				return err
 			}
@@ -522,35 +843,99 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		if err := sTx.CreatePayment(r.Context(), pmt); err != nil {
 			return err
 		}
-		if req.PaymentMode != "online" {
+		// Link the ride to its bill so receipt/recovery reads a single source
+		// of truth instead of racing the separate payment lookup.
+		if err := rTx.UpdateRidePayment(r.Context(), rideID, pmt.ID, paymentMode); err != nil {
+			return err
+		}
+		if paymentMode != string(payment.ModeOnline) {
 			commission := pmt.OriginalAmount - pmt.DriverShare
-			if commission > 0 && ids.IsValid(driverID) {
+			if commission > 0 {
+				if !ids.IsValid(driverID) {
+					return errors.New("invalid driver for commission debit")
+				}
+				var exists bool
+				if qerr := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM drivers WHERE id=$1)`, driverID).Scan(&exists); qerr != nil {
+					return qerr
+				}
+				if !exists {
+					return errors.New("driver not found for commission debit")
+				}
 				if err := wTx.UpdateWalletBalance(r.Context(), driverID, -commission); err != nil {
 					return err
 				}
+				bal, berr := wTx.GetBalance(r.Context(), driverID)
+				if berr != nil {
+					return berr
+				}
+				if err := wTx.InsertLedgerEntry(r.Context(), &payment.WalletTransaction{
+					DriverID:     driverID,
+					Amount:       commission,
+					Direction:    "debit",
+					TxnType:      "commission_debit",
+					ReferenceID:  pmt.ID,
+					Status:       "success",
+					BalanceAfter: &bal,
+				}); err != nil {
+					return err
+				}
+			}
+		} else if pmt.Paid && pmt.DriverShare > 0 {
+			// Fully-discounted online ride settled above: credit the driver
+			// share now (platform absorbs), with a ledger row.
+			if !ids.IsValid(driverID) {
+				return errors.New("invalid driver for zero-amount credit")
+			}
+			if err := wTx.UpdateWalletBalance(r.Context(), driverID, pmt.DriverShare); err != nil {
+				return err
+			}
+			bal, berr := wTx.GetBalance(r.Context(), driverID)
+			if berr != nil {
+				return berr
+			}
+			if err := wTx.InsertLedgerEntry(r.Context(), &payment.WalletTransaction{
+				DriverID:     driverID,
+				Amount:       pmt.DriverShare,
+				Direction:    "credit",
+				TxnType:      "ride_credit",
+				ReferenceID:  pmt.ID,
+				Status:       "success",
+				BalanceAfter: &bal,
+			}); err != nil {
+				return err
 			}
 		}
 		return nil
 	}); err != nil {
+		restoreDiscount()
+		// A concurrent completion may have won the status CAS while this
+		// request was in flight. Replay the winning bill instead of failing
+		// a retry that would otherwise strand the apps.
+		if fresh, ferr := h.Dispatcher.RideStore.GetRideByID(r.Context(), rideID); ferr == nil && fresh != nil && fresh.Status == ride.StatusCompleted {
+			if existing, perr := h.PaymentStore.FindPaymentByRideID(r.Context(), rideID); perr == nil && existing != nil {
+				encodeRideCompletion(w, existing, lockedTotal, lockedKm, recalcKm, extraKm, recalcReason, fareNote, nil)
+				return
+			}
+		}
 		logger.Log.Error().Err(err).Str("ride_id", rideID).Str("request_id", reqID).Msg("Failed to complete ride transaction")
 		response.Error(w, "Failed to complete ride: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	h.EventBus.PublishEvent(eventbus.ChannelRideCompleted, eventbus.RideCompletedPayload{
-		RideID:      rideID,
-		DriverID:    driverID,
-		UserID:      rideData.UserID,
-		PaymentMode: req.PaymentMode,
-		FinalAmount: userAmount,
-		DriverShare: func() float64 {
-			if rideData.Fare != nil {
-				return rideData.Fare.DriverShare
-			}
-			return 0
-		}(),
-		DropAddress: req.DropAddress,
-		RequestID:   reqID,
+		RideID:          rideID,
+		DriverID:        driverID,
+		UserID:          rideData.UserID,
+		PaymentID:       pmt.ID,
+		PaymentMode:     paymentMode,
+		FinalAmount:     userAmount,
+		DriverShare:     driverShare,
+		DropAddress:     req.DropAddress,
+		RequestID:       reqID,
+		EstimatedAmount: lockedTotal,
+		ExtraKm:         extraKm,
+		FareReason:      recalcReason,
+		FareNote:        fareNote,
 	})
 
 	// V20: Process referral ride completion
@@ -558,14 +943,50 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		go h.ReferralService.ProcessRideCompletion(context.Background(), rideData.UserID, driverID)
 	}
 
+	// Fare breakdown for the receipt (estimate vs actual).
+	breakup := map[string]interface{}{}
+	if src := fareToUpdate; src != nil {
+		breakup = map[string]interface{}{
+			"base_fare": src.BaseFare, "distance_fare": src.DistanceFare,
+			"emergency_surcharge": src.EmergencySurcharge, "night_surcharge": src.NightSurcharge,
+			"total": src.Total, "driver_share": src.DriverShare,
+		}
+	} else if rideData.Fare != nil {
+		f := rideData.Fare
+		breakup = map[string]interface{}{
+			"base_fare": f.BaseFare, "distance_fare": f.DistanceFare,
+			"emergency_surcharge": f.EmergencySurcharge, "night_surcharge": f.NightSurcharge,
+			"total": f.Total, "driver_share": f.DriverShare,
+		}
+	}
+	encodeRideCompletion(w, pmt, lockedTotal, lockedKm, recalcKm, extraKm, recalcReason, fareNote, breakup)
+}
+
+// encodeRideCompletion writes the canonical completion/replay response.
+// Retried completes must return exactly the same shape as the winning call.
+func encodeRideCompletion(w http.ResponseWriter, pmt *payment.Payment, estimatedAmount, estimatedKm, actualKm, extraKm float64, fareReason, fareNote string, breakup map[string]interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"detail":            "Ride Completed",
 		"payment_id":        pmt.ID,
 		"razorpay_order_id": pmt.RazorpayOrderID,
-		"take_cash":         req.PaymentMode != "online",
-		"amount":            userAmount,
+		"take_cash":         pmt.PaymentMode != payment.ModeOnline,
+		"amount":            pmt.ChargedAmount,
+		"estimated_amount":  estimatedAmount,
+		"estimated_km":      estimatedKm,
+		"actual_km":         actualKm,
+		"extra_km":          extraKm,
+		"fare_reason":       fareReason,
+		"fare_note":         fareNote,
+		"fare_breakup":      breakup,
 	})
+}
+
+func routeDistanceKm(r *ride.Ride) float64 {
+	if r != nil && r.Route != nil {
+		return r.Route.DistanceKm
+	}
+	return 0
 }
 
 func (h *RideHandler) HandleCancel(w http.ResponseWriter, r *http.Request) {
@@ -607,9 +1028,9 @@ func (h *RideHandler) HandleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.EventBus.PublishEvent(eventbus.ChannelRideCancelled, eventbus.RideCancelledPayload{
-		RideID:    rideID,
-		Reason:    cancelReason,
-		UserID:    rideData.UserID,
+		RideID: rideID,
+		Reason: cancelReason,
+		UserID: rideData.UserID,
 		DriverID: func() string {
 			if rideData.DriverID != nil {
 				return *rideData.DriverID
@@ -645,6 +1066,10 @@ func (h *RideHandler) HandleGetHistory(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		response.Error(w, "Failed to fetch history: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	for _, rd := range rides {
+		h.scrubStartOTP(r.Context(), role, rd)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -689,6 +1114,15 @@ func (h *RideHandler) HandleGetCurrentRide(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Explicit-ID fetch bypasses the scoped current-ride query: enforce
+	// ownership so strangers can't pull other rides (incl. their OTP).
+	if req.RideID != "" && role != "admin" && uidStr != rideData.UserID && (rideData.DriverID == nil || uidStr != *rideData.DriverID) {
+		response.Error(w, "Forbidden: you do not own this ride", http.StatusForbidden)
+		return
+	}
+
+	h.scrubStartOTP(r.Context(), role, rideData)
+
 	// Flutter expects legacy status strings (searching_rides, accepted_rides, ongoing_rides)
 	statusStr := string(rideData.Status)
 	if rideData.Status == ride.StatusSearching {
@@ -703,6 +1137,96 @@ func (h *RideHandler) HandleGetCurrentRide(w http.ResponseWriter, r *http.Reques
 		"found":  true,
 		"status": statusStr,
 		"data":   rideData,
+	})
+}
+
+// HandleGetRecentCompletedRide returns a COMPLETED ride that is recent enough
+// to still need post-ride handling (payment, rating, receipt). Callers pass
+// completed_after to bound recovery; old receipts must never resurface on
+// every launch.
+func (h *RideHandler) HandleGetRecentCompletedRide(w http.ResponseWriter, r *http.Request) {
+	uidStr, ok := r.Context().Value(middleware.UserIDKey).(string)
+	if !ok {
+		response.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	role, ok := r.Context().Value(middleware.UserRoleKey).(string)
+	if !ok {
+		response.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	role = h.upgradeUnvrfDriverRole(uidStr, role)
+
+	var req struct {
+		RideID         string `json:"ride_id"`
+		CompletedAfter string `json:"completed_after"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	if req.CompletedAfter != "" {
+		if t, terr := time.Parse(time.RFC3339, req.CompletedAfter); terr == nil {
+			cutoff = t
+		}
+	}
+
+	var rideData *ride.Ride
+	var err error
+	if role == "driver" {
+		// Driver app parity: newest ride, still gated by completion freshness.
+		var rides []*ride.Ride
+		rides, err = h.Dispatcher.RideStore.GetRideHistory(r.Context(), uidStr, role, 1, 0)
+		if err == nil && len(rides) > 0 && rides[0].Status == ride.StatusCompleted &&
+			rides[0].Time.CompletedAt != nil && !rides[0].Time.CompletedAt.Before(cutoff) {
+			rideData = rides[0]
+			if req.RideID != "" && rideData.ID != req.RideID {
+				rideData = nil
+			}
+		}
+	} else {
+		rideData, err = h.Dispatcher.RideStore.GetLatestCompletedRide(r.Context(), uidStr, req.RideID, &cutoff)
+	}
+	if err != nil {
+		response.Error(w, "Failed to fetch ride history: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if rideData == nil {
+		w.Write([]byte(`{"found": false}`))
+		return
+	}
+
+	h.scrubStartOTP(r.Context(), role, rideData)
+
+	finalAmount := 0.0
+	paymentMode := rideData.PaymentMode
+	paymentID := ""
+	paymentPaid := false
+	var razorpayOrderID any
+	if pmt, perr := h.PaymentStore.FindPaymentByRideID(r.Context(), rideData.ID); perr == nil && pmt != nil {
+		finalAmount = pmt.ChargedAmount
+		paymentMode = string(pmt.PaymentMode)
+		paymentID = pmt.ID
+		paymentPaid = pmt.Paid
+		razorpayOrderID = pmt.RazorpayOrderID
+	}
+
+	completedAt := ""
+	if rideData.Time.CompletedAt != nil {
+		completedAt = rideData.Time.CompletedAt.Format(time.RFC3339)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found":             true,
+		"status":            "completed_rides",
+		"data":              rideData,
+		"final_amount":      finalAmount,
+		"payment_mode":      paymentMode,
+		"payment_id":        paymentID,
+		"payment_paid":      paymentPaid,
+		"razorpay_order_id": razorpayOrderID,
+		"completed_at":      completedAt,
 	})
 }
 
@@ -806,10 +1330,10 @@ func (h *RideHandler) HandleGetUserDetails(w http.ResponseWriter, r *http.Reques
 
 func (h *RideHandler) HandleRoutePreview(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		OriginLat  float64 `json:"origin_lat" validate:"required,min=-90,max=90"`
-		OriginLng  float64 `json:"origin_lng" validate:"required,min=-180,max=180"`
-		DestLat    float64 `json:"dest_lat" validate:"required,min=-90,max=90"`
-		DestLng    float64 `json:"dest_lng" validate:"required,min=-180,max=180"`
+		OriginLat float64 `json:"origin_lat" validate:"required,min=-90,max=90"`
+		OriginLng float64 `json:"origin_lng" validate:"required,min=-180,max=180"`
+		DestLat   float64 `json:"dest_lat" validate:"required,min=-90,max=90"`
+		DestLng   float64 `json:"dest_lng" validate:"required,min=-180,max=180"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
@@ -819,7 +1343,11 @@ func (h *RideHandler) HandleRoutePreview(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	route, err := h.RouteClient.CalculateETA(r.Context(), req.OriginLat, req.OriginLng, req.DestLat, req.DestLng)
+	// Cap upstream Google latency: one slow routing call must never wedge
+	// every client polling ETAs on live ride screens.
+	rctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	route, err := h.RouteClient.CalculateETA(rctx, req.OriginLat, req.OriginLng, req.DestLat, req.DestLng)
 	if err != nil {
 		response.Error(w, "Failed to compute route: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -843,6 +1371,8 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 		DistanceKm float64 `json:"distance_km" validate:"required,gt=0"`
 		AmbTypeID  string  `json:"amb_type_id"`
 		IsSOS      bool    `json:"is_sos"`
+		PickupLat  float64 `json:"pickup_lat"`
+		PickupLng  float64 `json:"pickup_lng"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
@@ -860,34 +1390,31 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
-		pricingTiers := make([]pricing.PricingTier, len(ambType.PricingTier))
-		for i, t := range ambType.PricingTier {
-			pricingTiers[i] = pricing.PricingTier{
-				ThresholdDistance: t.ThresholdDistance,
-				CostPerKm:         t.CostPerKm,
-			}
+		effBase, pricingTiers, effShare, regionID := h.effectivePrice(r.Context(), req.PickupLat, req.PickupLng, ambType)
+
+		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, effBase, pricingTiers)
+		emgMult, nightMult := h.surcharges(r.Context())
+		emergency := h.PricingEngine.CalculateEmergencySurcharge(base, req.IsSOS, emgMult)
+		night := h.PricingEngine.CalculateNightSurcharge(base, time.Now(), nightMult)
+		total := payment.RoundRupees(base + emergency + night)
+
+		driverShare := payment.RoundRupees(total * effShare / 100.0)
+		regionIDStr := ""
+		if regionID != nil {
+			regionIDStr = *regionID
 		}
-
-		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, ambType.BaseFare, pricingTiers)
-		emergency := h.PricingEngine.CalculateEmergencySurcharge(base, req.IsSOS)
-		night := h.PricingEngine.CalculateNightSurcharge(base, time.Now())
-		total := float64(int((base+emergency+night)*100)) / 100
-
-		driverBaseFare := ambType.BaseFare * ambType.DriverShare / 100.0
-		dBase := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, driverBaseFare, pricingTiers)
-		dEmergency := h.PricingEngine.CalculateEmergencySurcharge(dBase, req.IsSOS)
-		dNight := h.PricingEngine.CalculateNightSurcharge(dBase, time.Now())
-		driverShare := float64(int((dBase+dEmergency+dNight)*100)) / 100
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
+			"region_id": regionIDStr,
 			"estimates": []map[string]interface{}{
 				{
 					"amb_type_id":  ambType.ID,
 					"name":         ambType.Name,
-					"base_fare":    ambType.BaseFare,
+					"base_fare":    effBase,
 					"total":        total,
 					"driver_share": driverShare,
+					"region_id":    regionIDStr,
 				},
 			},
 		})
@@ -910,29 +1437,21 @@ func (h *RideHandler) HandleFareEstimate(w http.ResponseWriter, r *http.Request)
 	}
 	estimates := make([]estimate, 0, len(allTypes))
 	for _, ambType := range allTypes {
-		pricingTiers := make([]pricing.PricingTier, len(ambType.PricingTier))
-		for i, t := range ambType.PricingTier {
-			pricingTiers[i] = pricing.PricingTier{
-				ThresholdDistance: t.ThresholdDistance,
-				CostPerKm:         t.CostPerKm,
-			}
-		}
+		ambType := ambType
+		effBase, pricingTiers, effShare, _ := h.effectivePrice(r.Context(), req.PickupLat, req.PickupLng, &ambType)
 
-		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, ambType.BaseFare, pricingTiers)
-		emergency := h.PricingEngine.CalculateEmergencySurcharge(base, req.IsSOS)
-		night := h.PricingEngine.CalculateNightSurcharge(base, time.Now())
-		total := float64(int((base+emergency+night)*100)) / 100
+		base := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, effBase, pricingTiers)
+		emgMult, nightMult := h.surcharges(r.Context())
+		emergency := h.PricingEngine.CalculateEmergencySurcharge(base, req.IsSOS, emgMult)
+		night := h.PricingEngine.CalculateNightSurcharge(base, time.Now(), nightMult)
+		total := payment.RoundRupees(base + emergency + night)
 
-		driverBaseFare := ambType.BaseFare * ambType.DriverShare / 100.0
-		dBase := h.PricingEngine.CalculateBaseAndDistanceFare(req.DistanceKm, driverBaseFare, pricingTiers)
-		dEmergency := h.PricingEngine.CalculateEmergencySurcharge(dBase, req.IsSOS)
-		dNight := h.PricingEngine.CalculateNightSurcharge(dBase, time.Now())
-		driverShare := float64(int((dBase+dEmergency+dNight)*100)) / 100
+		driverShare := payment.RoundRupees(total * effShare / 100.0)
 
 		estimates = append(estimates, estimate{
 			AmbTypeID:   ambType.ID,
 			Name:        ambType.Name,
-			BaseFare:    ambType.BaseFare,
+			BaseFare:    effBase,
 			Total:       total,
 			DriverShare: driverShare,
 		})

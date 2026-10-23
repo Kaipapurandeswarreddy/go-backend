@@ -68,48 +68,48 @@ const rideSelect = `SELECT id::text, user_id::text, driver_id::text, amb_type_id
 // scanRide scans a single row into a Ride. Handles JSONB unmarshaling and NULLs.
 func scanRide(row pgx.Row) (*Ride, error) {
 	var (
-		id                    string
-		userID                string
-		driverIDNS            sql.NullString
-		ambTypeIDNS           sql.NullString
-		hospitalIDNS          sql.NullString
-		startOTPNS            sql.NullString
-		status                string
-		pickupJSON            []byte
-		pickupAddress         string
-		pickupH3Cell          string
-		dropJSON              []byte
-		dropAddress           string
-		routeDistance         sql.NullFloat64
-		routeDuration         sql.NullInt32
-		routePolylineNS       sql.NullString
-		fareBase              sql.NullFloat64
-		fareDistance          sql.NullFloat64
-		fareEmergency         sql.NullFloat64
-		fareNight             sql.NullFloat64
-		fareWaiting           sql.NullFloat64
-		fareTotal             sql.NullFloat64
-		fareDriverShare       sql.NullFloat64
-		fareReferralDiscount  sql.NullFloat64
-		fareCurrencyNS        sql.NullString
-		emergencyTypeNS       sql.NullString
-		emergencyPriority     int
-		paymentMode           string
-		paymentIDNS           sql.NullString
-		createdAt             time.Time
-		assignedAt            sql.NullTime
-		arrivedAt             sql.NullTime
-		startedAt             sql.NullTime
-		completedAt           sql.NullTime
-		cancelledAt           sql.NullTime
-		dispatchCandidates    int
-		dispatchOffersSent    int
+		id                     string
+		userID                 string
+		driverIDNS             sql.NullString
+		ambTypeIDNS            sql.NullString
+		hospitalIDNS           sql.NullString
+		startOTPNS             sql.NullString
+		status                 string
+		pickupJSON             []byte
+		pickupAddress          string
+		pickupH3Cell           string
+		dropJSON               []byte
+		dropAddress            string
+		routeDistance          sql.NullFloat64
+		routeDuration          sql.NullInt32
+		routePolylineNS        sql.NullString
+		fareBase               sql.NullFloat64
+		fareDistance           sql.NullFloat64
+		fareEmergency          sql.NullFloat64
+		fareNight              sql.NullFloat64
+		fareWaiting            sql.NullFloat64
+		fareTotal              sql.NullFloat64
+		fareDriverShare        sql.NullFloat64
+		fareReferralDiscount   sql.NullFloat64
+		fareCurrencyNS         sql.NullString
+		emergencyTypeNS        sql.NullString
+		emergencyPriority      int
+		paymentMode            string
+		paymentIDNS            sql.NullString
+		createdAt              time.Time
+		assignedAt             sql.NullTime
+		arrivedAt              sql.NullTime
+		startedAt              sql.NullTime
+		completedAt            sql.NullTime
+		cancelledAt            sql.NullTime
+		dispatchCandidates     int
+		dispatchOffersSent     int
 		dispatchOffersDeclined int
 		dispatchOffersTimedOut int
-		dispatchLatency       int
-		cancellationReasonNS  sql.NullString
-		availableTypesJSON    []byte
-		latestConditionJSON   []byte
+		dispatchLatency        int
+		cancellationReasonNS   sql.NullString
+		availableTypesJSON     []byte
+		latestConditionJSON    []byte
 		conditionOnArrivalJSON []byte
 	)
 
@@ -337,48 +337,48 @@ func scanRides(rows pgx.Rows) ([]*Ride, error) {
 		// Reuse scan by creating a row wrapper: rows as pgx.Row is not directly compatible,
 		// so we manually scan here with same variables.
 		var (
-			id                    string
-			userID                string
-			driverIDNS            sql.NullString
-			ambTypeIDNS           sql.NullString
-			hospitalIDNS          sql.NullString
-			startOTPNS            sql.NullString
-			status                string
-			pickupJSON            []byte
-			pickupAddress         string
-			pickupH3Cell          string
-			dropJSON              []byte
-			dropAddress           string
-			routeDistance         sql.NullFloat64
-			routeDuration         sql.NullInt32
-			routePolylineNS       sql.NullString
-			fareBase              sql.NullFloat64
-			fareDistance          sql.NullFloat64
-			fareEmergency         sql.NullFloat64
-			fareNight             sql.NullFloat64
-			fareWaiting           sql.NullFloat64
-			fareTotal             sql.NullFloat64
-			fareDriverShare       sql.NullFloat64
-			fareReferralDiscount  sql.NullFloat64
-			fareCurrencyNS        sql.NullString
-			emergencyTypeNS       sql.NullString
-			emergencyPriority     int
-			paymentMode           string
-			paymentIDNS           sql.NullString
-			createdAt             time.Time
-			assignedAt            sql.NullTime
-			arrivedAt             sql.NullTime
-			startedAt             sql.NullTime
-			completedAt           sql.NullTime
-			cancelledAt           sql.NullTime
-			dispatchCandidates    int
-			dispatchOffersSent    int
+			id                     string
+			userID                 string
+			driverIDNS             sql.NullString
+			ambTypeIDNS            sql.NullString
+			hospitalIDNS           sql.NullString
+			startOTPNS             sql.NullString
+			status                 string
+			pickupJSON             []byte
+			pickupAddress          string
+			pickupH3Cell           string
+			dropJSON               []byte
+			dropAddress            string
+			routeDistance          sql.NullFloat64
+			routeDuration          sql.NullInt32
+			routePolylineNS        sql.NullString
+			fareBase               sql.NullFloat64
+			fareDistance           sql.NullFloat64
+			fareEmergency          sql.NullFloat64
+			fareNight              sql.NullFloat64
+			fareWaiting            sql.NullFloat64
+			fareTotal              sql.NullFloat64
+			fareDriverShare        sql.NullFloat64
+			fareReferralDiscount   sql.NullFloat64
+			fareCurrencyNS         sql.NullString
+			emergencyTypeNS        sql.NullString
+			emergencyPriority      int
+			paymentMode            string
+			paymentIDNS            sql.NullString
+			createdAt              time.Time
+			assignedAt             sql.NullTime
+			arrivedAt              sql.NullTime
+			startedAt              sql.NullTime
+			completedAt            sql.NullTime
+			cancelledAt            sql.NullTime
+			dispatchCandidates     int
+			dispatchOffersSent     int
 			dispatchOffersDeclined int
 			dispatchOffersTimedOut int
-			dispatchLatency       int
-			cancellationReasonNS  sql.NullString
-			availableTypesJSON    []byte
-			latestConditionJSON   []byte
+			dispatchLatency        int
+			cancellationReasonNS   sql.NullString
+			availableTypesJSON     []byte
+			latestConditionJSON    []byte
 			conditionOnArrivalJSON []byte
 		)
 		err := rows.Scan(
@@ -707,9 +707,13 @@ func (s *Store) CreateRide(ctx context.Context, ride *Ride) error {
 		conditionOnArrivalArg = data
 	}
 
+	var regionIDArg interface{}
+	if ride.RegionID != nil && *ride.RegionID != "" {
+		regionIDArg = *ride.RegionID
+	}
 	_, err = s.db.Exec(ctx,
-		`INSERT INTO rides (id, user_id, driver_id, amb_type_id, hospital_id, start_otp, status, pickup, pickup_address, pickup_h3_cell, drop, drop_address, route_distance_km, route_duration_seconds, route_polyline, fare_base, fare_distance, fare_emergency, fare_night, fare_waiting, fare_total, fare_driver_share, fare_referral_discount, fare_currency, emergency_type, emergency_priority, payment_mode, payment_id, created_at, assigned_at, arrived_at, started_at, completed_at, cancelled_at, dispatch_candidates_searched, dispatch_offers_sent, dispatch_offers_declined, dispatch_offers_timed_out, dispatch_assignment_latency_ms, cancellation_reason, available_types, latest_condition, condition_on_arrival)
-		 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::uuid, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41::jsonb, $42::jsonb, $43::jsonb)`,
+		`INSERT INTO rides (id, user_id, driver_id, amb_type_id, hospital_id, start_otp, status, pickup, pickup_address, pickup_h3_cell, drop, drop_address, route_distance_km, route_duration_seconds, route_polyline, fare_base, fare_distance, fare_emergency, fare_night, fare_waiting, fare_total, fare_driver_share, fare_referral_discount, fare_currency, emergency_type, emergency_priority, payment_mode, payment_id, created_at, assigned_at, arrived_at, started_at, completed_at, cancelled_at, dispatch_candidates_searched, dispatch_offers_sent, dispatch_offers_declined, dispatch_offers_timed_out, dispatch_assignment_latency_ms, cancellation_reason, available_types, latest_condition, condition_on_arrival, region_id)
+		 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::uuid, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41::jsonb, $42::jsonb, $43::jsonb, $44::uuid)`,
 		ride.ID,
 		ride.UserID,
 		driverIDArg,
@@ -753,8 +757,19 @@ func (s *Store) CreateRide(ctx context.Context, ride *Ride) error {
 		availableTypesArg,
 		latestConditionArg,
 		conditionOnArrivalArg,
+		regionIDArg,
 	)
 	return err
+}
+
+// GetRideRegionID returns the saved pricing region for a ride (nil = global).
+func (s *Store) GetRideRegionID(ctx context.Context, rideID string) (*string, error) {
+	var v *string
+	err := s.db.QueryRow(ctx, `SELECT region_id::text FROM rides WHERE id=$1::uuid`, rideID).Scan(&v)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // AtomicAssignDriver safely assigns a driver to a ride ONLY if the ride is still SEARCHING.
@@ -891,6 +906,57 @@ func (s *Store) UpdateRideFare(ctx context.Context, rideID string, fare *Fare) e
 		rideID, fare.BaseFare, fare.DistanceFare, fare.EmergencySurcharge, fare.NightSurcharge, fare.WaitingCharge, fare.Total, fare.DriverShare, fare.ReferralDiscount, fare.Currency,
 	)
 	return err
+}
+
+// UpdateRidePayment links a ride to its bill and records the settled payment
+// mode, so completion state is readable from the ride row alone.
+func (s *Store) UpdateRidePayment(ctx context.Context, rideID string, paymentID string, paymentMode string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE rides SET payment_id=$2::uuid, payment_mode=$3 WHERE id=$1::uuid`,
+		rideID, paymentID, paymentMode,
+	)
+	return err
+}
+
+// GetLatestCompletedRide returns the newest COMPLETED ride for a user,
+// optionally restricted by ride id and completion time. Bounded so an old
+// receipt cannot resurface on every app launch.
+func (s *Store) GetLatestCompletedRide(ctx context.Context, userID string, rideID string, completedAfter *time.Time) (*Ride, error) {
+	var (
+		row pgx.Row
+	)
+	switch {
+	case rideID != "":
+		row = s.db.QueryRow(ctx, rideSelect+` WHERE id=$1::uuid AND user_id=$2::uuid AND status='COMPLETED'`, rideID, userID)
+	case completedAfter != nil:
+		row = s.db.QueryRow(ctx, rideSelect+` WHERE user_id=$1::uuid AND status='COMPLETED' AND completed_at >= $2 ORDER BY completed_at DESC LIMIT 1`, userID, *completedAfter)
+	default:
+		row = s.db.QueryRow(ctx, rideSelect+` WHERE user_id=$1::uuid AND status='COMPLETED' ORDER BY completed_at DESC LIMIT 1`, userID)
+	}
+	ride, err := scanRide(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return ride, nil
+}
+
+// EscalateEmergencyForStoppedVehicle flips a normal IN_PROGRESS ride to
+// emergency priority after a confirmed 5-minute stop. The guarded WHERE
+// clause makes it idempotent: SOS rides, finished rides, or repeat calls
+// affect 0 rows and report escalated=false. Fare is intentionally untouched
+// (locked at booking time).
+func (s *Store) EscalateEmergencyForStoppedVehicle(ctx context.Context, rideID string) (bool, error) {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE rides SET emergency_priority=10, emergency_type=COALESCE(NULLIF(emergency_type,''),'stopped_vehicle') WHERE id=$1::uuid AND status='IN_PROGRESS' AND emergency_priority=0`,
+		rideID,
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // CancelStaleSearchingRides cancels all rides in SEARCHING state older than maxAge.
@@ -1091,6 +1157,19 @@ func (s *Store) ListConditionUpdatesBatch(ctx context.Context, rideIDs []string)
 		}
 	}
 	return m, nil
+}
+
+// UpdateRideActuals persists gated re-rate results: actual drop/route + new fare.
+// Estimate stays in route_*/drop; actuals go to actual_* for dispute audit.
+func (s *Store) UpdateRideActuals(ctx context.Context, rideID string, actualDrop []byte, actualKm float64, actualSecs int, polyline string, fare *Fare, reason string) error {
+	if fare == nil {
+		return errors.New("nil fare")
+	}
+	_, err := s.db.Exec(ctx,
+		`UPDATE rides SET actual_drop=$2::jsonb, actual_distance_km=$3, actual_duration_seconds=$4, actual_polyline=$5, fare_base=$6, fare_distance=$7, fare_emergency=$8, fare_night=$9, fare_waiting=$10, fare_total=$11, fare_driver_share=$12, fare_referral_discount=$13, fare_currency=$14, fare_recalc_reason=$15 WHERE id=$1::uuid`,
+		rideID, actualDrop, actualKm, actualSecs, polyline,
+		fare.BaseFare, fare.DistanceFare, fare.EmergencySurcharge, fare.NightSurcharge, fare.WaitingCharge, fare.Total, fare.DriverShare, fare.ReferralDiscount, fare.Currency, reason)
+	return err
 }
 
 // PopulateConditionUpdates fills Ride.ConditionUpdates for each ride in slice.

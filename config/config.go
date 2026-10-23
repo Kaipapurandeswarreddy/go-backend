@@ -35,11 +35,18 @@ type AppConfig struct {
 	RazorpayWebhookSecret string
 
 	// Zwitch (Bank Payouts)
-	ZwitchKey       string
-	ZwitchSecret    string
-	ZwitchAccountID string
-	ZwitchAPIBaseURL string
+	ZwitchKey                   string
+	ZwitchSecret                string
+	ZwitchVerificationKey       string
+	ZwitchVerificationSecret    string
+	ZwitchAccountID             string
+	ZwitchVerificationAccountID string
+	ZwitchAPIBaseURL            string
 	ZwitchProxyURL  string
+	ZwitchWebhookSecret string
+
+	// Wallet (withdrawals)
+	WithdrawalFee float64
 
 	// Cloudshope (Call Masking)
 	CloudshopeToken      string
@@ -52,8 +59,16 @@ type AppConfig struct {
 	GoogleTranslateAPIURL  string
 
 	FirebaseCredentialsPath string
+	GCSBucketName           string
 	Port                    string
 	AllowStaleRefreshChain  bool
+
+	// Resend (email invites)
+	ResendAPIKey      string
+	ResendFromEmail   string
+	ResendFromName    string
+	ResendToTest      string
+	ResendUseVerified bool
 }
 
 // LoadConfig reads configuration from environment variables
@@ -99,11 +114,16 @@ func LoadConfig() *AppConfig {
 		RazorpayKeySecret:      os.Getenv("RAZORPAY_KEY_SECRET"),
 		RazorpayWebhookSecret: os.Getenv("RAZORPAY_WEBHOOK_SECRET"),
 
-		ZwitchKey:         os.Getenv("ZWITCH_KEY"),
-		ZwitchSecret:      os.Getenv("ZWITCH_SECRET"),
-		ZwitchAccountID:   os.Getenv("ZWITCH_ACCOUNT_ID"),
-		ZwitchAPIBaseURL:  envOrDefault("ZWITCH_API_BASE_URL", "https://api.zwitch.io/v1"),
+		ZwitchKey:                   os.Getenv("ZWITCH_KEY"),
+		ZwitchSecret:                os.Getenv("ZWITCH_SECRET"),
+		ZwitchVerificationKey:       envOrDefault("ZWITCH_VERIFICATION_KEY", os.Getenv("ZWITCH_KEY")),
+		ZwitchVerificationSecret:    envOrDefault("ZWITCH_VERIFICATION_SECRET", os.Getenv("ZWITCH_SECRET")),
+		ZwitchAccountID:             os.Getenv("ZWITCH_ACCOUNT_ID"),
+		ZwitchVerificationAccountID: envOrDefault("ZWITCH_VERIFICATION_ACCOUNT_ID", os.Getenv("ZWITCH_ACCOUNT_ID")),
+		ZwitchAPIBaseURL:            envOrDefault("ZWITCH_API_BASE_URL", "https://api.zwitch.io/v1"),
 		ZwitchProxyURL:    os.Getenv("ZWITCH_PROXY_URL"),
+		ZwitchWebhookSecret: os.Getenv("ZWITCH_WEBHOOK_SECRET"),
+		WithdrawalFee:     envFloatOrDefault("WITHDRAWAL_FEE", 7),
 
 		CloudshopeToken:      os.Getenv("CLOUDSHOPE_TOKEN"),
 		CloudshopeNumber:     os.Getenv("CLOUDSHOPE_NUMBER"),
@@ -114,8 +134,15 @@ func LoadConfig() *AppConfig {
 		GoogleTranslateAPIURL: envOrDefault("GOOGLE_TRANSLATE_API_URL", "https://translate.googleapis.com/translate_a/single"),
 
 		FirebaseCredentialsPath: os.Getenv("FIREBASE_CREDENTIALS_PATH"),
+		GCSBucketName:           envOrDefault("GCS_BUCKET_NAME", "ambigo-driver-docs"),
 		Port:                    port,
 		AllowStaleRefreshChain:  os.Getenv("ALLOW_STALE_REFRESH_CHAIN") == "true",
+
+		ResendAPIKey:      os.Getenv("RESEND_API_KEY"),
+		ResendFromEmail:   envOrDefault("RESEND_FROM_EMAIL", "onboarding@resend.dev"),
+		ResendFromName:    envOrDefault("RESEND_FROM_NAME", "Ambigo"),
+		ResendToTest:      envOrDefault("RESEND_TO_TEST", "delivered@resend.dev"),
+		ResendUseVerified: os.Getenv("RESEND_USE_VERIFIED") == "true",
 	}
 
 	if cfg.JWTSecret == "" {
@@ -138,6 +165,15 @@ func envOrDefault(key, fallback string) string {
 func envIntOrDefault(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+func envFloatOrDefault(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n >= 0 {
 			return n
 		}
 	}
