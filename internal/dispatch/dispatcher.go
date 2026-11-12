@@ -12,11 +12,14 @@ import (
 	"ambigo-backend/internal/requestid"
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/websocket"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Dispatcher struct {
 	Matcher   *Matcher
-	RideStore *ride.Store
+	RideStore RideStoreAPI
 	EventBus  *eventbus.InMemoryBus
 	WSManager *websocket.Manager
 
@@ -25,7 +28,26 @@ type Dispatcher struct {
 	mu              sync.RWMutex
 }
 
-func NewDispatcher(matcher *Matcher, rideStore *ride.Store, eventBus *eventbus.InMemoryBus, wsManager *websocket.Manager) *Dispatcher {
+// RideStoreAPI is the subset of ride.Store used through the dispatcher.
+// *ride.Store satisfies it implicitly; tests inject in-memory fakes.
+type RideStoreAPI interface {
+	CreateRide(ctx context.Context, r *ride.Ride) error
+	GetRideByID(ctx context.Context, rideID string) (*ride.Ride, error)
+	AtomicAssignDriver(ctx context.Context, rideID, driverID string) error
+	CancelRide(ctx context.Context, rideID string, currentStatus ride.RideStatus, reason string, availableTypes ...[]string) error
+	UpdateDispatchMetadata(ctx context.Context, rideID string, meta *ride.DispatchMetadata) error
+	CancelStaleSearchingRides(ctx context.Context, maxAge time.Duration) (int64, error)
+	GetRideRegionID(ctx context.Context, rideID string) (*string, error)
+	GetCurrentRide(ctx context.Context, entityID, role string) (*ride.Ride, error)
+	UpdateRideStatus(ctx context.Context, rideID string, currentStatus, nextStatus ride.RideStatus) error
+	ListTrail(ctx context.Context, rideID string) ([]ride.TrailPoint, error)
+	GetRideHistory(ctx context.Context, entityID, role string, limit, skip int64) ([]*ride.Ride, error)
+	GetLatestCompletedRide(ctx context.Context, userID, rideID string, completedAfter *time.Time) (*ride.Ride, error)
+	Pool() *pgxpool.Pool
+	WithTx(tx pgx.Tx) *ride.Store
+}
+
+func NewDispatcher(matcher *Matcher, rideStore RideStoreAPI, eventBus *eventbus.InMemoryBus, wsManager *websocket.Manager) *Dispatcher {
 	d := &Dispatcher{
 		Matcher:         matcher,
 		RideStore:       rideStore,
@@ -67,8 +89,10 @@ func (d *Dispatcher) RequestRide(ctx context.Context, r *ride.Ride) error {
 	rideID := r.ID
 
 	d.mu.Lock()
-	d.acceptChannels[rideID] = make(chan string, 1)
-	d.declineChannels[rideID] = make(chan string, 1)
+	// Buffered for broadcast: up to 5 concurrent accepts/declines plus the
+	// hospital-first offer must never block their HTTP handlers.
+	d.acceptChannels[rideID] = make(chan string, 8)
+	d.declineChannels[rideID] = make(chan string, 8)
 	d.mu.Unlock()
 
 	pickupLng, pickupLat := r.Pickup.Coordinates[0], r.Pickup.Coordinates[1]
@@ -176,6 +200,21 @@ func (d *Dispatcher) persistDispatchMetadata(rideID string, meta *ride.DispatchM
 	d.RideStore.UpdateDispatchMetadata(ctx, rideID, meta)
 }
 
+// withdrawOthers notifies broadcast losers that the ride was won by someone
+// else, so their offer cards disappear instead of lingering to expiry.
+func (d *Dispatcher) withdrawOthers(rideID string, candidates []Candidate, winnerID, reqID string) {
+	for _, c := range candidates {
+		if c.DriverID == winnerID {
+			continue
+		}
+		d.EventBus.PublishEvent(eventbus.ChannelRideWithdrawn, eventbus.RideWithdrawnPayload{
+			RideID:    rideID,
+			DriverID:  c.DriverID,
+			RequestID: reqID,
+		})
+	}
+}
+
 func (d *Dispatcher) startMatchingLoop(r *ride.Ride, reqID string) {
 	rideIDStr := r.ID
 	logger.Log.Info().Str("ride_id", rideIDStr).Str("request_id", reqID).Msg("Starting matching loop")
@@ -193,75 +232,72 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride, reqID string) {
 	if r.AmbTypeID != nil {
 		ambTypeID = *r.AmbTypeID
 	}
-	candidates, err := d.Matcher.FindBestDrivers(context.Background(), pickupLat, pickupLng, 5, ambTypeID)
-	if err != nil || len(candidates) == 0 {
-		availableTypes := d.Matcher.FindAvailableOtherTypes(pickupLat, pickupLng, ambTypeID)
-		logger.Log.Warn().Str("ride_id", rideIDStr).Str("request_id", reqID).Msg("No drivers found. Cancelling.")
-		d.RideStore.CancelRide(context.Background(), rideIDStr, ride.StatusSearching, "no_drivers", availableTypes)
-		d.EventBus.PublishEvent(eventbus.ChannelRideCancelled, eventbus.RideCancelledPayload{
-			RideID:         rideIDStr,
-			Reason:         "no_drivers",
-			UserID:         r.UserID,
-			RequestID:      reqID,
-			AvailableTypes: availableTypes,
-		})
-		return
+	hospitalID := ""
+	if r.HospitalID != nil {
+		hospitalID = *r.HospitalID
 	}
 
 	startTime := time.Now()
-	r.DispatchMetadata.CandidatesSearched = len(candidates)
 
 	checkTicker := time.NewTicker(5 * time.Second)
 	defer checkTicker.Stop()
 	candidateTimer := time.NewTimer(30 * time.Second)
 	defer candidateTimer.Stop()
 
-	for i, candidate := range candidates {
-		logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Int("eta", candidate.ETASeconds).Int("candidate", i+1).Int("total", len(candidates)).Str("request_id", reqID).Msg("Offering to driver")
+	pickupLat2, pickupLng2 := 0.0, 0.0
+	if len(r.Pickup.Coordinates) == 2 {
+		pickupLng2 = r.Pickup.Coordinates[0]
+		pickupLat2 = r.Pickup.Coordinates[1]
+	}
+	dropoffLat, dropoffLng := 0.0, 0.0
+	if len(r.Drop.Coordinates) == 2 {
+		dropoffLng = r.Drop.Coordinates[0]
+		dropoffLat = r.Drop.Coordinates[1]
+	}
+	fareVal := 0.0
+	driverShareVal := 0.0
+	if r.Fare != nil {
+		fareVal = r.Fare.Total
+		driverShareVal = r.Fare.DriverShare
+	}
+	tripDistanceKm := 0.0
+	tripDurationSeconds := 0
+	if r.Route != nil {
+		tripDistanceKm = r.Route.DistanceKm
+		tripDurationSeconds = r.Route.DurationSeconds
+	}
+	isSOS := r.EmergencyPriority > 0
 
-		fareVal := 0.0
-		driverShareVal := 0.0
-		if r.Fare != nil {
-			fareVal = r.Fare.Total
-			driverShareVal = r.Fare.DriverShare
-		}
-
-		tripDistanceKm := 0.0
-		if r.Route != nil {
-			tripDistanceKm = r.Route.DistanceKm
-		}
+	// offerOne publishes a single offer and waits for accept/decline/timeout.
+	// Returns (accepted, aborted): accepted → caller assigns and returns;
+	// aborted → ride left SEARCHING, caller must stop the loop.
+	offerOne := func(candidate Candidate, idx, total int) (bool, bool) {
+		logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Int("eta", candidate.ETASeconds).Int("candidate", idx).Int("total", total).Str("request_id", reqID).Msg("Offering to driver")
 
 		r.DispatchMetadata.OffersSent++
 
-		pickupLat, pickupLng := 0.0, 0.0
-		if len(r.Pickup.Coordinates) == 2 {
-			pickupLng = r.Pickup.Coordinates[0]
-			pickupLat = r.Pickup.Coordinates[1]
-		}
-		dropoffLat, dropoffLng := 0.0, 0.0
-		if len(r.Drop.Coordinates) == 2 {
-			dropoffLng = r.Drop.Coordinates[0]
-			dropoffLat = r.Drop.Coordinates[1]
-		}
-
 		d.EventBus.PublishEvent(eventbus.ChannelRideDriverOffered, eventbus.RideDriverOfferedPayload{
-			RideID:           rideIDStr,
-			DriverID:         candidate.DriverID,
-			UserID:           r.UserID,
-			PickupLat:        pickupLat,
-			PickupLng:        pickupLng,
-			PickupAddress:    r.PickupAddress,
-			DropoffLat:       dropoffLat,
-			DropoffLng:       dropoffLng,
-			DropAddress:      r.DropAddress,
-			ETASeconds:       candidate.ETASeconds,
-			PickupDistanceKm: candidate.DistanceKm,
-			TripDistanceKm:   tripDistanceKm,
-			Fare:             fareVal,
-			DriverShare:      driverShareVal,
-			PaymentMode:      r.PaymentMode,
-			IsSOS:            r.EmergencyPriority > 0,
-			RequestID:        reqID,
+			RideID:              rideIDStr,
+			DriverID:            candidate.DriverID,
+			UserID:              r.UserID,
+			PickupLat:           pickupLat2,
+			PickupLng:           pickupLng2,
+			PickupAddress:       r.PickupAddress,
+			DropoffLat:          dropoffLat,
+			DropoffLng:          dropoffLng,
+			DropAddress:         r.DropAddress,
+			ETASeconds:          candidate.ETASeconds,
+			PickupDistanceKm:    candidate.DistanceKm,
+			TripDistanceKm:      tripDistanceKm,
+			TripDurationSeconds: tripDurationSeconds,
+			Fare:                fareVal,
+			DriverShare:         driverShareVal,
+			PaymentMode:         r.PaymentMode,
+			IsSOS:               isSOS,
+			AmbTypeID:           ambTypeID,
+			OfferedAt:           time.Now().UTC().Format(time.RFC3339),
+			OfferExpiresIn:      30,
+			RequestID:           reqID,
 		})
 
 		d.mu.RLock()
@@ -274,8 +310,7 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride, reqID string) {
 		}
 		candidateTimer.Reset(30 * time.Second)
 
-		candidateHandled := false
-		for !candidateHandled {
+		for {
 			select {
 			case acceptedDriverID := <-acceptCh:
 				if acceptedDriverID == candidate.DriverID {
@@ -283,28 +318,175 @@ func (d *Dispatcher) startMatchingLoop(r *ride.Ride, reqID string) {
 					logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Str("request_id", reqID).Msg("Driver accepted the ride")
 					metrics.ObserveDispatchLatency(time.Since(startTime))
 					d.persistDispatchMetadata(rideIDStr, &r.DispatchMetadata)
-					return
+					return true, false
 				}
-				candidateHandled = true
+				return false, false
 			case declinedDriverID := <-declineCh:
 				if declinedDriverID == candidate.DriverID {
 					r.DispatchMetadata.OffersDeclined++
 					logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Str("request_id", reqID).Msg("Driver declined. Moving to next.")
 				}
-				candidateHandled = true
+				return false, false
 			case <-candidateTimer.C:
 				r.DispatchMetadata.OffersTimedOut++
 				logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", candidate.DriverID).Str("request_id", reqID).Msg("Driver timed out. Moving to next.")
-				candidateHandled = true
+				return false, false
 			case <-checkTicker.C:
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				currentRide, err := d.RideStore.GetRideByID(ctx, rideIDStr)
 				cancel()
 				if err != nil || currentRide == nil || currentRide.Status != ride.StatusSearching {
 					logger.Log.Warn().Str("ride_id", rideIDStr).Msg("Ride was cancelled externally, stopping matching loop")
-					return
+					return false, true
 				}
 			}
+		}
+	}
+
+	offered := make(map[string]bool)
+	hospitalOffered := 0
+
+	// offerBroadcast publishes the ride to all candidates at once and waits
+	// for the first accept inside a single 30s window. Returns (accepted,
+	// aborted): accepted → a driver won and losers were withdrawn; aborted →
+	// ride left SEARCHING, caller must stop the loop. All-declined or window
+	// expiry returns (false, false) so the caller falls through to exhaustion.
+	offerBroadcast := func(candidates []Candidate) (bool, bool) {
+		total := len(candidates) + hospitalOffered
+		for i, c := range candidates {
+			logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", c.DriverID).Int("eta", c.ETASeconds).Int("candidate", i+1).Int("total", total).Str("request_id", reqID).Msg("Broadcasting to driver")
+
+			r.DispatchMetadata.OffersSent++
+
+			d.EventBus.PublishEvent(eventbus.ChannelRideDriverOffered, eventbus.RideDriverOfferedPayload{
+				RideID:              rideIDStr,
+				DriverID:            c.DriverID,
+				UserID:              r.UserID,
+				PickupLat:           pickupLat2,
+				PickupLng:           pickupLng2,
+				PickupAddress:       r.PickupAddress,
+				DropoffLat:          dropoffLat,
+				DropoffLng:          dropoffLng,
+				DropAddress:         r.DropAddress,
+				ETASeconds:          c.ETASeconds,
+				PickupDistanceKm:    c.DistanceKm,
+				TripDistanceKm:      tripDistanceKm,
+				TripDurationSeconds: tripDurationSeconds,
+				Fare:                fareVal,
+				DriverShare:         driverShareVal,
+				PaymentMode:         r.PaymentMode,
+				IsSOS:               isSOS,
+				AmbTypeID:           ambTypeID,
+				OfferedAt:           time.Now().UTC().Format(time.RFC3339),
+				OfferExpiresIn:      30,
+				RequestID:           reqID,
+			})
+		}
+
+		d.mu.RLock()
+		acceptCh := d.acceptChannels[rideIDStr]
+		declineCh := d.declineChannels[rideIDStr]
+		d.mu.RUnlock()
+
+		if !candidateTimer.Stop() {
+			select {
+			case <-candidateTimer.C:
+			default:
+			}
+		}
+		candidateTimer.Reset(30 * time.Second)
+
+		declined := 0
+		for {
+			select {
+			case acceptedDriverID := <-acceptCh:
+				// The DB CAS in AtomicAssignDriver already picked the winner;
+				// the first message here is that winner.
+				r.DispatchMetadata.AssignmentLatencyMs = int(time.Since(startTime).Milliseconds())
+				logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", acceptedDriverID).Str("request_id", reqID).Msg("Driver won broadcast")
+				metrics.ObserveDispatchLatency(time.Since(startTime))
+				d.persistDispatchMetadata(rideIDStr, &r.DispatchMetadata)
+				d.withdrawOthers(rideIDStr, candidates, acceptedDriverID, reqID)
+				return true, false
+			case <-declineCh:
+				r.DispatchMetadata.OffersDeclined++
+				declined++
+				logger.Log.Info().Str("ride_id", rideIDStr).Int("declined", declined).Int("total", len(candidates)).Str("request_id", reqID).Msg("Broadcast decline")
+				if declined >= len(candidates) {
+					return false, false
+				}
+			case <-candidateTimer.C:
+				r.DispatchMetadata.OffersTimedOut += len(candidates) - declined
+				logger.Log.Info().Str("ride_id", rideIDStr).Int("declined", declined).Int("total", len(candidates)).Str("request_id", reqID).Msg("Broadcast window expired")
+				return false, false
+			case <-checkTicker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				currentRide, err := d.RideStore.GetRideByID(ctx, rideIDStr)
+				cancel()
+				if err != nil || currentRide == nil || currentRide.Status != ride.StatusSearching {
+					logger.Log.Warn().Str("ride_id", rideIDStr).Msg("Ride was cancelled externally, stopping matching loop")
+					return false, true
+				}
+			}
+		}
+	}
+
+	// Phase 0 — hospital-first: single nearest MD-registered driver of the
+	// destination hospital within 10 km. Miss falls through to normal flow.
+	if hospitalID != "" {
+		if hospCandidate, ok := d.Matcher.FindBestHospitalDriver(context.Background(), hospitalID, pickupLat, pickupLng, ambTypeID); ok {
+			offered[hospCandidate.DriverID] = true
+			hospitalOffered = 1
+			logger.Log.Info().Str("ride_id", rideIDStr).Str("driver_id", hospCandidate.DriverID).Str("hospital_id", hospitalID).Str("request_id", reqID).Msg("Hospital-first offer")
+			accepted, aborted := offerOne(hospCandidate, 1, 1)
+			if aborted {
+				return
+			}
+			if accepted {
+				return
+			}
+		}
+	}
+
+	// Phase 1 — normal flow: nearest drivers, excluding the hospital-first
+	// driver if already offered (never offer the same driver twice).
+	candidates, err := d.Matcher.FindBestDrivers(context.Background(), pickupLat, pickupLng, 5, ambTypeID)
+	if err == nil && len(candidates) > 0 && len(offered) > 0 {
+		kept := candidates[:0]
+		for _, c := range candidates {
+			if !offered[c.DriverID] {
+				kept = append(kept, c)
+			}
+		}
+		candidates = kept
+	}
+	if err != nil || len(candidates) == 0 {
+		if hospitalOffered == 0 {
+			availableTypes := d.Matcher.FindAvailableOtherTypes(pickupLat, pickupLng, ambTypeID)
+			logger.Log.Warn().Str("ride_id", rideIDStr).Str("request_id", reqID).Msg("No drivers found. Cancelling.")
+			d.RideStore.CancelRide(context.Background(), rideIDStr, ride.StatusSearching, "no_drivers", availableTypes)
+			d.EventBus.PublishEvent(eventbus.ChannelRideCancelled, eventbus.RideCancelledPayload{
+				RideID:         rideIDStr,
+				Reason:         "no_drivers",
+				UserID:         r.UserID,
+				RequestID:      reqID,
+				AvailableTypes: availableTypes,
+			})
+			return
+		}
+		// Hospital driver was offered but normal pool is empty/exhausted:
+		// fall through to all_drivers_exhausted below.
+		candidates = nil
+	}
+
+	r.DispatchMetadata.CandidatesSearched = len(candidates) + hospitalOffered
+
+	// Broadcast phase: all candidates get the offer at once, first accept
+	// wins. All-declined/expired falls through to exhaustion below.
+	if len(candidates) > 0 {
+		accepted, aborted := offerBroadcast(candidates)
+		if aborted || accepted {
+			return
 		}
 	}
 
