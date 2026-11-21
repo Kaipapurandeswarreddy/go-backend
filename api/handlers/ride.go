@@ -196,7 +196,11 @@ func (h *RideHandler) HandleRequestRide(w http.ResponseWriter, r *http.Request) 
 
 	// Book Any: resolve to a type with nearby available drivers
 	if req.AmbTypeID == "" {
-		candidates, err := h.Dispatcher.Matcher.FindBestDrivers(r.Context(), req.PickupLat, req.PickupLng, 5, "")
+		maxCand := 10
+		if h.Dispatcher != nil && h.Dispatcher.MaxCandidates > 0 {
+			maxCand = h.Dispatcher.MaxCandidates
+		}
+		candidates, err := h.Dispatcher.Matcher.FindBestDrivers(r.Context(), req.PickupLat, req.PickupLng, maxCand, "")
 		if err != nil || len(candidates) == 0 {
 			availableTypes := h.Dispatcher.Matcher.FindAvailableOtherTypes(req.PickupLat, req.PickupLng, "")
 			w.Header().Set("Content-Type", "application/json")

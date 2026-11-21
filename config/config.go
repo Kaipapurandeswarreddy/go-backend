@@ -85,6 +85,10 @@ type AppConfig struct {
 	AxiomAPIToken  string
 	AxiomDataset   string
 	AxiomAPIBaseURL string
+
+	// Dispatch
+	DispatchMaxCandidates int
+	DispatchRadiusKm      float64
 }
 
 // LoadConfig reads configuration from environment variables
@@ -166,6 +170,9 @@ func LoadConfig() *AppConfig {
 		AxiomAPIToken:  os.Getenv("AXIOM_API_TOKEN"),
 		AxiomDataset:   envOrDefault("AXIOM_DATASET", "ambigo-events"),
 		AxiomAPIBaseURL: envOrDefault("AXIOM_API_BASE_URL", "https://api.axiom.co"),
+
+		DispatchMaxCandidates: envIntOrDefault("DISPATCH_MAX_CANDIDATES", 10),
+		DispatchRadiusKm:      envFloatOrDefault("DISPATCH_RADIUS_KM", 10.0),
 	}
 
 	if cfg.JWTSecret == "" {
