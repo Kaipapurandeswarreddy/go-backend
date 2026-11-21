@@ -157,8 +157,11 @@ func main() {
 		ambTypeNames[t.ID] = t.Name
 	}
 	matcher := dispatch.NewMatcher(locationStore, routeClient, ambTypeNames)
+	matcher.RadiusKm = appConfig.DispatchRadiusKm
 	matcher.SetHospitalDeps(adminStore, authStore)
 	dispatcher := dispatch.NewDispatcher(matcher, rideStore, eventBus, wsManager)
+	dispatcher.MaxCandidates = appConfig.DispatchMaxCandidates
+	dispatcher.RadiusKm = appConfig.DispatchRadiusKm
 	dispatcher.StartStaleRideCleanup()
 	wsManager.SetSafetyDeps(rideStore, adminStore, ambTypeNames, safetyStateStore)
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
