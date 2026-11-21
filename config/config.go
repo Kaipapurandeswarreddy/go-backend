@@ -80,6 +80,11 @@ type AppConfig struct {
 	ResendFromName    string
 	ResendToTest      string
 	ResendUseVerified bool
+
+	// Axiom (30-day hot analytics store). Empty token disables the shipper.
+	AxiomAPIToken  string
+	AxiomDataset   string
+	AxiomAPIBaseURL string
 }
 
 // LoadConfig reads configuration from environment variables
@@ -157,6 +162,10 @@ func LoadConfig() *AppConfig {
 		ResendFromName:    envOrDefault("RESEND_FROM_NAME", "Ambigo"),
 		ResendToTest:      envOrDefault("RESEND_TO_TEST", "delivered@resend.dev"),
 		ResendUseVerified: os.Getenv("RESEND_USE_VERIFIED") == "true",
+
+		AxiomAPIToken:  os.Getenv("AXIOM_API_TOKEN"),
+		AxiomDataset:   envOrDefault("AXIOM_DATASET", "ambigo-events"),
+		AxiomAPIBaseURL: envOrDefault("AXIOM_API_BASE_URL", "https://api.axiom.co"),
 	}
 
 	if cfg.JWTSecret == "" {

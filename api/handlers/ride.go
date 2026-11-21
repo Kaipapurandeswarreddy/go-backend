@@ -407,7 +407,7 @@ func (h *RideHandler) HandleArrive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.EventBus.PublishEvent(eventbus.ChannelRideArrived, eventbus.RideStatusChangedPayload{
-		RideID: rideID, UserID: rideData.UserID, Status: string(ride.StatusArrived), RequestID: reqID,
+		RideID: rideID, UserID: rideData.UserID, DriverID: callerID, Status: string(ride.StatusArrived), RequestID: reqID,
 	})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Driver Arrived"})
@@ -493,7 +493,7 @@ func (h *RideHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.EventBus.PublishEvent(eventbus.ChannelRideStarted, eventbus.RideStatusChangedPayload{
-		RideID: rideID, UserID: rideData.UserID, Status: string(ride.StatusInProgress), RequestID: reqID,
+		RideID: rideID, UserID: rideData.UserID, DriverID: callerID, Status: string(ride.StatusInProgress), RequestID: reqID,
 	})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Ride Started"})
