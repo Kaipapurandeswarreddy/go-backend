@@ -72,9 +72,10 @@ func NewRouteClient(apiKey, apiURL string) *RouteClient {
 }
 
 type computeRoutesRequest struct {
-	Origin      waypoint `json:"origin"`
-	Destination waypoint `json:"destination"`
-	TravelMode  string   `json:"travelMode"` // "DRIVE"
+	Origin            waypoint `json:"origin"`
+	Destination       waypoint `json:"destination"`
+	TravelMode        string   `json:"travelMode"` // "DRIVE"
+	RoutingPreference string   `json:"routingPreference,omitempty"` // "TRAFFIC_AWARE"
 }
 
 type waypoint struct {
@@ -107,9 +108,12 @@ func haversineRoute(originLat, originLng, destLat, destLng float64) *ride.Route 
 	a := math.Sin(dlat/2)*math.Sin(dlat/2) + math.Cos(originLat*(math.Pi/180.0))*math.Cos(destLat*(math.Pi/180.0))*math.Sin(dlon/2)*math.Sin(dlon/2)
 	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 	distance := R * c
-	durationSeconds := int((distance / 40.0) * 3600.0)
+	// Factor in realistic urban road detour index (~1.35x) and urban ambulance speed (25 km/h)
+	// to prevent catastrophic underestimation during circuit-breaker fallbacks.
+	roadDistance := distance * 1.35
+	durationSeconds := int((roadDistance / 25.0) * 3600.0)
 	return &ride.Route{
-		DistanceKm:      distance,
+		DistanceKm:      roadDistance,
 		DurationSeconds: durationSeconds,
 	}
 }
@@ -136,7 +140,8 @@ func (rc *RouteClient) CalculateETA(ctx context.Context, originLat, originLng, d
 				Destination: waypoint{
 					Location: locationPayload{LatLng: latLngPayload{Latitude: destLat, Longitude: destLng}},
 				},
-				TravelMode: "DRIVE",
+				TravelMode:        "DRIVE",
+				RoutingPreference: "TRAFFIC_AWARE",
 			}
 
 			jsonData, err := json.Marshal(reqBody)

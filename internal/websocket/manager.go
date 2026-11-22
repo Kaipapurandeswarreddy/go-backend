@@ -97,6 +97,12 @@ type Manager struct {
 	Safety      *safety.Tracker
 	SafetyStore *safety.StateStore
 
+	// ETAEngine computes canonical server-side ETAs for active rides.
+	ETAEngine interface {
+		OnDriverLocation(rideID, driverID string, lat, lng float64, status ride.RideStatus) *eventbus.RideETAUpdatePayload
+		ClearRide(rideID string)
+	}
+
 	// locThrottle caps location fan-out: max 1 bus event per driver per
 	// interval (giants: ~1 per 3s). Extra pings still update the store.
 	locThrottleMu sync.Mutex
@@ -459,6 +465,7 @@ func (m *Manager) SetRideStatus(driverID, rideID string, status ride.RideStatus)
 
 func (m *Manager) ClearActiveRide(driverID string) {
 	m.mu.Lock()
+	rideID := m.activeDriverRide[driverID]
 	delete(m.activeDriverRide, driverID)
 	delete(m.activeDriverStatus, driverID)
 	m.mu.Unlock()
@@ -467,6 +474,9 @@ func (m *Manager) ClearActiveRide(driverID string) {
 		_ = m.LocStore.SetDriverRide(driverID, "")
 	}
 	m.resetSafetyState(driverID)
+	if m.ETAEngine != nil && rideID != "" {
+		m.ETAEngine.ClearRide(rideID)
+	}
 }
 
 func (m *Manager) resetSafetyState(driverID string) {

@@ -24,6 +24,7 @@ import (
 	"ambigo-backend/internal/analytics"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/dispatch"
+	"ambigo-backend/internal/eta"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/hospital"
 	"ambigo-backend/internal/location"
@@ -162,7 +163,10 @@ func main() {
 	dispatcher := dispatch.NewDispatcher(matcher, rideStore, eventBus, wsManager)
 	dispatcher.MaxCandidates = appConfig.DispatchMaxCandidates
 	dispatcher.RadiusKm = appConfig.DispatchRadiusKm
+	dispatcher.OfferTimeoutSec = appConfig.DispatchOfferTimeoutSec
 	dispatcher.StartStaleRideCleanup()
+	etaEngine := eta.NewETAEngine(routeClient, rideStore)
+	wsManager.ETAEngine = etaEngine
 	wsManager.SetSafetyDeps(rideStore, adminStore, ambTypeNames, safetyStateStore)
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	activeRides, activeErr := rideStore.ListActiveDriverRides(seedCtx)
@@ -240,7 +244,7 @@ func main() {
 	hospitalDashboardHandler := handlers.NewHospitalDashboardHandler(rideStore, hospitalStore, adminStore, authStore, wsManager, eventBus)
 	offerHandler := handlers.NewOfferHandler(offerStore, eventBus)
 	sharedHandler := handlers.NewSharedHandler(cloudshopeService, counterStore, adminStore, hospitalStore, hospitalSeeder)
-	sharedHandler.SetAppConfig(appConfig.WithdrawalFee, 30)
+	sharedHandler.SetAppConfig(appConfig.WithdrawalFee, appConfig.DispatchOfferTimeoutSec)
 	walletHandler := handlers.NewWalletHandler(authStore, eventBus, walletStore, zwitchService)
 	walletHandler.SetWithdrawalFee(appConfig.WithdrawalFee)
 	walletHandler.SetZwitchWebhookSecret(appConfig.ZwitchWebhookSecret)

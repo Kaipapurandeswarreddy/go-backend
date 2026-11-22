@@ -68,6 +68,19 @@ func (m *Manager) handleLocationUpdate(client *Client, payload json.RawMessage) 
 		}()
 	}
 
+	if rideID != "" && m.ETAEngine != nil {
+		driverID := client.ID
+		curLat, curLng := update.Lat, update.Lng
+		curStatus := rideStatus
+		go func() {
+			if etaPayload := m.ETAEngine.OnDriverLocation(rideID, driverID, curLat, curLng, curStatus); etaPayload != nil {
+				if m.EventBus != nil {
+					m.EventBus.PublishEvent(eventbus.ChannelRideETAUpdate, *etaPayload)
+				}
+			}
+		}()
+	}
+
 	var stoppedSince, stoppedStage string
 	var stoppedSeconds int64
 	if rideStatus == ride.StatusInProgress {
