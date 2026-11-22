@@ -116,6 +116,15 @@ func (e *Engine) OnDriverLocation(rideID, driverID string, lat, lng float64, sta
 
 	// 2. Initialize ride geometry if first time or status changed
 	statusChanged := state.status != status
+	if statusChanged {
+		// Destination changes between ride stages (Pickup -> Drop):
+		// Clear previous stage polyline points and previous ETA state
+		state.polylinePoints = nil
+		state.totalPolylineDistance = 0
+		state.routeDurationSecs = 0
+		state.prevETASecs = 0
+		state.prevDistanceKm = 0
+	}
 	state.status = status
 
 	if !state.initialized || statusChanged {
@@ -188,8 +197,8 @@ func (e *Engine) OnDriverLocation(rideID, driverID string, lat, lng float64, sta
 		}
 		rawETASecs = int(ratio * float64(state.routeDurationSecs))
 	} else {
-		// 25 km/h urban speed fallback
-		rawETASecs = int((remainingKm / 25.0) * 3600.0)
+		// Realistic ambulance response/transit speed fallback: 38 km/h (~10.5 m/s)
+		rawETASecs = int((remainingKm / 38.0) * 3600.0)
 	}
 	if rawETASecs < 0 {
 		rawETASecs = 0
@@ -255,6 +264,17 @@ func (e *Engine) initRideGeometry(state *rideETAState) {
 	if rd.Route != nil {
 		state.pickupDropDistanceKm = rd.Route.DistanceKm
 		state.pickupDropDurationSecs = rd.Route.DurationSeconds
+		// In StatusInProgress, rd.Route represents the precomputed route from Pickup to Drop (Hospital).
+		// Seed the polyline geometry so the engine has accurate Google ETA immediately.
+		if state.status == ride.StatusInProgress && rd.Route.Polyline != "" {
+			pts := ride.DecodePolyline(rd.Route.Polyline)
+			if len(pts) > 0 {
+				state.polylinePoints = pts
+				state.totalPolylineDistance = rd.Route.DistanceKm
+				state.routeDurationSecs = rd.Route.DurationSeconds
+				state.lastRouteFetchAt = time.Now()
+			}
+		}
 	}
 	state.initialized = true
 }
@@ -263,7 +283,7 @@ func (e *Engine) fetchFreshRoute(state *rideETAState, originLat, originLng, dest
 	if e.routeClient == nil || (destLat == 0 && destLng == 0) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
 	rt, err := e.routeClient.CalculateETA(ctx, originLat, originLng, destLat, destLng)
@@ -272,16 +292,21 @@ func (e *Engine) fetchFreshRoute(state *rideETAState, originLat, originLng, dest
 	}
 
 	pts := ride.DecodePolyline(rt.Polyline)
-	if len(pts) == 0 {
-		pts = [][2]float64{{originLat, originLng}, {destLat, destLng}}
+	if len(pts) > 0 {
+		state.polylinePoints = pts
+		state.routeDurationSecs = rt.DurationSeconds
+		state.totalPolylineDistance = rt.DistanceKm
+		state.lastRouteFetchAt = time.Now()
+		state.lastFetchLat = originLat
+		state.lastFetchLng = originLng
+	} else if len(state.polylinePoints) == 0 {
+		state.polylinePoints = [][2]float64{{originLat, originLng}, {destLat, destLng}}
+		state.routeDurationSecs = rt.DurationSeconds
+		state.totalPolylineDistance = rt.DistanceKm
+		state.lastRouteFetchAt = time.Now()
+		state.lastFetchLat = originLat
+		state.lastFetchLng = originLng
 	}
-
-	state.polylinePoints = pts
-	state.routeDurationSecs = rt.DurationSeconds
-	state.totalPolylineDistance = rt.DistanceKm
-	state.lastRouteFetchAt = time.Now()
-	state.lastFetchLat = originLat
-	state.lastFetchLng = originLng
 }
 
 // pointToPolylineDistanceKm computes the minimum distance from point to any segment of polyline.

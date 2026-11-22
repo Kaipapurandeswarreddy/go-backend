@@ -232,13 +232,31 @@ func (m *Manager) Run() {
 			if m.clients[client.Role][client.ID] == nil {
 				m.clients[client.Role][client.ID] = make(map[*Client]bool)
 			}
-			// Same-session reconnect: evict the stale duplicate so one device
-			// never accumulates watchers that multiply every fan-out.
-			// Silent by operator choice: no log line here (routine path).
+			// Same-session reconnect: allow up to 2 concurrent sockets per session
+			// (e.g. Flutter UI isolate + background location service isolate).
+			// If 2 or more already exist, evict the oldest non-watcher duplicate.
+			sessionClients := make([]*Client, 0)
 			for oldClient := range m.clients[client.Role][client.ID] {
 				if oldClient.SessionID == client.SessionID {
-					m.removeClientLocked(oldClient)
+					sessionClients = append(sessionClients, oldClient)
 				}
+			}
+			if len(sessionClients) >= 2 {
+				var targetToEvict *Client = sessionClients[0]
+				for _, sc := range sessionClients {
+					isWatcher := false
+					for _, watchers := range m.rideWatchers {
+						if watchers[sc] {
+							isWatcher = true
+							break
+						}
+					}
+					if !isWatcher {
+						targetToEvict = sc
+						break
+					}
+				}
+				m.removeClientLocked(targetToEvict)
 			}
 			// Eviction above may have deleted the now-empty inner map.
 			if m.clients[client.Role][client.ID] == nil {

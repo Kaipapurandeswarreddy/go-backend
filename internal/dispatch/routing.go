@@ -108,10 +108,10 @@ func haversineRoute(originLat, originLng, destLat, destLng float64) *ride.Route 
 	a := math.Sin(dlat/2)*math.Sin(dlat/2) + math.Cos(originLat*(math.Pi/180.0))*math.Cos(destLat*(math.Pi/180.0))*math.Sin(dlon/2)*math.Sin(dlon/2)
 	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 	distance := R * c
-	// Factor in realistic urban road detour index (~1.35x) and urban ambulance speed (25 km/h)
-	// to prevent catastrophic underestimation during circuit-breaker fallbacks.
+	// Factor in realistic urban road detour index (~1.35x) and average ambulance transit speed (38 km/h)
+	// so that circuit-breaker fallbacks remain consistent with Google Routes API.
 	roadDistance := distance * 1.35
-	durationSeconds := int((roadDistance / 25.0) * 3600.0)
+	durationSeconds := int((roadDistance / 38.0) * 3600.0)
 	return &ride.Route{
 		DistanceKm:      roadDistance,
 		DurationSeconds: durationSeconds,
