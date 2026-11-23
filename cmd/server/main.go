@@ -166,6 +166,8 @@ func main() {
 	dispatcher.OfferTimeoutSec = appConfig.DispatchOfferTimeoutSec
 	dispatcher.StartStaleRideCleanup()
 	etaEngine := eta.NewETAEngine(routeClient, rideStore)
+	// Seed ETA snapshots (WATCH_RIDE) from the driver's last known GPS fix.
+	etaEngine.SetDriverLocator(locationStore)
 	wsManager.ETAEngine = etaEngine
 	wsManager.SetSafetyDeps(rideStore, adminStore, ambTypeNames, safetyStateStore)
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)

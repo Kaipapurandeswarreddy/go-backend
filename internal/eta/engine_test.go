@@ -47,6 +47,70 @@ func TestRemainingDistanceAlongPolyline(t *testing.T) {
 	}
 }
 
+func TestDeriveSnapshotAssignedHasPickupETA(t *testing.T) {
+	rd := &ride.Ride{
+		ID:     "ride1",
+		Status: ride.StatusAssigned,
+		Pickup: ride.GeoJSONPoint{Type: "Point", Coordinates: []float64{77.60, 12.90}},
+		Drop:   ride.GeoJSONPoint{Type: "Point", Coordinates: []float64{77.70, 13.00}},
+		Route:  &ride.Route{DistanceKm: 10, DurationSeconds: 900},
+	}
+	// Driver ~1.5 km north-east of pickup.
+	p := deriveSnapshot(rd, "drv1", 12.91, 77.61)
+	if p == nil {
+		t.Fatal("expected a snapshot for an ASSIGNED ride")
+	}
+	if p.Stage != "en_route_pickup" {
+		t.Fatalf("stage = %q, want en_route_pickup", p.Stage)
+	}
+	if p.RemainingSecs <= 0 {
+		t.Fatalf("remaining_seconds = %d, want > 0", p.RemainingSecs)
+	}
+	// Hospital ETA must include the pickup leg plus on-scene time and the drop leg.
+	wantHospital := p.RemainingSecs + 300 + rd.Route.DurationSeconds
+	if p.HospitalETASecs != wantHospital {
+		t.Fatalf("hospital_eta_seconds = %d, want %d", p.HospitalETASecs, wantHospital)
+	}
+}
+
+func TestDeriveSnapshotArrivedIsZeroToPickup(t *testing.T) {
+	rd := &ride.Ride{
+		ID:     "ride1",
+		Status: ride.StatusArrived,
+		Pickup: ride.GeoJSONPoint{Type: "Point", Coordinates: []float64{77.60, 12.90}},
+		Drop:   ride.GeoJSONPoint{Type: "Point", Coordinates: []float64{77.70, 13.00}},
+		Route:  &ride.Route{DistanceKm: 10, DurationSeconds: 900},
+	}
+	p := deriveSnapshot(rd, "drv1", 12.90, 77.60)
+	if p == nil || p.RemainingSecs != 0 {
+		t.Fatalf("arrived snapshot = %+v, want remaining 0", p)
+	}
+	if p.HospitalETASecs != 300+900 {
+		t.Fatalf("hospital_eta_seconds = %d, want %d", p.HospitalETASecs, 1200)
+	}
+}
+
+func TestDeriveSnapshotInProgressTargetsDrop(t *testing.T) {
+	rd := &ride.Ride{
+		ID:     "ride1",
+		Status: ride.StatusInProgress,
+		Pickup: ride.GeoJSONPoint{Type: "Point", Coordinates: []float64{77.60, 12.90}},
+		Drop:   ride.GeoJSONPoint{Type: "Point", Coordinates: []float64{77.70, 13.00}},
+		Route:  &ride.Route{DistanceKm: 10, DurationSeconds: 900},
+	}
+	// Driver at the pickup: remaining must be the pickup->drop leg, not zero.
+	p := deriveSnapshot(rd, "drv1", 12.90, 77.60)
+	if p == nil {
+		t.Fatal("expected a snapshot for an IN_PROGRESS ride")
+	}
+	if p.Stage != "en_route_hospital" {
+		t.Fatalf("stage = %q, want en_route_hospital", p.Stage)
+	}
+	if p.RemainingSecs <= 0 || p.RemainingKm <= 0 {
+		t.Fatalf("remaining = %ds/%fkm, want > 0", p.RemainingSecs, p.RemainingKm)
+	}
+}
+
 func TestAntiJitterFilter(t *testing.T) {
 	engine := NewETAEngine(nil, nil)
 

@@ -108,6 +108,11 @@ type Manager struct {
 	// interval (giants: ~1 per 3s). Extra pings still update the store.
 	locThrottleMu sync.Mutex
 	locThrottle   map[string]time.Time
+
+	// rideRecovery throttles DB rehydration of a driver's active ride when the
+	// in-memory map was lost (restart) — see recoverActiveRide.
+	rideRecoveryMu sync.Mutex
+	rideRecovery   map[string]time.Time
 }
 
 // LocationPublishInterval is the minimum gap between location bus events for

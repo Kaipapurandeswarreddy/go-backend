@@ -193,11 +193,17 @@ func (rc *RouteClient) CalculateETA(ctx context.Context, originLat, originLng, d
 		return nil, innerErr
 	})
 	if err != nil {
-		if errors.Is(err, gobreaker.ErrOpenState) {
-			logger.Log.Warn().Str("client", "routes").Msg("circuit breaker open, fallback to haversine")
-			return haversineRoute(originLat, originLng, destLat, destLng), nil
-		}
-		return nil, err
+		// Any upstream failure (open breaker, quota/billing 4xx-5xx, timeout,
+		// malformed body) degrades to the haversine estimate instead of
+		// surfacing a 500. Ride screens poll this endpoint for ETAs — a hard
+		// failure there leaves every accepted/ongoing screen stuck on
+		// "Calculating..." until Google recovers.
+		logger.Log.Warn().Err(err).Str("client", "routes").Msg("routes api failed, falling back to haversine")
+		return haversineRoute(originLat, originLng, destLat, destLng), nil
+	}
+	if result == nil {
+		// Defensive: a nil result without an error would nil-deref callers.
+		return haversineRoute(originLat, originLng, destLat, destLng), nil
 	}
 	return result, nil
 }

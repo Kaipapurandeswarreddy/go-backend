@@ -54,10 +54,19 @@ type rideETAState struct {
 	lastPayload          *eventbus.RideETAUpdatePayload
 }
 
+// DriverLocator supplies the last known GPS fix for a driver. The ETA engine
+// uses it to derive a canonical ETA when no location ping has been processed
+// since the ride was assigned (e.g. a backend restart or a driver that has not
+// yet re-sent GPS), so WATCH_RIDE can always be seeded with a payload.
+type DriverLocator interface {
+	GetLocation(driverID string) (lat, lng float64, err error)
+}
+
 // Engine implements the canonical server-side ETA engine.
 type Engine struct {
 	routeClient *dispatch.RouteClient
 	rideStore   *ride.Store
+	locator     DriverLocator
 
 	mu     sync.RWMutex
 	states map[string]*rideETAState
@@ -70,6 +79,11 @@ func NewETAEngine(routeClient *dispatch.RouteClient, rideStore *ride.Store) *Eng
 		rideStore:   rideStore,
 		states:      make(map[string]*rideETAState),
 	}
+}
+
+// SetDriverLocator wires the live GPS store (called from main after stores exist).
+func (e *Engine) SetDriverLocator(locator DriverLocator) {
+	e.locator = locator
 }
 
 // ClearRide removes cached ETA state when a ride ends.
@@ -93,24 +107,105 @@ func (e *Engine) GetLatestETA(rideID string) *eventbus.RideETAUpdatePayload {
 	}
 	e.mu.RUnlock()
 
-	// If no dynamic GPS payload exists yet, check stored ride data for initial ETA
-	if e.rideStore != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		rd, err := e.rideStore.GetRideByID(ctx, rideID)
-		if err == nil && rd != nil && rd.Route != nil && rd.Route.DurationSeconds > 0 {
-			if rd.Status == ride.StatusInProgress {
-				return &eventbus.RideETAUpdatePayload{
-					RideID:          rideID,
-					DriverID:        "",
-					Stage:           "en_route_hospital",
-					RemainingSecs:   rd.Route.DurationSeconds,
-					RemainingKm:     math.Round(rd.Route.DistanceKm*10) / 10,
-					HospitalETASecs: rd.Route.DurationSeconds,
-					HospitalETAKm:   math.Round(rd.Route.DistanceKm*10) / 10,
-					IsTrafficAware:  true,
-				}
+	// If no dynamic GPS payload exists yet, derive one from the driver's last
+	// known fix and the stored ride geometry. This covers ASSIGNED / ARRIVED
+	// screens too — restricting the seed to IN_PROGRESS left every accepted
+	// screen with no initial ETA at all.
+	if e.rideStore == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	rd, err := e.rideStore.GetRideByID(ctx, rideID)
+	if err != nil || rd == nil {
+		return nil
+	}
+
+	if rd.DriverID != nil && *rd.DriverID != "" && e.locator != nil {
+		if lat, lng, lerr := e.locator.GetLocation(*rd.DriverID); lerr == nil {
+			// Derive without touching the route API or engine state: this runs
+			// on the WATCH_RIDE path and must answer instantly. The next GPS
+			// ping replaces it with the traffic-aware value.
+			if p := deriveSnapshot(rd, *rd.DriverID, lat, lng); p != nil {
+				return p
 			}
+		}
+	}
+
+	// Fallback: the precomputed pickup->drop route is only a valid "remaining"
+	// estimate once the ride is IN_PROGRESS (driver heading to the hospital).
+	// For a pre-pickup stage it would misreport the drop leg as the pickup ETA.
+	if rd.Route != nil && rd.Route.DurationSeconds > 0 && rd.Status == ride.StatusInProgress {
+		return &eventbus.RideETAUpdatePayload{
+			RideID:          rideID,
+			DriverID:        "",
+			Stage:           "en_route_hospital",
+			RemainingSecs:   rd.Route.DurationSeconds,
+			RemainingKm:     math.Round(rd.Route.DistanceKm*10) / 10,
+			HospitalETASecs: rd.Route.DurationSeconds,
+			HospitalETAKm:   math.Round(rd.Route.DistanceKm*10) / 10,
+			IsTrafficAware:  true,
+		}
+	}
+	return nil
+}
+
+// deriveSnapshot builds a first ETA payload from the stored ride geometry and a
+// driver fix, without a route-API call or any engine-state mutation. Pure so it
+// can run synchronously on the WATCH_RIDE read path. Falls back to the same
+// 1.35x detour / 38 km/h model as the backend haversine fallback.
+func deriveSnapshot(rd *ride.Ride, driverID string, lat, lng float64) *eventbus.RideETAUpdatePayload {
+	if rd == nil || lat == 0 || lng == 0 {
+		return nil
+	}
+
+	pickupDropKm, pickupDropSecs := 0.0, 0
+	if rd.Route != nil {
+		pickupDropKm = rd.Route.DistanceKm
+		pickupDropSecs = rd.Route.DurationSeconds
+	}
+
+	legKm := func(dst []float64) (float64, bool) {
+		if len(dst) != 2 || (dst[0] == 0 && dst[1] == 0) {
+			return 0, false
+		}
+		// GeoJSON stores [lng, lat].
+		return HaversineKm(lat, lng, dst[1], dst[0]) * 1.35, true
+	}
+
+	switch rd.Status {
+	case ride.StatusAssigned, ride.StatusArrived:
+		remainingKm, _ := legKm(rd.Pickup.Coordinates)
+		remainingSecs := int((remainingKm / 38.0) * 3600.0)
+		if rd.Status == ride.StatusArrived {
+			remainingKm, remainingSecs = 0, 0
+		}
+		return &eventbus.RideETAUpdatePayload{
+			RideID:          rd.ID,
+			DriverID:        driverID,
+			Stage:           "en_route_pickup",
+			RemainingSecs:   remainingSecs,
+			RemainingKm:     math.Round(remainingKm*10) / 10,
+			HospitalETASecs: remainingSecs + 300 + pickupDropSecs,
+			HospitalETAKm:   math.Round((remainingKm+pickupDropKm)*10) / 10,
+			IsTrafficAware:  false,
+		}
+	case ride.StatusInProgress:
+		remainingKm, ok := legKm(rd.Drop.Coordinates)
+		remainingSecs := int((remainingKm / 38.0) * 3600.0)
+		// No usable drop geometry: fall back to the precomputed full leg.
+		if !ok && pickupDropKm > 0 {
+			remainingKm, remainingSecs = pickupDropKm, pickupDropSecs
+		}
+		return &eventbus.RideETAUpdatePayload{
+			RideID:          rd.ID,
+			DriverID:        driverID,
+			Stage:           "en_route_hospital",
+			RemainingSecs:   remainingSecs,
+			RemainingKm:     math.Round(remainingKm*10) / 10,
+			HospitalETASecs: remainingSecs,
+			HospitalETAKm:   math.Round(remainingKm*10) / 10,
+			IsTrafficAware:  false,
 		}
 	}
 	return nil
@@ -180,7 +275,7 @@ func (e *Engine) OnDriverLocation(rideID, driverID string, lat, lng float64, sta
 		hETAKm := state.pickupDropDistanceKm
 		state.prevETASecs = 0
 		state.prevDistanceKm = 0
-		return &eventbus.RideETAUpdatePayload{
+		payload := &eventbus.RideETAUpdatePayload{
 			RideID:          rideID,
 			DriverID:        driverID,
 			Stage:           stageStr,
@@ -190,6 +285,8 @@ func (e *Engine) OnDriverLocation(rideID, driverID string, lat, lng float64, sta
 			HospitalETAKm:   hETAKm,
 			IsTrafficAware:  true,
 		}
+		state.lastPayload = payload
+		return payload
 	} else if status == ride.StatusInProgress {
 		targetLat, targetLng = state.dropLat, state.dropLng
 		stageStr = "en_route_hospital"
