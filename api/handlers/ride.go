@@ -676,10 +676,12 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 					// Prefer saved ride region (pickup region locked at request).
 					if h.RegionStore != nil {
 						if rid, rerr := h.Dispatcher.RideStore.GetRideRegionID(r.Context(), rideID); rerr == nil && rid != nil && *rid != "" {
-							if rp, perr := h.RegionStore.GetRegionPrice(r.Context(), *rid, ambType.ID); perr == nil && rp != nil {
+							if rp, perr := h.RegionStore.GetRegionPriceWithParent(r.Context(), *rid, ambType.ID); perr == nil && rp != nil {
 								effBase, tiers, effShare = rp.BaseFare, rp.PricingTier, rp.DriverShare
 							}
-						} else if len(rideData.Pickup.Coordinates) == 2 {
+						}
+						// If rid was missing or didn't yield an override, resolve using pickup coordinates
+						if (effBase == ambType.BaseFare && len(tiers) == len(ambType.PricingTier)) && len(rideData.Pickup.Coordinates) == 2 {
 							if res, rerr := h.RegionStore.ResolvePriceForPickup(r.Context(), rideData.Pickup.Coordinates[1], rideData.Pickup.Coordinates[0], ambType.ID, effBase, tiers, effShare, ambType.ListingThreshold, ambType.HelperIncluded, ambType.OTPRequired); rerr == nil && res != nil && res.IsOverride {
 								effBase, tiers, effShare = res.BaseFare, res.Tiers, res.DriverShare
 							}
@@ -691,6 +693,10 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 					ngt := h.PricingEngine.CalculateNightSurcharge(base, time.Now(), nightMult)
 					total := payment.RoundRupees(base + emg + ngt)
 					share := payment.RoundRupees(total * effShare / 100.0)
+					if billKm >= lockedKm && total < lockedTotal {
+						total = lockedTotal
+						share = lockedShare
+					}
 					if total > 0 {
 						finalAmount = total
 						lockedShare = share
@@ -750,11 +756,17 @@ func (h *RideHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 		extraKm = payment.RoundRupees(extraKm*10) / 10 // 1 decimal
 		switch recalcReason {
 		case "drop_moved":
-			fareNote = fmt.Sprintf("Ended %.1f km past the planned drop", extraKm)
+			if extraKm > 0 {
+				fareNote = fmt.Sprintf("Ended %.1f km past the planned drop", extraKm)
+			}
 		case "detour":
-			fareNote = fmt.Sprintf("Route was %.1f km longer than estimated", extraKm)
+			if extraKm > 0 {
+				fareNote = fmt.Sprintf("Route was %.1f km longer than estimated", extraKm)
+			}
 		default:
-			fareNote = fmt.Sprintf("Adjusted for %.1f km extra travel", extraKm)
+			if extraKm > 0 {
+				fareNote = fmt.Sprintf("Adjusted for %.1f km extra travel", extraKm)
+			}
 		}
 	}
 
