@@ -51,6 +51,7 @@ type rideETAState struct {
 	prevETASecs          int
 	prevDistanceKm       float64
 	initialized          bool
+	lastPayload          *eventbus.RideETAUpdatePayload
 }
 
 // Engine implements the canonical server-side ETA engine.
@@ -76,6 +77,43 @@ func (e *Engine) ClearRide(rideID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.states, rideID)
+}
+
+// GetLatestETA returns the most recent canonical ETA payload for the ride, or derives it from precomputed ride data.
+func (e *Engine) GetLatestETA(rideID string) *eventbus.RideETAUpdatePayload {
+	if rideID == "" {
+		return nil
+	}
+	e.mu.RLock()
+	state, exists := e.states[rideID]
+	if exists && state != nil && state.lastPayload != nil {
+		p := *state.lastPayload
+		e.mu.RUnlock()
+		return &p
+	}
+	e.mu.RUnlock()
+
+	// If no dynamic GPS payload exists yet, check stored ride data for initial ETA
+	if e.rideStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		rd, err := e.rideStore.GetRideByID(ctx, rideID)
+		if err == nil && rd != nil && rd.Route != nil && rd.Route.DurationSeconds > 0 {
+			if rd.Status == ride.StatusInProgress {
+				return &eventbus.RideETAUpdatePayload{
+					RideID:          rideID,
+					DriverID:        "",
+					Stage:           "en_route_hospital",
+					RemainingSecs:   rd.Route.DurationSeconds,
+					RemainingKm:     math.Round(rd.Route.DistanceKm*10) / 10,
+					HospitalETASecs: rd.Route.DurationSeconds,
+					HospitalETAKm:   math.Round(rd.Route.DistanceKm*10) / 10,
+					IsTrafficAware:  true,
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // OnDriverLocation is called on each driver GPS ping for an active ride.
@@ -228,7 +266,7 @@ func (e *Engine) OnDriverLocation(rideID, driverID string, lat, lng float64, sta
 		hospitalETAKm = remainingKm + state.pickupDropDistanceKm
 	}
 
-	return &eventbus.RideETAUpdatePayload{
+	payload := &eventbus.RideETAUpdatePayload{
 		RideID:          rideID,
 		DriverID:        driverID,
 		Stage:           stageStr,
@@ -238,6 +276,8 @@ func (e *Engine) OnDriverLocation(rideID, driverID string, lat, lng float64, sta
 		HospitalETAKm:   math.Round(hospitalETAKm*10) / 10,
 		IsTrafficAware:  true,
 	}
+	state.lastPayload = payload
+	return payload
 }
 
 func (e *Engine) initRideGeometry(state *rideETAState) {

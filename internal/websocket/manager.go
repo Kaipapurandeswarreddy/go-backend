@@ -101,6 +101,7 @@ type Manager struct {
 	ETAEngine interface {
 		OnDriverLocation(rideID, driverID string, lat, lng float64, status ride.RideStatus) *eventbus.RideETAUpdatePayload
 		ClearRide(rideID string)
+		GetLatestETA(rideID string) *eventbus.RideETAUpdatePayload
 	}
 
 	// locThrottle caps location fan-out: max 1 bus event per driver per
@@ -590,6 +591,20 @@ func (m *Manager) HandleIncomingMessage(client *Client, message []byte) {
 		}
 		m.rideWatchers[payload.RideID][client] = true
 		m.mu.Unlock()
+
+		// Instant ETA Push: seed this watcher with the latest known ETA immediately
+		if m.ETAEngine != nil {
+			if etaPayload := m.ETAEngine.GetLatestETA(payload.RideID); etaPayload != nil {
+				if payloadBytes, err := json.Marshal(etaPayload); err == nil {
+					if msgBytes, err := json.Marshal(BaseMessage{Type: EventRideETAUpdate, Payload: payloadBytes}); err == nil {
+						select {
+						case client.Send <- msgBytes:
+						default:
+						}
+					}
+				}
+			}
+		}
 	case EventRideDeclined:
 		var payload struct {
 			RideID string `json:"ride_id"`
