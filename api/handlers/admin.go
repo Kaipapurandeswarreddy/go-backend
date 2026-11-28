@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
@@ -13,10 +15,14 @@ import (
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/ids"
 	"ambigo-backend/internal/logger"
+	"ambigo-backend/internal/mailer"
+	"ambigo-backend/internal/payment"
 	"ambigo-backend/internal/requestid"
 	"ambigo-backend/internal/ride"
 	"ambigo-backend/internal/translation"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type AdminHandler struct {
@@ -28,11 +34,15 @@ type AdminHandler struct {
 	PendingHospitalStore *admin.PendingHospitalStore
 	CounterStore         *admin.CounterStore
 	RideStore            *ride.Store
+	WalletStore          *payment.WalletStore
 	JWTSecret            string
 	SMSCfg               auth.SMSCountryConfig
+	Mailer               *mailer.ResendMailer
+	ReviewOTPNumbers     map[string]bool
+	ReviewOTPCode        string
 }
 
-func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, hcStore *admin.HospitalCityStore, pStore *admin.PendingHospitalStore, cStore *admin.CounterStore, rStore *ride.Store, jwtSecret string, smsCfg auth.SMSCountryConfig) *AdminHandler {
+func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventbus.InMemoryBus, hStore *admin.HospitalStore, hcStore *admin.HospitalCityStore, pStore *admin.PendingHospitalStore, cStore *admin.CounterStore, rStore *ride.Store, jwtSecret string, smsCfg auth.SMSCountryConfig, mailer *mailer.ResendMailer) *AdminHandler {
 	return &AdminHandler{
 		Store:                store,
 		AuthStore:            authStore,
@@ -44,7 +54,24 @@ func NewAdminHandler(store *admin.Store, authStore *auth.Store, eventBus *eventb
 		RideStore:            rStore,
 		JWTSecret:            jwtSecret,
 		SMSCfg:               smsCfg,
+		Mailer:               mailer,
 	}
+}
+
+// SetWalletStore wires the wallet store for the delta-adjust endpoint.
+// Kept as a setter so the long constructor signature stays untouched.
+func (h *AdminHandler) SetWalletStore(s *payment.WalletStore) {
+	h.WalletStore = s
+}
+
+// SetReviewOTP enables fixed-code login for App Store review test numbers.
+func (h *AdminHandler) SetReviewOTP(numbers map[string]bool, code string) {
+	h.ReviewOTPNumbers = numbers
+	h.ReviewOTPCode = code
+}
+
+func (h *AdminHandler) isReviewNumber(mobile string) bool {
+	return h.ReviewOTPNumbers[mobile]
 }
 
 func (h *AdminHandler) HandleAdminLogin(w http.ResponseWriter, r *http.Request) {
@@ -60,21 +87,27 @@ func (h *AdminHandler) HandleAdminLogin(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	req.Username = strings.TrimSpace(req.Username)
+
 	adminUser, err := h.Store.FindAdminByUsername(r.Context(), req.Username)
 	if err != nil {
+		logger.Log.Error().Err(err).Str("username", req.Username).Msg("Admin login error during lookup")
 		response.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
 	if adminUser == nil {
+		logger.Log.Warn().Str("username", req.Username).Msg("Admin login failed: admin not found")
 		response.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
 	if !adminUser.Active {
+		logger.Log.Warn().Str("username", req.Username).Msg("Admin login failed: account suspended")
 		response.Error(w, "Account deactivated", http.StatusForbidden)
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(adminUser.HashedPassword), []byte(req.Password)); err != nil {
+		logger.Log.Warn().Str("username", req.Username).Msg("Admin login failed: password mismatch")
 		response.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -86,9 +119,143 @@ func (h *AdminHandler) HandleAdminLogin(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"detail": "Admin Login Successful",
 		"token":  token,
+		"user": map[string]interface{}{
+			"id":       adminUser.ID,
+			"_id":      adminUser.ID,
+			"username": adminUser.Username,
+			"name":     adminUser.Name,
+			"role":     adminUser.Role,
+			"mobile":   adminUser.Mobile,
+		},
+	})
+}
+
+// HandleAdminRegister allows registering a new admin account.
+func (h *AdminHandler) HandleAdminRegister(w http.ResponseWriter, r *http.Request) {
+	reqID := requestid.FromContext(r.Context())
+
+	var req struct {
+		Username string `json:"username" validate:"required"`
+		Password string `json:"password" validate:"required"`
+		Name     string `json:"name" validate:"required"`
+		Mobile   string `json:"mobile"`
+		Role     string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+
+	req.Username = strings.TrimSpace(req.Username)
+	req.Name = strings.TrimSpace(req.Name)
+	req.Mobile = strings.TrimSpace(req.Mobile)
+	req.Role = strings.TrimSpace(req.Role)
+
+	if len(req.Username) < 3 {
+		response.Error(w, "Username must be at least 3 characters", http.StatusBadRequest)
+		return
+	}
+	if len(req.Password) < 6 {
+		response.Error(w, "Password must be at least 6 characters", http.StatusBadRequest)
+		return
+	}
+
+	// If no super_admin exists in the system, first registered admin becomes super_admin
+	count, _ := h.Store.CountActiveSuperAdmins(r.Context())
+	if count == 0 {
+		req.Role = "super_admin"
+	} else if req.Role == "" || (req.Role != "admin" && req.Role != "super_admin") {
+		req.Role = "admin"
+	}
+
+	exists, err := h.Store.CheckAdminUsernameExists(r.Context(), req.Username, "")
+	if err != nil {
+		logger.Log.Error().Err(err).Str("username", req.Username).Msg("Username check failed")
+		response.Error(w, "Internal error checking username", http.StatusInternalServerError)
+		return
+	}
+	if exists {
+		response.Error(w, "Admin with this username already exists", http.StatusConflict)
+		return
+	}
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		logger.Log.Error().Err(err).Msg("Password hash failed")
+		response.Error(w, "Failed to hash password", http.StatusInternalServerError)
+		return
+	}
+
+	newID := ids.New()
+	staff, err := h.Store.CreateStaff(r.Context(), newID, req.Username, string(hashed), req.Name, req.Role, req.Mobile)
+	if err != nil {
+		logger.Log.Error().Err(err).Str("username", req.Username).Msg("Failed to register admin")
+		response.Error(w, "Failed to register admin account", http.StatusInternalServerError)
+		return
+	}
+
+	token, err := auth.GenerateJWT(staff.ID, "admin", staff.Role, h.JWTSecret)
+	if err != nil {
+		logger.Log.Error().Err(err).Msg("Failed to generate token on register")
+		response.Error(w, "Account created, but failed to generate token. Please sign in.", http.StatusInternalServerError)
+		return
+	}
+
+	h.EventBus.PublishEvent(eventbus.ChannelAdminStaffCreated, eventbus.AdminStaffPayload{
+		AdminID:   staff.ID,
+		Username:  staff.Username,
+		Name:      staff.Name,
+		Role:      staff.Role,
+		Action:    "registered",
+		ActorID:   staff.ID,
+		RequestID: reqID,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"detail": "Admin registered successfully",
+		"token":  token,
+		"user": map[string]interface{}{
+			"id":       staff.ID,
+			"_id":      staff.ID,
+			"username": staff.Username,
+			"name":     staff.Name,
+			"role":     staff.Role,
+			"mobile":   staff.Mobile,
+		},
+	})
+}
+
+// HandleAdminMe returns the currently authenticated admin's details.
+func (h *AdminHandler) HandleAdminMe(w http.ResponseWriter, r *http.Request) {
+	adminID, ok := r.Context().Value(middleware.UserIDKey).(string)
+	if !ok || adminID == "" {
+		response.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	adminUser, err := h.Store.FindAdminByID(r.Context(), adminID)
+	if err != nil || adminUser == nil {
+		response.Error(w, "Admin not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":       adminUser.ID,
+		"_id":      adminUser.ID,
+		"username": adminUser.Username,
+		"name":     adminUser.Name,
+		"role":     adminUser.Role,
+		"active":   adminUser.Active,
+		"mobile":   adminUser.Mobile,
 	})
 }
 
@@ -118,6 +285,12 @@ func (h *AdminHandler) HandleAdminMobileRequestOTP(w http.ResponseWriter, r *htt
 		return
 	}
 
+	// App Store review test number: fixed code accepted at verify, no SMS.
+	if h.isReviewNumber(req.Mobile) {
+		json.NewEncoder(w).Encode(map[string]string{"detail": "OTP sent", "name": adminUser.Name})
+		return
+	}
+
 	otp, err := h.AuthStore.GenerateAndStoreOTP(r.Context(), req.Mobile)
 	if err != nil {
 		response.Error(w, "Failed to generate OTP", http.StatusInternalServerError)
@@ -142,10 +315,16 @@ func (h *AdminHandler) HandleAdminMobileVerifyOTP(w http.ResponseWriter, r *http
 		return
 	}
 
-	valid, err := h.AuthStore.VerifyOTP(r.Context(), req.Mobile, req.OTP)
-	if err != nil {
-		response.Error(w, "Internal error", http.StatusInternalServerError)
-		return
+	var valid bool
+	if h.isReviewNumber(req.Mobile) {
+		valid = req.OTP == h.ReviewOTPCode
+	} else {
+		var err error
+		valid, err = h.AuthStore.VerifyOTP(r.Context(), req.Mobile, req.OTP)
+		if err != nil {
+			response.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 	if !valid {
 		response.Error(w, "Invalid OTP", http.StatusUnauthorized)
@@ -422,8 +601,38 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 	if req.MyReferralCode != "" {
 		existing.MyReferralCode = req.MyReferralCode
 	}
-	if req.WalletBalance != 0 {
-		existing.WalletBalance = req.WalletBalance
+	// NOTE: direct balance sets are deprecated — use
+	// POST /api/v2/admin/drivers/wallet/adjust (delta + reason + ledger row).
+	// The legacy field is still honored for old dashboards, applied as an
+	// atomic delta+ledger transaction (never a blind overwrite, so concurrent
+	// ride credits cannot be clobbered and zero deltas are expressible via
+	// the adjust endpoint).
+	if req.WalletBalance != 0 && req.WalletBalance != existing.WalletBalance {
+		if h.WalletStore == nil {
+			response.Error(w, "Wallet service not configured", http.StatusInternalServerError)
+			return
+		}
+		delta := req.WalletBalance - existing.WalletBalance
+		derr := payment.WithTx(r.Context(), h.WalletStore.Pool(), func(tx pgx.Tx) error {
+			wTx := h.WalletStore.WithTx(tx)
+			bal, aerr := wTx.AdjustWalletBalance(r.Context(), existing.ID, delta)
+			if aerr != nil {
+				return aerr
+			}
+			existing.WalletBalance = bal
+			return wTx.InsertLedgerEntry(r.Context(), &payment.WalletTransaction{
+				DriverID:    existing.ID,
+				Amount:      absFloat(delta),
+				Direction:   map[bool]string{true: "credit", false: "debit"}[delta > 0],
+				TxnType:     "admin_adjust",
+				ReferenceID: "admin:set:" + reqID,
+				Status:      "success",
+				BalanceAfter: &bal,
+			})
+		})
+		if derr != nil {
+			logger.Log.Error().Err(derr).Str("driver_id", existing.ID).Msg("Legacy admin balance set failed")
+		}
 	}
 	if req.Location != nil {
 		existing.Location = req.Location
@@ -441,6 +650,8 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 		if existing.WalletDetails == nil {
 			existing.WalletDetails = &auth.WalletDetails{}
 		}
+		bankChanged := (req.WalletDetails.AccountNo != "" && !strings.EqualFold(req.WalletDetails.AccountNo, existing.WalletDetails.AccountNo)) ||
+			(req.WalletDetails.IFSCCode != "" && !strings.EqualFold(req.WalletDetails.IFSCCode, existing.WalletDetails.IFSCCode))
 		if req.WalletDetails.AccountNo != "" {
 			existing.WalletDetails.AccountNo = req.WalletDetails.AccountNo
 		}
@@ -452,6 +663,14 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 		}
 		if req.WalletDetails.BenfID != "" {
 			existing.WalletDetails.BenfID = req.WalletDetails.BenfID
+		}
+		// An admin-swapped account is unproven by definition: reset the
+		// first-payout gate (the driver re-verifies on next save in-app).
+		// Without this, the user-path gate is bypassable from the dashboard.
+		if bankChanged && h.WalletStore != nil {
+			if verr := h.WalletStore.SetWalletVerified(r.Context(), existing.ID, false); verr != nil {
+				logger.Log.Error().Err(verr).Str("driver_id", existing.ID).Msg("Failed to reset verification flag on admin bank edit")
+			}
 		}
 	}
 	if req.Details != nil {
@@ -491,6 +710,75 @@ func (h *AdminHandler) HandleUpdateDriver(w http.ResponseWriter, r *http.Request
 	})
 
 	json.NewEncoder(w).Encode(map[string]string{"detail": "Driver updated successfully"})
+}
+
+func absFloat(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// HandleAdjustDriverWallet applies a signed delta to a driver's wallet with
+// a mandatory reason, atomically with a ledger row. This replaces blind
+// absolute sets: concurrent ride credits cannot be clobbered, zero is
+// expressible, and every adjustment is journaled with who/why.
+func (h *AdminHandler) HandleAdjustDriverWallet(w http.ResponseWriter, r *http.Request) {
+	if h.WalletStore == nil {
+		response.Error(w, "Wallet service not configured", http.StatusInternalServerError)
+		return
+	}
+	var req struct {
+		DriverID string  `json:"driver_id" validate:"required"`
+		Delta    float64 `json:"delta"`
+		Reason   string  `json:"reason" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if !response.Validate(w, &req) {
+		return
+	}
+	if !ids.IsValid(req.DriverID) {
+		response.Error(w, "Invalid driver ID", http.StatusBadRequest)
+		return
+	}
+	if req.Delta == 0 {
+		response.Error(w, "Delta must be non-zero", http.StatusBadRequest)
+		return
+	}
+	if req.Delta < -1000000 || req.Delta > 1000000 {
+		response.Error(w, "Delta out of range", http.StatusBadRequest)
+		return
+	}
+	adminID, _ := r.Context().Value(middleware.UserIDKey).(string)
+
+	var bal float64
+	derr := payment.WithTx(r.Context(), h.WalletStore.Pool(), func(tx pgx.Tx) error {
+		wTx := h.WalletStore.WithTx(tx)
+		var aerr error
+		bal, aerr = wTx.AdjustWalletBalance(r.Context(), req.DriverID, req.Delta)
+		if aerr != nil {
+			return aerr
+		}
+		return wTx.InsertLedgerEntry(r.Context(), &payment.WalletTransaction{
+			DriverID:    req.DriverID,
+			Amount:      absFloat(req.Delta),
+			Direction:   map[bool]string{true: "credit", false: "debit"}[req.Delta > 0],
+			TxnType:     "admin_adjust",
+			ReferenceID: "admin:" + adminID + ":" + req.Reason,
+			Status:      "success",
+			BalanceAfter: &bal,
+		})
+	})
+	if derr != nil {
+		response.Error(w, "Driver not found or adjustment failed", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"detail": "Wallet adjusted", "wallet_balance": bal})
 }
 
 // HandleDeleteDriver removes a verified driver
@@ -603,6 +891,12 @@ func (h *AdminHandler) HandleAcceptDriver(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Backfill MD ambulance relation: resolve the single active link by mobile.
+	// Public drivers (zero links) keep md_ambulance_id NULL.
+	if link, err := h.Store.ActiveMDAmbulanceForMobile(r.Context(), driver.Mobile); err == nil && link != nil {
+		_ = h.AuthStore.SetDriverMDAmbulanceID(r.Context(), driver.ID, link.AmbulanceID)
+	}
+
 	// Revoke old refresh tokens so the driver must re-login with role "driver"
 	if _, revokeErr := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driver.ID, "driver_approved"); revokeErr != nil {
 		logger.Log.Error().Err(revokeErr).Str("driver_id", driver.ID).Msg("Failed to revoke driver refresh tokens after approval")
@@ -676,7 +970,8 @@ func (h *AdminHandler) HandleDriverRideList(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	json.NewEncoder(w).Encode(rides)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.enrichAdminRides(r.Context(), rides))
 }
 
 // ---------------------------------------------------------------
@@ -836,15 +1131,109 @@ func (h *AdminHandler) HandleUserRideList(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	json.NewEncoder(w).Encode(rides)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.enrichAdminRides(r.Context(), rides))
 }
 
 // ---------------------------------------------------------------
-// RIDE LISTING (completed / ongoing)
+// RIDE LISTING (completed / ongoing / filtered)
 // ---------------------------------------------------------------
+
+// adminRide is a ride plus display names resolved server-side so the console
+// never shows raw user/driver/hospital/ambulance-type IDs.
+type adminRide struct {
+	*ride.Ride
+	UserName     string `json:"user_name,omitempty"`
+	UserMobile   string `json:"user_mobile,omitempty"`
+	DriverName   string `json:"driver_name,omitempty"`
+	DriverMobile string `json:"driver_mobile,omitempty"`
+	HospitalName string `json:"hospital_name,omitempty"`
+	AmbTypeName  string `json:"amb_type_name,omitempty"`
+}
+
+// enrichAdminRides resolves names onto console ride lists. Every lookup is
+// non-fatal: a failure leaves the field empty instead of failing the list.
+func (h *AdminHandler) enrichAdminRides(ctx context.Context, rides []*ride.Ride) []adminRide {
+	nameByAmbID := map[string]string{}
+	if ambTypes, err := h.Store.ListAmbulanceTypes(ctx); err == nil {
+		for _, t := range ambTypes {
+			nameByAmbID[t.ID] = t.Name
+		}
+	}
+	out := make([]adminRide, 0, len(rides))
+	for _, rd := range rides {
+		er := adminRide{Ride: rd}
+		if rd.UserID != "" {
+			if u, err := h.AuthStore.FindUserByID(ctx, rd.UserID); err == nil && u != nil {
+				er.UserName = u.Name
+				er.UserMobile = u.Mobile
+			}
+		}
+		if rd.DriverID != nil && *rd.DriverID != "" {
+			if drv, err := h.AuthStore.FindDriverByID(ctx, *rd.DriverID); err == nil && drv != nil {
+				er.DriverName = drv.Name
+				er.DriverMobile = drv.Mobile
+			}
+		}
+		if rd.HospitalID != nil && *rd.HospitalID != "" {
+			if hosp, err := h.HospitalStore.FindByID(ctx, *rd.HospitalID); err == nil && hosp != nil {
+				er.HospitalName = hosp.Name["en_US"]
+			}
+		}
+		if rd.AmbTypeID != nil {
+			er.AmbTypeName = nameByAmbID[*rd.AmbTypeID]
+		}
+		out = append(out, er)
+	}
+	return out
+}
+
+// allRideStatuses is the full ordered set of ride statuses.
+var allRideStatuses = []ride.RideStatus{
+	ride.StatusSearching, ride.StatusAssigned, ride.StatusArrived,
+	ride.StatusInProgress, ride.StatusCompleted, ride.StatusCancelled,
+}
 
 type rideStatusFilter struct {
 	Status ride.RideStatus `json:"status"`
+	Limit  int64           `json:"limit"`
+	Skip   int64           `json:"skip"`
+}
+
+// HandleListRides returns the most recent rides, optionally filtered to a
+// single status (e.g. "CANCELLED"). Empty status returns all rides.
+func (h *AdminHandler) HandleListRides(w http.ResponseWriter, r *http.Request) {
+	var req rideStatusFilter
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Limit <= 0 || req.Limit > 100 {
+		req.Limit = 100
+	}
+	if req.Skip < 0 {
+		req.Skip = 0
+	}
+	statuses := allRideStatuses
+	if req.Status != "" {
+		valid := false
+		for _, st := range allRideStatuses {
+			if st == req.Status {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			response.Error(w, "Invalid status", http.StatusBadRequest)
+			return
+		}
+		statuses = []ride.RideStatus{req.Status}
+	}
+	rides, err := h.RideStore.ListRidesByStatus(r.Context(), statuses, req.Limit, req.Skip)
+	if err != nil {
+		response.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.enrichAdminRides(r.Context(), rides))
 }
 
 // HandleListCompletedRides returns all completed rides
@@ -855,7 +1244,8 @@ func (h *AdminHandler) HandleListCompletedRides(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	json.NewEncoder(w).Encode(rides)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.enrichAdminRides(r.Context(), rides))
 }
 
 // HandleListOngoingRides returns all currently active rides (ASSIGNED, ARRIVED, IN_PROGRESS)
@@ -866,7 +1256,8 @@ func (h *AdminHandler) HandleListOngoingRides(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	json.NewEncoder(w).Encode(rides)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.enrichAdminRides(r.Context(), rides))
 }
 
 // ---------------------------------------------------------------
@@ -1247,7 +1638,28 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Cascade: delete MDs and receptionists linked to this hospital (and revoke sessions)
+	if mds, err := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), req.HospitalID); err == nil {
+		for _, md := range mds {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), md.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), md.ID)
+		}
+	}
+	if receps, err := h.AuthStore.ListReceptionistsByHospital(r.Context(), req.HospitalID); err == nil {
+		for _, rc := range receps {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), rc.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalReceptionistJWT(r.Context(), rc.ID)
+		}
+	}
+	// Delete MDs explicitly before hospital (FK SET NULL, not CASCADE)
+	if mds, err := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), req.HospitalID); err == nil {
+		for _, md := range mds {
+			_ = h.AuthStore.DeleteHospitalMD(r.Context(), md.ID)
+		}
+	}
+
 	if err := h.HospitalStore.DeleteHospital(r.Context(), req.HospitalID); err != nil {
+		logger.Log.Error().Err(err).Str("hospital_id", req.HospitalID).Msg("Hospital delete failed")
 		response.Error(w, "Hospital delete failed", http.StatusBadRequest)
 		return
 	}
@@ -1255,7 +1667,7 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 	h.EventBus.PublishEvent(eventbus.ChannelAdminHospitalDeleted, eventbus.AdminHospitalPayload{
 		HospitalID: req.HospitalID, RequestID: reqID,
 	})
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital deleted successfully"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital and associated MDs/receptionists deleted"})
 }
 
 // -------------------------
@@ -1263,12 +1675,13 @@ func (h *AdminHandler) HandleDeleteHospital(w http.ResponseWriter, r *http.Reque
 // -------------------------
 
 type HospitalCityRequest struct {
-	ID       string  `json:"_id"`
-	Name     string  `json:"name" validate:"required"`
-	Lat      float64 `json:"lat" validate:"required,min=-90,max=90"`
-	Lng      float64 `json:"lng" validate:"required,min=-180,max=180"`
-	RadiusKM float64 `json:"radius_km" validate:"required,min=1"`
-	Enabled  bool    `json:"enabled"`
+	ID              string   `json:"_id"`
+	Name            string   `json:"name" validate:"required"`
+	Lat             float64  `json:"lat" validate:"required,min=-90,max=90"`
+	Lng             float64  `json:"lng" validate:"required,min=-180,max=180"`
+	RadiusKM        float64  `json:"radius_km" validate:"required,min=1,max=60"`
+	MaxPerCategory  *int     `json:"max_per_category" validate:"omitempty,min=5,max=60"`
+	Enabled         bool     `json:"enabled"`
 }
 
 func (h *AdminHandler) HandleListHospitalCities(w http.ResponseWriter, r *http.Request) {
@@ -1291,12 +1704,23 @@ func (h *AdminHandler) HandleAddHospitalCity(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	maxPerCategory := 40
+	if req.MaxPerCategory != nil {
+		maxPerCategory = *req.MaxPerCategory
+	}
+	if maxPerCategory < 5 {
+		maxPerCategory = 5
+	}
+	if maxPerCategory > 60 {
+		maxPerCategory = 60
+	}
 	city := &admin.HospitalCity{
-		Name:     req.Name,
-		Lat:      req.Lat,
-		Lng:      req.Lng,
-		RadiusM:  int64(req.RadiusKM * 1000),
-		Enabled:  req.Enabled,
+		Name:           req.Name,
+		Lat:            req.Lat,
+		Lng:            req.Lng,
+		RadiusM:        int64(req.RadiusKM * 1000),
+		MaxPerCategory: maxPerCategory,
+		Enabled:        req.Enabled,
 	}
 	if err := h.HospitalCityStore.Create(r.Context(), city); err != nil {
 		response.Error(w, "City add failed", http.StatusBadRequest)
@@ -1324,13 +1748,24 @@ func (h *AdminHandler) HandleUpdateHospitalCity(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	maxPerCategoryUpd := 40
+	if req.MaxPerCategory != nil {
+		maxPerCategoryUpd = *req.MaxPerCategory
+	}
+	if maxPerCategoryUpd < 5 {
+		maxPerCategoryUpd = 5
+	}
+	if maxPerCategoryUpd > 60 {
+		maxPerCategoryUpd = 60
+	}
 	city := &admin.HospitalCity{
-		ID:      req.ID,
-		Name:    req.Name,
-		Lat:     req.Lat,
-		Lng:     req.Lng,
-		RadiusM: int64(req.RadiusKM * 1000),
-		Enabled: req.Enabled,
+		ID:             req.ID,
+		Name:           req.Name,
+		Lat:            req.Lat,
+		Lng:            req.Lng,
+		RadiusM:        int64(req.RadiusKM * 1000),
+		MaxPerCategory: maxPerCategoryUpd,
+		Enabled:        req.Enabled,
 	}
 	if err := h.HospitalCityStore.Update(r.Context(), city); err != nil {
 		response.Error(w, "City update failed", http.StatusBadRequest)
@@ -1425,7 +1860,9 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 		response.Error(w, "Already processed", http.StatusBadRequest)
 		return
 	}
-	// Create active hospital from pending details
+	// Create active hospital from pending details. If the same building already
+	// exists nearby (e.g. Google-seeded row), merge into it instead of
+	// duplicating: MD links attach to one row so dispatch priority can't miss.
 	hType := admin.ClassifyHospitalType(pending.Name, nil)
 	hospital := admin.Hospital{
 		Name:         translation.Map{"en_US": pending.Name},
@@ -1444,9 +1881,44 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 		hospital.Location = *pending.Location
 		hospital.H3Cells = admin.BuildH3Cells(pending.Location.Coordinates[0], pending.Location.Coordinates[1])
 	}
-	if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
-		response.Error(w, "Failed to create hospital", http.StatusInternalServerError)
-		return
+	merged := false
+	if len(hospital.Location.Coordinates) == 2 && !(hospital.Location.Coordinates[0] == 0 && hospital.Location.Coordinates[1] == 0) {
+		if nearby, err := h.HospitalStore.FindNearby(r.Context(), hospital.Location.Coordinates[0], hospital.Location.Coordinates[1], admin.DuplicateMergeRadiusKm); err == nil {
+			if target := admin.PickMergeTarget(nearby, pending.Name); target != nil {
+				// Survivor keeps its identity (esp. Google place_id so future
+				// seeds find it); MD-curated fields win, blanks filled.
+				if target.Name == nil {
+					target.Name = translation.Map{"en_US": pending.Name}
+				}
+				if target.Address == nil {
+					target.Address = translation.Map{"en_US": pending.Address}
+				}
+				if len(target.Location.Coordinates) == 0 {
+					target.Location = hospital.Location
+				}
+				if len(target.H3Cells) == 0 {
+					target.H3Cells = hospital.H3Cells
+				}
+				if target.Services == nil {
+					target.Services = []string{}
+				}
+				target.HospitalType = hType
+				target.Category = admin.HospitalCategoryFromType(hType)
+				target.TypeLocked = true
+				if err := h.HospitalStore.UpdateHospital(r.Context(), target); err != nil {
+					response.Error(w, "Failed to merge hospital", http.StatusInternalServerError)
+					return
+				}
+				hospital = *target
+				merged = true
+			}
+		}
+	}
+	if !merged {
+		if err := h.HospitalStore.CreateHospital(r.Context(), &hospital); err != nil {
+			response.Error(w, "Failed to create hospital", http.StatusInternalServerError)
+			return
+		}
 	}
 	_ = h.CounterStore.IncrementCounter(r.Context(), "hospitals")
 	// Update pending status
@@ -1463,6 +1935,13 @@ func (h *AdminHandler) HandleApprovePendingHospital(w http.ResponseWriter, r *ht
 				_ = h.AuthStore.UpdateHospitalMD(r.Context(), md)
 			}
 		}
+	}
+
+	// Send approval email (no link, just where to login)
+	if h.Mailer != nil && pending.Email != "" {
+		_ = h.Mailer.SendHospitalApproveEmail(pending.Email, pending.Name, pending.City)
+	} else {
+		logger.Log.Warn().Str("pending_id", pending.ID).Msg("Approve email skipped: no email or mailer")
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1490,10 +1969,15 @@ func (h *AdminHandler) HandleRejectPendingHospital(w http.ResponseWriter, r *htt
 		response.Error(w, "Pending hospital not found", http.StatusNotFound)
 		return
 	}
-	// Delete entirely so MD can re-signup fresh
-	if err := h.PendingHospitalStore.Delete(r.Context(), req.ID); err != nil {
+	// Hybrid C: keep pending row as rejected for audit, delete MD to free mobile
+	reviewerID, _ := r.Context().Value(middleware.UserIDKey).(string)
+	if err := h.PendingHospitalStore.Reject(r.Context(), req.ID, reviewerID, req.ErrorMessage); err != nil {
 		response.Error(w, "Reject failed", http.StatusInternalServerError)
 		return
+	}
+	// Send rejection email (no link, just where to login and reason)
+	if h.Mailer != nil && pending.Email != "" {
+		_ = h.Mailer.SendHospitalRejectEmail(pending.Email, pending.Name, req.ErrorMessage)
 	}
 	if pending.MDID != "" && ids.IsValid(pending.MDID) {
 		_ = h.AuthStore.DeleteHospitalMD(r.Context(), pending.MDID)
@@ -1501,7 +1985,7 @@ func (h *AdminHandler) HandleRejectPendingHospital(w http.ResponseWriter, r *htt
 		_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), pending.MDID)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital rejected and removed"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "Hospital rejected"})
 }
 
 func (h *AdminHandler) HandlePendingHospitalCounter(w http.ResponseWriter, r *http.Request) {
@@ -1575,11 +2059,46 @@ func (h *AdminHandler) HandleDeleteHospitalMD(w http.ResponseWriter, r *http.Req
 	if !response.Validate(w, &req) {
 		return
 	}
-	if err := h.AuthStore.DeleteHospitalMD(r.Context(), req.ID); err != nil {
-		response.Error(w, "Delete failed", http.StatusInternalServerError)
+	md, err := h.AuthStore.FindHospitalMDByID(r.Context(), req.ID)
+	if err != nil || md == nil {
+		response.Error(w, "MD not found", http.StatusNotFound)
 		return
 	}
+	hospitalID := ""
+	if md.HospitalID != nil {
+		hospitalID = *md.HospitalID
+	}
+	// Revoke MD session first
 	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), req.ID, "deleted")
+	_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), req.ID)
+
+	// If MD linked to hospital, delete hospital and all receptionists/MDs of that hospital
+	if hospitalID != "" && ids.IsValid(hospitalID) {
+		// Capture MDs and receptionists before hospital delete (FK SET NULL would hide them)
+		mds, _ := h.AuthStore.ListHospitalMDsByHospitalID(r.Context(), hospitalID)
+		receps, _ := h.AuthStore.ListReceptionistsByHospital(r.Context(), hospitalID)
+		for _, rc := range receps {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), rc.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalReceptionistJWT(r.Context(), rc.ID)
+		}
+		for _, m := range mds {
+			_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), m.ID, "hospital_deleted")
+			_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), m.ID)
+		}
+		// Delete hospital (cascades receptionists via FK, MDs stay with SET NULL so explicit delete next)
+		_ = h.HospitalStore.DeleteHospital(r.Context(), hospitalID)
+		for _, m := range mds {
+			_ = h.AuthStore.DeleteHospitalMD(r.Context(), m.ID)
+		}
+		// Ensure requested MD deleted even if not in list (e.g., list empty)
+		_ = h.AuthStore.DeleteHospitalMD(r.Context(), req.ID)
+	} else {
+		// No hospital linked — just delete MD
+		if err := h.AuthStore.DeleteHospitalMD(r.Context(), req.ID); err != nil {
+			response.Error(w, "Delete failed", http.StatusInternalServerError)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"detail": "MD login deleted, hospital retained"})
+	json.NewEncoder(w).Encode(map[string]string{"detail": "MD, hospital and receptionists deleted"})
 }

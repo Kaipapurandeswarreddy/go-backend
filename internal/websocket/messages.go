@@ -4,14 +4,23 @@ import "encoding/json"
 
 // Event types
 const (
-	EventLocationUpdate = "LOCATION_UPDATE"
-	EventWatchRide      = "WATCH_RIDE"
-	EventRideUpdate     = "RIDE_UPDATE"
-	EventRideRequested  = "RIDE_REQUESTED"
-	EventRideAccepted   = "RIDE_ACCEPTED"
-	EventRideDeclined   = "RIDE_DECLINED"
-	EventSOSAlert       = "SOS_ALERT"
-	EventError          = "ERROR"
+	EventLocationUpdate     = "LOCATION_UPDATE"
+	EventWatchRide          = "WATCH_RIDE"
+	EventRideUpdate         = "RIDE_UPDATE"
+	EventRideRequested      = "RIDE_REQUESTED"
+	EventRideAccepted       = "RIDE_ACCEPTED"
+	EventRideDeclined       = "RIDE_DECLINED"
+	EventSOSAlert           = "SOS_ALERT"
+	EventFleetLocation      = "FLEET_LOCATION_UPDATE"
+	EventFleetStatus        = "FLEET_STATUS_UPDATE"
+	EventAdminActivity      = "ADMIN_ACTIVITY"
+	EventSafetyAlertUpdated = "SAFETY_ALERT_UPDATED"
+	EventError              = "ERROR"
+	// Hospital decline auto-reroute (mid-ride destination change).
+	EventDestinationChanged = "DESTINATION_CHANGED"
+	EventRideReassignedAway = "RIDE_REASSIGNED_AWAY"
+	EventNewIncoming        = "NEW_INCOMING"
+	EventRideETAUpdate      = "RIDE_ETA_UPDATE"
 )
 
 // BaseMessage is the generic envelope for all websocket communications

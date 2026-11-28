@@ -9,6 +9,7 @@ import (
 
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/api/response"
+	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/ids"
@@ -26,6 +27,9 @@ type AuthHandler struct {
 	SMSCfg                 auth.SMSCountryConfig
 	AllowStaleRefreshChain bool
 	ReferralService        *referral.Service
+	MDStore                *admin.Store
+	ReviewOTPNumbers       map[string]bool
+	ReviewOTPCode          string
 }
 
 func NewAuthHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, jwtSecret string, smsCfg auth.SMSCountryConfig, allowStaleRefreshChain bool, referralService *referral.Service) *AuthHandler {
@@ -37,6 +41,34 @@ func NewAuthHandler(authStore *auth.Store, eventBus *eventbus.InMemoryBus, jwtSe
 		AllowStaleRefreshChain: allowStaleRefreshChain,
 		ReferralService:        referralService,
 	}
+}
+
+// SetMDStore wires MD ambulance link checks (nil-safe when unset, e.g. tests).
+func (h *AuthHandler) SetMDStore(store *admin.Store) {
+	h.MDStore = store
+}
+
+// SetReviewOTP enables fixed-code login for App Store review test numbers.
+func (h *AuthHandler) SetReviewOTP(numbers map[string]bool, code string) {
+	h.ReviewOTPNumbers = numbers
+	h.ReviewOTPCode = code
+}
+
+func (h *AuthHandler) isReviewNumber(mobile string) bool {
+	return h.ReviewOTPNumbers[mobile]
+}
+
+// blockedByMD reports whether an MD-linked mobile has no active link.
+// Public mobiles (zero links) or unset store are never blocked.
+func (h *AuthHandler) blockedByMD(ctx context.Context, mobile string) bool {
+	if h.MDStore == nil || mobile == "" {
+		return false
+	}
+	blocked, err := h.MDStore.IsMobileBlockedByMD(ctx, mobile)
+	if err != nil {
+		return false
+	}
+	return blocked
 }
 
 type otpPayload struct {
@@ -53,6 +85,7 @@ type verifyPayload struct {
 	ReferralCode string `json:"referral_code,omitempty"`
 	DeviceID     string `json:"device_id,omitempty"`
 	DeviceName   string `json:"device_name,omitempty"`
+	FCMToken     string `json:"fcm_token,omitempty"`
 }
 
 func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Request) {
@@ -65,6 +98,16 @@ func (h *AuthHandler) HandleUserRequestOTP(w http.ResponseWriter, r *http.Reques
 	// V11: Validate mobile number
 	if !mobileRegex.MatchString(payload.Mobile) {
 		response.Error(w, "Invalid mobile number", http.StatusBadRequest)
+		return
+	}
+
+	// App Store review test number: fixed code accepted at verify, no SMS.
+	if h.isReviewNumber(payload.Mobile) {
+		var name string
+		if existingUser, _ := h.AuthStore.FindUserByMobile(r.Context(), payload.Mobile); existingUser != nil {
+			name = existingUser.Name
+		}
+		response.Success(w, http.StatusOK, map[string]string{"detail": "OTP sent", "name": name})
 		return
 	}
 
@@ -117,32 +160,39 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// V13: Check lockout before OTP verify
-	locked, err := h.AuthStore.IsOTPLocked(r.Context(), payload.Mobile)
-	if err != nil {
-		response.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-	if locked {
-		response.Error(w, "Too many attempts. Try again later.", http.StatusTooManyRequests)
-		return
-	}
+	var valid bool
+	if h.isReviewNumber(payload.Mobile) {
+		valid = payload.OTP == h.ReviewOTPCode
+	} else {
+		// V13: Check lockout before OTP verify
+		locked, err := h.AuthStore.IsOTPLocked(r.Context(), payload.Mobile)
+		if err != nil {
+			response.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		if locked {
+			response.Error(w, "Too many attempts. Try again later.", http.StatusTooManyRequests)
+			return
+		}
 
-	// V2: VerifyOTP now checks expiry in application code
-	valid, err := h.AuthStore.VerifyOTP(r.Context(), payload.Mobile, payload.OTP)
-	if err != nil {
-		response.Error(w, "Internal error", http.StatusInternalServerError)
-		return
+		// V2: VerifyOTP now checks expiry in application code
+		valid, err = h.AuthStore.VerifyOTP(r.Context(), payload.Mobile, payload.OTP)
+		if err != nil {
+			response.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		if !valid {
+			// V13: Track failed attempt
+			_ = h.AuthStore.IncrementFailedOTP(r.Context(), payload.Mobile)
+		} else {
+			// V13: Reset failed attempts on success
+			_ = h.AuthStore.ResetFailedOTP(r.Context(), payload.Mobile)
+		}
 	}
 	if !valid {
-		// V13: Track failed attempt
-		_ = h.AuthStore.IncrementFailedOTP(r.Context(), payload.Mobile)
 		response.Error(w, "Invalid OTP", http.StatusUnauthorized)
 		return
 	}
-
-	// V13: Reset failed attempts on success
-	_ = h.AuthStore.ResetFailedOTP(r.Context(), payload.Mobile)
 
 	user, err := h.AuthStore.FindUserByMobile(r.Context(), payload.Mobile)
 	if err != nil {
@@ -190,6 +240,9 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Single-device: revoke previous sessions like driver (user strict single-device)
+	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), user.ID, "session_replaced")
+
 	// V8: Generate access token + refresh token
 	accessToken, err := auth.GenerateAccessToken(user.ID, "user", h.JWTSecret)
 	if err != nil {
@@ -203,11 +256,22 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
+	// Session-scoped push token for the single-session kill-switch.
+	_ = h.AuthStore.SetSessionFCMToken(r.Context(), user.ID, sessionID, payload.FCMToken)
+	if payload.FCMToken != "" {
+		_ = h.AuthStore.UpdateUserFCM(r.Context(), user.ID, payload.FCMToken)
+	}
 
 	h.AuthStore.UpdateUserJWT(r.Context(), user.ID, accessToken)
 
 	h.EventBus.PublishEvent(eventbus.ChannelAuthUserLoggedIn, eventbus.AuthUserLoggedInPayload{
 		UserID: user.ID, Mobile: payload.Mobile, RequestID: reqID,
+	})
+	// Always publish session_replaced on new login so WS manager records the
+	// authoritative session_id and kicks any old connections, even if refresh
+	// tokens were already cleaned up by a prior logout.
+	h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
+		UserID: user.ID, Role: "user", SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
 	})
 
 	response.Success(w, http.StatusOK, map[string]string{
@@ -226,6 +290,22 @@ func (h *AuthHandler) HandleDriverRequestOTP(w http.ResponseWriter, r *http.Requ
 
 	if !mobileRegex.MatchString(payload.Mobile) {
 		response.Error(w, "Invalid mobile number", http.StatusBadRequest)
+		return
+	}
+
+	// MD-linked mobiles need an active ambulance link; public mobiles bypass.
+	if h.blockedByMD(r.Context(), payload.Mobile) {
+		response.Error(w, "Ambulance deactivated by hospital", http.StatusForbidden)
+		return
+	}
+
+	// App Store review test number: fixed code accepted at verify, no SMS.
+	if h.isReviewNumber(payload.Mobile) {
+		var name string
+		if existingDriver, _ := h.AuthStore.FindDriverByMobile(r.Context(), payload.Mobile); existingDriver != nil {
+			name = existingDriver.Name
+		}
+		response.Success(w, http.StatusOK, map[string]string{"detail": "OTP sent", "name": name})
 		return
 	}
 
@@ -274,23 +354,38 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	locked, err := h.AuthStore.IsOTPLocked(r.Context(), payload.Mobile)
-	if err != nil {
-		response.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-	if locked {
-		response.Error(w, "Too many attempts. Try again later.", http.StatusTooManyRequests)
+	// MD-linked mobiles need an active ambulance link; public mobiles bypass.
+	if h.blockedByMD(r.Context(), payload.Mobile) {
+		response.Error(w, "Ambulance deactivated by hospital", http.StatusForbidden)
 		return
 	}
 
-	valid, err := h.AuthStore.VerifyOTP(r.Context(), payload.Mobile, payload.OTP)
-	if err != nil || !valid {
-		_ = h.AuthStore.IncrementFailedOTP(r.Context(), payload.Mobile)
+	var valid bool
+	if h.isReviewNumber(payload.Mobile) {
+		valid = payload.OTP == h.ReviewOTPCode
+	} else {
+		locked, err := h.AuthStore.IsOTPLocked(r.Context(), payload.Mobile)
+		if err != nil {
+			response.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		if locked {
+			response.Error(w, "Too many attempts. Try again later.", http.StatusTooManyRequests)
+			return
+		}
+
+		valid, err = h.AuthStore.VerifyOTP(r.Context(), payload.Mobile, payload.OTP)
+		if err != nil || !valid {
+			_ = h.AuthStore.IncrementFailedOTP(r.Context(), payload.Mobile)
+			response.Error(w, "Invalid OTP", http.StatusUnauthorized)
+			return
+		}
+		_ = h.AuthStore.ResetFailedOTP(r.Context(), payload.Mobile)
+	}
+	if !valid {
 		response.Error(w, "Invalid OTP", http.StatusUnauthorized)
 		return
 	}
-	_ = h.AuthStore.ResetFailedOTP(r.Context(), payload.Mobile)
 
 	driver, err := h.AuthStore.FindDriverByMobile(r.Context(), payload.Mobile)
 	if err != nil {
@@ -351,7 +446,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Revoke all previous sessions so only this device stays logged in
-	revokedCount, err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID, "session_replaced")
+	_, err = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID, "session_replaced")
 	if err != nil {
 		logger.Log.Error().Err(err).Str("driver_id", driverID).Str("request_id", reqID).Msg("Failed to revoke old driver sessions")
 	}
@@ -368,6 +463,11 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
+	// Session-scoped push token for the single-session kill-switch.
+	_ = h.AuthStore.SetSessionFCMToken(r.Context(), driverID, sessionID, payload.FCMToken)
+	if payload.FCMToken != "" && role == "driver" {
+		_ = h.AuthStore.UpdateDriverFCM(r.Context(), driverID, payload.FCMToken)
+	}
 
 	if role == "driver" {
 		h.AuthStore.UpdateDriverJWT(r.Context(), driverID, accessToken)
@@ -379,13 +479,12 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 		DriverID: driverID, Mobile: payload.Mobile, Role: role, RequestID: reqID,
 	})
 
-	// A prior session was replaced by this login — notify all live connections
-	// instantly so the old device is kicked without waiting for token expiry.
-	if revokedCount > 0 {
-		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
-			UserID: driverID, Role: role, SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
-		})
-	}
+	// Always publish session_replaced on new login so WS manager records the
+	// authoritative session_id and kicks any old connections, even if refresh
+	// tokens were already cleaned up by a prior logout.
+	h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
+		UserID: driverID, Role: role, SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
+	})
 
 	response.Success(w, http.StatusOK, map[string]string{
 		"access_token":  accessToken,
@@ -401,6 +500,7 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 		RefreshToken string `json:"refresh_token"`
 		DeviceID     string `json:"device_id,omitempty"`
 		DeviceName   string `json:"device_name,omitempty"`
+		FCMToken     string `json:"fcm_token,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.RefreshToken == "" {
 		response.Error(w, "Invalid payload", http.StatusBadRequest)
@@ -422,6 +522,14 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 	if !tokenDoc.Revoked && time.Now().Before(tokenDoc.ExpiresAt) {
 		newRT, newTokenStr, err := h.AuthStore.RotateById(r.Context(), tokenDoc, payload.DeviceID, payload.DeviceName)
 		if err == nil {
+			_ = h.AuthStore.SetSessionFCMToken(r.Context(), newRT.UserID, newRT.SessionID, payload.FCMToken)
+			if payload.FCMToken != "" {
+				if newRT.Role == "user" {
+					_ = h.AuthStore.UpdateUserFCM(r.Context(), newRT.UserID, payload.FCMToken)
+				} else if newRT.Role == "driver" {
+					_ = h.AuthStore.UpdateDriverFCM(r.Context(), newRT.UserID, payload.FCMToken)
+				}
+			}
 			newAccessToken, err := h.generateAccessTokenForRole(r.Context(), newRT)
 			if err != nil {
 				response.Error(w, "Failed to generate token", http.StatusInternalServerError)
@@ -462,6 +570,14 @@ func (h *AuthHandler) HandleRefreshToken(w http.ResponseWriter, r *http.Request)
 			// Found live token deeper in the chain — rotate it to issue a new string
 			newRT, newTokenStr, err := h.AuthStore.RotateById(r.Context(), liveToken, payload.DeviceID, payload.DeviceName)
 			if err == nil {
+				_ = h.AuthStore.SetSessionFCMToken(r.Context(), newRT.UserID, newRT.SessionID, payload.FCMToken)
+			if payload.FCMToken != "" {
+				if newRT.Role == "user" {
+					_ = h.AuthStore.UpdateUserFCM(r.Context(), newRT.UserID, payload.FCMToken)
+				} else if newRT.Role == "driver" {
+					_ = h.AuthStore.UpdateDriverFCM(r.Context(), newRT.UserID, payload.FCMToken)
+				}
+			}
 				newAccessToken, err := h.generateAccessTokenForRole(r.Context(), newRT)
 				if err != nil {
 					response.Error(w, "Failed to generate token", http.StatusInternalServerError)
@@ -512,6 +628,12 @@ func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 			_ = h.AuthStore.ClearDriverJWT(r.Context(), userID)
 		case "unvrf_driver":
 			_ = h.AuthStore.ClearUnverifiedDriverJWT(r.Context(), userID)
+		case "attendant":
+			_ = h.AuthStore.ClearAmbulanceAttendantJWT(r.Context(), userID)
+		case "hospital_md":
+			_ = h.AuthStore.ClearHospitalMDJWT(r.Context(), userID)
+		case "hospital_receptionist":
+			_ = h.AuthStore.ClearHospitalReceptionistJWT(r.Context(), userID)
 		}
 	}
 

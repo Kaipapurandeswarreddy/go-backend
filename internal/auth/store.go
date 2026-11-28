@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"ambigo-backend/internal/ids"
@@ -25,10 +27,10 @@ var (
 )
 
 const (
-	otpExpiry           = 5 * time.Minute
-	maxOTPAttempts      = 5
-	otpLockoutDuration  = 1 * time.Hour
-	refreshTokenExpiry  = 30 * 24 * time.Hour
+	otpExpiry          = 5 * time.Minute
+	maxOTPAttempts     = 5
+	otpLockoutDuration = 1 * time.Hour
+	refreshTokenExpiry = 30 * 24 * time.Hour
 )
 
 type Store struct {
@@ -58,7 +60,7 @@ func scanUserRow(row pgx.Row) (*User, error) {
 	var locationData []byte
 	var fcmToken, jwtToken *string
 	var id string
-	err := row.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken)
+	err := row.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -85,8 +87,9 @@ func scanDriverRow(row pgx.Row) (*Driver, error) {
 	var myReferralCode *string
 	var fcmToken, jwtToken *string
 	var lastLocationUpdate *time.Time
+	var verifiedAt *time.Time
 	var id string
-	err := row.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData)
+	err := row.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.WalletVerified, &verifiedAt, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData)
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +115,7 @@ func scanDriverRow(row pgx.Row) (*Driver, error) {
 	d.FCMToken = fcmToken
 	d.JWTToken = jwtToken
 	d.LastLocationUpdate = lastLocationUpdate
+	d.WalletVerifiedAt = verifiedAt
 	return &d, nil
 }
 
@@ -217,8 +221,14 @@ func scanHospitalReceptionistRow(row pgx.Row) (*HospitalReceptionist, error) {
 	var r HospitalReceptionist
 	var mobile *string
 	var jwtToken *string
+	var email *string
+	var role sql.NullString
+	var roleID *string
+	var status sql.NullString
+	var mustChange sql.NullBool
+	var invitedAt sql.NullTime
 	var id, hospitalID, createdByMDID string
-	err := row.Scan(&id, &hospitalID, &createdByMDID, &r.Name, &r.Username, &r.PasswordHash, &mobile, &r.Active, &r.CreatedAt, &jwtToken)
+	err := row.Scan(&id, &hospitalID, &createdByMDID, &r.Name, &r.Username, &r.PasswordHash, &mobile, &r.Active, &r.CreatedAt, &jwtToken, &email, &status, &mustChange, &invitedAt, &role, &roleID)
 	if err != nil {
 		return nil, err
 	}
@@ -227,6 +237,30 @@ func scanHospitalReceptionistRow(row pgx.Row) (*HospitalReceptionist, error) {
 	r.CreatedByMDID = createdByMDID
 	r.Mobile = mobile
 	r.JWTToken = jwtToken
+	r.Email = email
+	if role.Valid && strings.TrimSpace(role.String) != "" {
+		r.Role = role.String
+	} else {
+		r.Role = "Staff"
+	}
+	r.RoleID = roleID
+	if status.Valid {
+		r.Status = status.String
+	} else if r.Active {
+		r.Status = "active"
+	} else {
+		r.Status = "invited"
+	}
+	if mustChange.Valid {
+		r.MustChangePassword = mustChange.Bool
+	} else {
+		r.MustChangePassword = r.Status == "invited"
+	}
+	if invitedAt.Valid {
+		r.InvitedAt = invitedAt.Time
+	} else {
+		r.InvitedAt = r.CreatedAt
+	}
 	return &r, nil
 }
 
@@ -347,16 +381,16 @@ func (s *Store) CreateRefreshToken(ctx context.Context, userID, role, sessionID,
 
 	now := time.Now()
 	rt := &RefreshToken{
-		ID:        ids.New(),
-		UserID:    userID,
-		Role:      role,
-		TokenHash: tokenHash,
-		SessionID: sessionID,
-		DeviceID:  deviceID,
+		ID:         ids.New(),
+		UserID:     userID,
+		Role:       role,
+		TokenHash:  tokenHash,
+		SessionID:  sessionID,
+		DeviceID:   deviceID,
 		DeviceName: deviceName,
-		CreatedAt: now,
-		ExpiresAt: now.Add(refreshTokenExpiry),
-		Revoked:   false,
+		CreatedAt:  now,
+		ExpiresAt:  now.Add(refreshTokenExpiry),
+		Revoked:    false,
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO refresh_tokens (id, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, false)`, rt.ID, rt.UserID, rt.Role, rt.TokenHash, rt.SessionID, rt.DeviceID, rt.DeviceName, rt.CreatedAt, rt.ExpiresAt)
 	if err != nil {
@@ -525,6 +559,40 @@ func (s *Store) RevokeAllUserRefreshTokens(ctx context.Context, userID, reason s
 	return tag.RowsAffected(), nil
 }
 
+// SetSessionFCMToken stamps the push token on the caller's live session row.
+// FCM tokens rotate independently of logins, so login/refresh proactively
+// report the current token; per-account fcm_token columns can't be used for
+// this because each device's report overwrites the previous one.
+func (s *Store) SetSessionFCMToken(ctx context.Context, userID, sessionID, fcmToken string) error {
+	if fcmToken == "" || sessionID == "" {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE refresh_tokens SET fcm_token=$3 WHERE user_id=$1 AND session_id=$2 AND revoked=false`, userID, sessionID, fcmToken)
+	return err
+}
+
+// ListSupersededSessionFCMTokens returns distinct push tokens of sessions
+// that were killed by a newer login (revoked with reason session_replaced),
+// excluding the just-created session. Used for the FCM kill-switch push.
+func (s *Store) ListSupersededSessionFCMTokens(ctx context.Context, userID, exceptSessionID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT fcm_token FROM refresh_tokens WHERE user_id=$1 AND revoked=true AND revoked_reason='session_replaced' AND fcm_token IS NOT NULL AND fcm_token<>'' AND (session_id IS DISTINCT FROM $2) AND fcm_token NOT IN (SELECT fcm_token FROM refresh_tokens WHERE user_id=$1 AND revoked=false AND fcm_token IS NOT NULL AND fcm_token<>'')`, userID, exceptSessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		if t != "" {
+			out = append(out, t)
+		}
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListUserSessions(ctx context.Context, userID string) ([]RefreshToken, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id::text, user_id, role, token_hash, session_id, device_id, device_name, created_at, expires_at, revoked, revoked_at, revoked_reason, superseded_by::text FROM refresh_tokens WHERE user_id=$1 AND revoked=false`, userID)
 	if err != nil {
@@ -671,7 +739,7 @@ func IsValidIndianMobile(mobile string) bool {
 // ---- Existing methods below ----
 
 func (s *Store) FindUserByMobile(ctx context.Context, mobile string) (*User, error) {
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users WHERE mobile=$1`, mobile)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token, created_at FROM users WHERE mobile=$1`, mobile)
 	u, err := scanUserRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -683,7 +751,7 @@ func (s *Store) FindUserByMobile(ctx context.Context, mobile string) (*User, err
 }
 
 func (s *Store) FindDriverByMobile(ctx context.Context, mobile string) (*Driver, error) {
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE mobile=$1`, mobile)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE mobile=$1`, mobile)
 	d, err := scanDriverRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -756,7 +824,7 @@ func (s *Store) FindUserByID(ctx context.Context, id string) (*User, error) {
 	if !ids.IsValid(id) {
 		return nil, fmt.Errorf("invalid id: %s", id)
 	}
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users WHERE id=$1::uuid`, id)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token, created_at FROM users WHERE id=$1::uuid`, id)
 	u, err := scanUserRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -771,7 +839,7 @@ func (s *Store) FindDriverByID(ctx context.Context, id string) (*Driver, error) 
 	if !ids.IsValid(id) {
 		return nil, fmt.Errorf("invalid id: %s", id)
 	}
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE id=$1::uuid`, id)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE id=$1::uuid`, id)
 	d, err := scanDriverRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -836,6 +904,58 @@ func (s *Store) UpdateUnverifiedDriverFCM(ctx context.Context, id string, token 
 	return err
 }
 
+// SetDriverMDAmbulanceID records the effective MD ambulance for a verified driver.
+// Pass "" to clear (unlinked). Column lives outside scanDriverRow so old queries keep working.
+func (s *Store) SetDriverMDAmbulanceID(ctx context.Context, driverID, ambulanceID string) error {
+	if !ids.IsValid(driverID) {
+		return fmt.Errorf("invalid id: %s", driverID)
+	}
+	if ambulanceID == "" {
+		_, err := s.pool.Exec(ctx, `UPDATE drivers SET md_ambulance_id=NULL WHERE id=$1::uuid`, driverID)
+		return err
+	}
+	if !ids.IsValid(ambulanceID) {
+		return fmt.Errorf("invalid ambulance id: %s", ambulanceID)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET md_ambulance_id=$2::uuid WHERE id=$1::uuid`, driverID, ambulanceID)
+	return err
+}
+
+// GetDriverMDAmbulanceID fetches the stored effective ambulance for a driver.
+func (s *Store) GetDriverMDAmbulanceID(ctx context.Context, driverID string) (*string, error) {
+	if !ids.IsValid(driverID) {
+		return nil, fmt.Errorf("invalid id: %s", driverID)
+	}
+	var v *string
+	err := s.pool.QueryRow(ctx, `SELECT md_ambulance_id::text FROM drivers WHERE id=$1::uuid`, driverID).Scan(&v)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return v, nil
+}
+
+// FindDriverIDsByMobiles maps mobiles to verified driver IDs, skipping
+// mobiles with no verified driver row. Used for hospital-first dispatch.
+func (s *Store) FindDriverIDsByMobiles(ctx context.Context, mobiles []string) (map[string]string, error) {
+	out := make(map[string]string, len(mobiles))
+	for _, m := range mobiles {
+		if m == "" {
+			continue
+		}
+		d, err := s.FindDriverByMobile(ctx, m)
+		if err != nil {
+			return nil, err
+		}
+		if d != nil {
+			out[m] = d.ID
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) UpdateUnverifiedDriver(ctx context.Context, driver *UnverifiedDriver) error {
 	if !ids.IsValid(driver.ID) {
 		return fmt.Errorf("invalid id: %s", driver.ID)
@@ -869,8 +989,8 @@ func (s *Store) ApproveDriver(ctx context.Context, driver *Driver) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	_, err = tx.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb)`,
-		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
+	_, err = tx.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17::jsonb)`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.WalletVerified, driver.WalletVerifiedAt, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
 	if err != nil {
 		return err
 	}
@@ -887,7 +1007,7 @@ func (s *Store) ListDrivers(ctx context.Context, skip int64) ([]Driver, int64, e
 	if err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers ORDER BY created_at DESC, id DESC OFFSET $1 LIMIT 20`, skip)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers ORDER BY created_at DESC, id DESC OFFSET $1 LIMIT 20`, skip)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -901,11 +1021,13 @@ func (s *Store) ListDrivers(ctx context.Context, skip int64) ([]Driver, int64, e
 		var myReferralCode *string
 		var fcmToken, jwtToken *string
 		var lastLocationUpdate *time.Time
+		var verifiedAt *time.Time
 		var id string
-		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData); err != nil {
+		if err := rows.Scan(&id, &d.Name, &d.Mobile, &d.Photo, &d.VehicleType, &d.VehicleReg, &walletDetailsData, &d.WalletBalance, &d.WalletVerified, &verifiedAt, &d.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &lastLocationUpdate, &detailsData); err != nil {
 			return nil, 0, err
 		}
 		d.ID = id
+		d.WalletVerifiedAt = verifiedAt
 		if myReferralCode != nil {
 			d.MyReferralCode = *myReferralCode
 		}
@@ -943,8 +1065,8 @@ func (s *Store) InsertDriver(ctx context.Context, driver *Driver) error {
 	}
 	locationData := marshalJSONB(driver.Location)
 	detailsData := marshalJSONB(driver.Details)
-	_, err := s.pool.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb)`,
-		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
+	_, err := s.pool.Exec(ctx, `INSERT INTO drivers (id, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17::jsonb)`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.WalletVerified, driver.WalletVerifiedAt, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
 	return err
 }
 
@@ -958,8 +1080,12 @@ func (s *Store) UpdateDriver(ctx context.Context, driver *Driver) error {
 	}
 	locationData := marshalJSONB(driver.Location)
 	detailsData := marshalJSONB(driver.Details)
-	_, err := s.pool.Exec(ctx, `UPDATE drivers SET name=$2, mobile=$3, photo=$4, vehicle_type=$5, vehicle_registration=$6, wallet_details=$7::jsonb, wallet_balance=$8, referral_code=$9, my_referral_code=$10, location=$11::jsonb, fcm_token=$12, jwt_token=$13, last_location_update=$14, details=$15::jsonb WHERE id=$1::uuid`,
-		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.WalletBalance, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
+	// NOTE: wallet_balance is deliberately NOT written here. Balance is only
+	// mutated via atomic delta operations (UpdateWalletBalance/DeductBalance/
+	// AdjustWalletBalance) so a stale struct can never clobber concurrent
+	// ride credits. Use WalletStore.AdjustWalletBalance for corrections.
+	_, err := s.pool.Exec(ctx, `UPDATE drivers SET name=$2, mobile=$3, photo=$4, vehicle_type=$5, vehicle_registration=$6, wallet_details=$7::jsonb, referral_code=$8, my_referral_code=$9, location=$10::jsonb, fcm_token=$11, jwt_token=$12, last_location_update=$13, details=$14::jsonb WHERE id=$1::uuid`,
+		driver.ID, driver.Name, driver.Mobile, driver.Photo, driver.VehicleType, driver.VehicleReg, walletDetailsData, driver.ReferralCode, driver.MyReferralCode, locationData, driver.FCMToken, driver.JWTToken, driver.LastLocationUpdate, detailsData)
 	return err
 }
 
@@ -1145,6 +1271,27 @@ func (s *Store) ListAllUnverifiedDriversWithOffset(ctx context.Context, limit in
 	return drivers, rows.Err()
 }
 
+func (s *Store) ListAllUnverifiedDriversForMigration(ctx context.Context) ([]UnverifiedDriver, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, portrait_image, poi_image, dl_image, rc_image, amb_front, amb_inside, vehicle_type, under_progress, error_message, fcm_token, jwt_token, location FROM unverified_drivers`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var drivers []UnverifiedDriver
+	for rows.Next() {
+		u, err := scanUnverifiedDriverRow(rows)
+		if err != nil {
+			continue
+		}
+		drivers = append(drivers, *u)
+	}
+	if drivers == nil {
+		drivers = []UnverifiedDriver{}
+	}
+	return drivers, rows.Err()
+}
+
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	return s.ListUsersPaginated(ctx, 50, "")
 }
@@ -1156,7 +1303,7 @@ func (s *Store) ListUsersWithOffset(ctx context.Context, limit int, offset int) 
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, limit, offset)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token, created_at FROM users ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -1168,7 +1315,7 @@ func (s *Store) ListUsersWithOffset(ctx context.Context, limit int, offset int) 
 		var locationData []byte
 		var fcmToken, jwtToken *string
 		var id string
-		if err := rows.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken); err != nil {
+		if err := rows.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		u.ID = id
@@ -1198,9 +1345,9 @@ func (s *Store) ListUsersPaginated(ctx context.Context, limit int, cursor string
 	var rows pgx.Rows
 	var err error
 	if cursor != "" && ids.IsValid(cursor) {
-		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users WHERE (created_at, id) < ((SELECT created_at FROM users WHERE id=$2::uuid), $2::uuid) ORDER BY created_at DESC, id DESC LIMIT $1`, limit, cursor)
+		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token, created_at FROM users WHERE (created_at, id) < ((SELECT created_at FROM users WHERE id=$2::uuid), $2::uuid) ORDER BY created_at DESC, id DESC LIMIT $1`, limit, cursor)
 	} else {
-		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+		rows, err = s.pool.Query(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token, created_at FROM users ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -1213,7 +1360,7 @@ func (s *Store) ListUsersPaginated(ctx context.Context, limit int, cursor string
 		var locationData []byte
 		var fcmToken, jwtToken *string
 		var id string
-		if err := rows.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken); err != nil {
+		if err := rows.Scan(&id, &u.Name, &u.Mobile, &u.ReferralCode, &myReferralCode, &locationData, &fcmToken, &jwtToken, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		u.ID = id
@@ -1263,7 +1410,7 @@ func (s *Store) SetDriverReferralCode(ctx context.Context, driverID string, code
 }
 
 func (s *Store) FindUserByReferralCode(ctx context.Context, code string) (*User, error) {
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token FROM users WHERE my_referral_code=$1`, code)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, referral_code, my_referral_code, location, fcm_token, jwt_token, created_at FROM users WHERE my_referral_code=$1`, code)
 	u, err := scanUserRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1275,7 +1422,7 @@ func (s *Store) FindUserByReferralCode(ctx context.Context, code string) (*User,
 }
 
 func (s *Store) FindDriverByReferralCode(ctx context.Context, code string) (*Driver, error) {
-	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE my_referral_code=$1`, code)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, name, mobile, photo, vehicle_type, vehicle_registration, wallet_details, wallet_balance, wallet_verified, wallet_verified_at, referral_code, my_referral_code, location, fcm_token, jwt_token, last_location_update, details FROM drivers WHERE my_referral_code=$1`, code)
 	d, err := scanDriverRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1432,6 +1579,37 @@ func (s *Store) ListHospitalMDs(ctx context.Context) ([]HospitalMD, error) {
 	return list, nil
 }
 
+func (s *Store) ListHospitalMDsByHospitalID(ctx context.Context, hospitalID string) ([]HospitalMD, error) {
+	if !ids.IsValid(hospitalID) {
+		return nil, fmt.Errorf("invalid hospital id: %s", hospitalID)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_pending_id::text, hospital_id::text, name, email, mobile, official_number, username, password_hash, status, jwt_token, fcm_token, created_at FROM hospital_mds WHERE hospital_id=$1::uuid`, hospitalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []HospitalMD
+	for rows.Next() {
+		var md HospitalMD
+		var id, hpID, hID, username, pwHash, jwtToken, fcmToken *string
+		if err := rows.Scan(&id, &hpID, &hID, &md.Name, &md.Email, &md.Mobile, &md.OfficialNumber, &username, &pwHash, &md.Status, &jwtToken, &fcmToken, &md.CreatedAt); err != nil {
+			return nil, err
+		}
+		md.ID = *id
+		md.HospitalPendingID = hpID
+		md.HospitalID = hID
+		md.Username = username
+		md.PasswordHash = pwHash
+		md.JWTToken = jwtToken
+		md.FCMToken = fcmToken
+		list = append(list, md)
+	}
+	if list == nil {
+		list = []HospitalMD{}
+	}
+	return list, nil
+}
+
 func (s *Store) BanHospitalMD(ctx context.Context, id string) error {
 	if !ids.IsValid(id) {
 		return fmt.Errorf("invalid id: %s", id)
@@ -1456,19 +1634,39 @@ func (s *Store) DeleteHospitalMD(ctx context.Context, id string) error {
 	return err
 }
 
-// ---- Hospital Receptionist (Phase 2) ----
+// ---- Hospital Receptionist / Staff (Phase 2) ----
 
 func (s *Store) CreateHospitalReceptionist(ctx context.Context, r *HospitalReceptionist) error {
 	r.ID = ids.New()
 	r.CreatedAt = time.Now()
+	r.InvitedAt = time.Now()
 	r.Active = true
-	_, err := s.pool.Exec(ctx, `INSERT INTO hospital_receptionists (id, hospital_id, created_by_md_id, name, username, password_hash, mobile, active, jwt_token, created_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10)`,
-		r.ID, r.HospitalID, r.CreatedByMDID, r.Name, r.Username, r.PasswordHash, r.Mobile, r.Active, r.JWTToken, r.CreatedAt)
+	if r.Status == "" {
+		r.Status = "invited"
+	}
+	r.MustChangePassword = true
+	if strings.TrimSpace(r.Role) == "" {
+		r.Role = "Staff"
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO hospital_receptionists (id, hospital_id, created_by_md_id, name, username, password_hash, mobile, active, jwt_token, created_at, email, status, must_change_password, invited_at, role, role_id) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::uuid)`,
+		r.ID, r.HospitalID, r.CreatedByMDID, r.Name, r.Username, r.PasswordHash, r.Mobile, r.Active, r.JWTToken, r.CreatedAt, r.Email, r.Status, r.MustChangePassword, r.InvitedAt, r.Role, r.RoleID)
 	return err
 }
 
 func (s *Store) FindHospitalReceptionistByUsername(ctx context.Context, username string) (*HospitalReceptionist, error) {
-	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token FROM hospital_receptionists WHERE username=$1`, username)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token, email, status, must_change_password, invited_at, role, role_id::text FROM hospital_receptionists WHERE username=$1`, username)
+	r, err := scanHospitalReceptionistRow(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return r, nil
+}
+
+func (s *Store) FindHospitalReceptionistByEmail(ctx context.Context, email string) (*HospitalReceptionist, error) {
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token, email, status, must_change_password, invited_at, role, role_id::text FROM hospital_receptionists WHERE email=$1`, email)
 	r, err := scanHospitalReceptionistRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1483,7 +1681,7 @@ func (s *Store) FindHospitalReceptionistByID(ctx context.Context, id string) (*H
 	if !ids.IsValid(id) {
 		return nil, fmt.Errorf("invalid id: %s", id)
 	}
-	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token FROM hospital_receptionists WHERE id=$1::uuid`, id)
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token, email, status, must_change_password, invited_at, role, role_id::text FROM hospital_receptionists WHERE id=$1::uuid`, id)
 	r, err := scanHospitalReceptionistRow(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1498,26 +1696,18 @@ func (s *Store) ListReceptionistsByHospital(ctx context.Context, hospitalID stri
 	if !ids.IsValid(hospitalID) {
 		return nil, fmt.Errorf("invalid id: %s", hospitalID)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token FROM hospital_receptionists WHERE hospital_id=$1::uuid`, hospitalID)
+	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, username, password_hash, mobile, active, created_at, jwt_token, email, status, must_change_password, invited_at, role, role_id::text FROM hospital_receptionists WHERE hospital_id=$1::uuid`, hospitalID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var list []HospitalReceptionist
 	for rows.Next() {
-		var r HospitalReceptionist
-		var mobile *string
-		var jwtToken *string
-		var id, hid, mdid string
-		if err := rows.Scan(&id, &hid, &mdid, &r.Name, &r.Username, &r.PasswordHash, &mobile, &r.Active, &r.CreatedAt, &jwtToken); err != nil {
+		r, err := scanHospitalReceptionistRow(rows)
+		if err != nil {
 			return nil, err
 		}
-		r.ID = id
-		r.HospitalID = hid
-		r.CreatedByMDID = mdid
-		r.Mobile = mobile
-		r.JWTToken = jwtToken
-		list = append(list, r)
+		list = append(list, *r)
 	}
 	if list == nil {
 		list = []HospitalReceptionist{}
@@ -1546,6 +1736,95 @@ func (s *Store) ClearHospitalReceptionistJWT(ctx context.Context, id string) err
 		return fmt.Errorf("invalid id: %s", id)
 	}
 	_, err := s.pool.Exec(ctx, `UPDATE hospital_receptionists SET jwt_token=NULL WHERE id=$1::uuid`, id)
+	return err
+}
+
+func (s *Store) UpdateReceptionistPassword(ctx context.Context, id string, hash string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_receptionists SET password_hash=$2, must_change_password=false, status='active', active=true WHERE id=$1::uuid`, id, hash)
+	return err
+}
+
+func (s *Store) UpdateReceptionistResendInvite(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_receptionists SET invited_at=now(), status='invited' WHERE id=$1::uuid`, id)
+	return err
+}
+
+func (s *Store) SetReceptionistTempPassword(ctx context.Context, id string, hash string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE hospital_receptionists SET password_hash=$2, must_change_password=true, status='invited', active=true, invited_at=now() WHERE id=$1::uuid`, id, hash)
+	return err
+}
+
+// ---- Hospital Staff Roles ----
+
+func (s *Store) CreateHospitalStaffRole(ctx context.Context, role *HospitalStaffRole) error {
+	if role.ID == "" {
+		role.ID = ids.New()
+	}
+	role.CreatedAt = time.Now()
+	role.UpdatedAt = time.Now()
+	role.Active = true
+	_, err := s.pool.Exec(ctx, `INSERT INTO hospital_staff_roles (id, hospital_id, created_by_md_id, name, description, active, created_at, updated_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8)`,
+		role.ID, role.HospitalID, role.CreatedByMDID, role.Name, role.Description, role.Active, role.CreatedAt, role.UpdatedAt)
+	return err
+}
+
+func (s *Store) ListHospitalStaffRoles(ctx context.Context, hospitalID string) ([]HospitalStaffRole, error) {
+	if !ids.IsValid(hospitalID) {
+		return nil, fmt.Errorf("invalid hospital id: %s", hospitalID)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, description, active, created_at, updated_at FROM hospital_staff_roles WHERE hospital_id=$1::uuid ORDER BY created_at ASC`, hospitalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []HospitalStaffRole
+	for rows.Next() {
+		var sr HospitalStaffRole
+		var desc *string
+		if err := rows.Scan(&sr.ID, &sr.HospitalID, &sr.CreatedByMDID, &sr.Name, &desc, &sr.Active, &sr.CreatedAt, &sr.UpdatedAt); err != nil {
+			return nil, err
+		}
+		sr.Description = desc
+		list = append(list, sr)
+	}
+	if list == nil {
+		list = []HospitalStaffRole{}
+	}
+	return list, rows.Err()
+}
+
+func (s *Store) FindHospitalStaffRoleByID(ctx context.Context, id string) (*HospitalStaffRole, error) {
+	if !ids.IsValid(id) {
+		return nil, fmt.Errorf("invalid id: %s", id)
+	}
+	row := s.pool.QueryRow(ctx, `SELECT id::text, hospital_id::text, created_by_md_id::text, name, description, active, created_at, updated_at FROM hospital_staff_roles WHERE id=$1::uuid`, id)
+	var sr HospitalStaffRole
+	var desc *string
+	if err := row.Scan(&sr.ID, &sr.HospitalID, &sr.CreatedByMDID, &sr.Name, &desc, &sr.Active, &sr.CreatedAt, &sr.UpdatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	sr.Description = desc
+	return &sr, nil
+}
+
+func (s *Store) DeleteHospitalStaffRole(ctx context.Context, id string) error {
+	if !ids.IsValid(id) {
+		return fmt.Errorf("invalid id: %s", id)
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM hospital_staff_roles WHERE id=$1::uuid`, id)
 	return err
 }
 

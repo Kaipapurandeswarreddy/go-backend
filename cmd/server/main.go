@@ -8,15 +8,23 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
+
+	"golang.org/x/time/rate"
+
+	"ambigo-backend/internal/mailer"
 
 	"ambigo-backend/api/handlers"
 	"ambigo-backend/api/middleware"
 	"ambigo-backend/config"
 	"ambigo-backend/internal/admin"
+	"ambigo-backend/internal/adminstats"
+	"ambigo-backend/internal/analytics"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/dispatch"
+	"ambigo-backend/internal/eta"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/hospital"
 	"ambigo-backend/internal/location"
@@ -25,8 +33,11 @@ import (
 	"ambigo-backend/internal/offer"
 	"ambigo-backend/internal/payment"
 	"ambigo-backend/internal/places"
+	"ambigo-backend/internal/pricing"
 	"ambigo-backend/internal/referral"
 	"ambigo-backend/internal/ride"
+	"ambigo-backend/internal/safety"
+	"ambigo-backend/internal/storage"
 	"ambigo-backend/internal/telephony"
 	"ambigo-backend/internal/translation"
 	"ambigo-backend/internal/websocket"
@@ -54,6 +65,19 @@ func main() {
 
 	// 1. Load Configuration
 	appConfig := config.LoadConfig()
+
+	// Load-test override: longer-lived access tokens so multi-hour suites
+	// never outlive their mint (e.g. JWT_VALIDITY_MS=8h). Production default
+	// stays 15 minutes when unset.
+	if v := os.Getenv("JWT_VALIDITY_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			auth.AccessTokenExpiry = time.Duration(ms) * time.Millisecond
+			log.Info().Dur("access_token_expiry", auth.AccessTokenExpiry).Msg("JWT validity override active")
+		} else if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			auth.AccessTokenExpiry = d
+			log.Info().Dur("access_token_expiry", auth.AccessTokenExpiry).Msg("JWT validity override active")
+		}
+	}
 
 	// 2. Initialize PostgreSQL (primary) — replaces MongoDB
 	pgCfg := config.PostgresConfig{
@@ -101,6 +125,9 @@ func main() {
 	walletStore := payment.NewWalletStore(pool)
 	feedbackStore := ride.NewFeedbackStore(pool)
 	referralStore := referral.NewStore(pool)
+	safetyAlertStore := safety.NewAlertStore(pool)
+	safetyStateStore := safety.NewStateStore(pool)
+	auditStore := admin.NewAuditStore(pool)
 
 	// Initialize Services & Dispatcher
 	referralService := referral.NewService(referralStore, authStore, offerStore, walletStore, eventBus)
@@ -131,18 +158,45 @@ func main() {
 		ambTypeNames[t.ID] = t.Name
 	}
 	matcher := dispatch.NewMatcher(locationStore, routeClient, ambTypeNames)
+	matcher.RadiusKm = appConfig.DispatchRadiusKm
+	matcher.SetHospitalDeps(adminStore, authStore)
 	dispatcher := dispatch.NewDispatcher(matcher, rideStore, eventBus, wsManager)
+	dispatcher.MaxCandidates = appConfig.DispatchMaxCandidates
+	dispatcher.RadiusKm = appConfig.DispatchRadiusKm
+	dispatcher.OfferTimeoutSec = appConfig.DispatchOfferTimeoutSec
 	dispatcher.StartStaleRideCleanup()
+	etaEngine := eta.NewETAEngine(routeClient, rideStore)
+	// Seed ETA snapshots (WATCH_RIDE) from the driver's last known GPS fix.
+	etaEngine.SetDriverLocator(locationStore)
+	wsManager.ETAEngine = etaEngine
+	wsManager.SetSafetyDeps(rideStore, adminStore, ambTypeNames, safetyStateStore)
+	seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	activeRides, activeErr := rideStore.ListActiveDriverRides(seedCtx)
+	if activeErr != nil {
+		logger.Log.Error().Err(activeErr).Msg("Failed to restore active ride tracking")
+	} else {
+		wsManager.SeedActiveRides(activeRides)
+	}
+	safetyStates, safetyErr := safetyStateStore.ListActive(seedCtx)
+	if safetyErr != nil {
+		logger.Log.Error().Err(safetyErr).Msg("Failed to restore stopped-vehicle tracking")
+	} else {
+		wsManager.SeedSafetyStates(safetyStates)
+	}
+	seedCancel()
 
 	// Set Google Translate API URL (used by package-level var)
 	translation.TranslateAPIURL = appConfig.GoogleTranslateAPIURL
 
 	rzpService := payment.NewRazorpayService(appConfig.RazorpayKeyID, appConfig.RazorpayKeySecret)
 	cloudshopeService := telephony.NewCloudshopeService(appConfig.CloudshopeToken, appConfig.CloudshopeNumber, appConfig.CloudshopeAPIBaseURL, appConfig.SMSCC)
-	zwitchService := payment.NewZwitchService(appConfig.ZwitchKey, appConfig.ZwitchSecret, appConfig.ZwitchAccountID, appConfig.ZwitchAPIBaseURL, appConfig.ZwitchProxyURL)
+	zwitchService := payment.NewZwitchService(appConfig.ZwitchKey, appConfig.ZwitchSecret, appConfig.ZwitchVerificationKey, appConfig.ZwitchVerificationSecret, appConfig.ZwitchAccountID, appConfig.ZwitchVerificationAccountID, appConfig.ZwitchAPIBaseURL, appConfig.ZwitchProxyURL)
 
 	// Initialize Handlers
-	rideHandler := handlers.NewRideHandler(dispatcher, eventBus, paymentStore, rzpService, authStore, adminStore, routeClient, walletStore, referralService)
+	regionStore := pricing.NewRegionStore(pool)
+	settingsStore := pricing.NewSettingsStore(pool)
+	rideHandler := handlers.NewRideHandler(dispatcher, eventBus, paymentStore, rzpService, authStore, adminStore, routeClient, walletStore, referralService, regionStore, settingsStore)
+	regionHandler := handlers.NewRegionHandler(regionStore, settingsStore)
 	smsCfg := auth.SMSCountryConfig{
 		APIKey:     os.Getenv("SMS_COUNTRY_KEY"),
 		APIToken:   os.Getenv("SMS_COUNTRY_TOKEN"),
@@ -150,32 +204,90 @@ func main() {
 		SenderID:   appConfig.SMSSenderID,
 		CC:         appConfig.SMSCC,
 	}
+	storageService, err := storage.NewStorageService(context.Background(), appConfig.GCSBucketName)
+	if err != nil {
+		logger.Log.Warn().Err(err).Msg("GCS Storage Service failed to initialize; falling back to DB storage")
+	}
+
 	authHandler := handlers.NewAuthHandler(authStore, eventBus, appConfig.JWTSecret, smsCfg, appConfig.AllowStaleRefreshChain, referralService)
+	authHandler.SetMDStore(adminStore)
+	authHandler.SetReviewOTP(appConfig.ReviewOTPNumbers, appConfig.ReviewOTPCode)
+	if len(appConfig.ReviewOTPNumbers) > 0 {
+		logger.Log.Warn().Int("review_numbers", len(appConfig.ReviewOTPNumbers)).Msg("APP_REVIEW_OTP_NUMBERS is set: fixed-OTP review login active for whitelisted numbers (no SMS)")
+	}
 	profileHandler := handlers.NewProfileHandler(authStore)
-	verificationHandler := handlers.NewVerificationHandler(authStore)
+	profileHandler.SetAdminStore(adminStore)
+	verificationHandler := handlers.NewVerificationHandler(authStore, storageService)
+	mediaHandler := handlers.NewMediaHandler(storageService, appConfig.JWTSecret)
 	paymentHandler := handlers.NewPaymentHandler(paymentStore, eventBus, rzpService, walletStore, appConfig.RazorpayWebhookSecret)
-	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, hospitalCityStore, pendingHospitalStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg)
+	resendMailer := mailer.NewResendMailer(appConfig)
+	adminHandler := handlers.NewAdminHandler(adminStore, authStore, eventBus, hospitalStore, hospitalCityStore, pendingHospitalStore, counterStore, rideStore, appConfig.JWTSecret, smsCfg, resendMailer)
+	adminHandler.SetReviewOTP(appConfig.ReviewOTPNumbers, appConfig.ReviewOTPCode)
+	adminStatsHandler := &handlers.AdminStatsHandler{Store: adminstats.NewStore(pool), LocationStore: locationStore, AuditStore: auditStore}
+	adminSafetyHandler := &handlers.AdminSafetyHandler{Store: safetyAlertStore, WSManager: wsManager}
+	adminFinanceHandler := &handlers.AdminFinanceHandler{
+		PaymentStore: paymentStore,
+		WalletStore:  walletStore,
+		AuthStore:    authStore,
+		Pool:         pool,
+	}
+	adminAuditHandler := &handlers.AdminAuditHandler{
+		AuditStore: auditStore,
+	}
+	adminLiveRideHandler := &handlers.AdminLiveRideHandler{
+		RideStore: rideStore, AuthStore: authStore, AdminStore: adminStore,
+		HospitalStore: hospitalStore, AlertStore: safetyAlertStore, AuditStore: auditStore,
+		SafetyStateStore: safetyStateStore, LocationStore: locationStore,
+	}
 	hospitalAuthHandler := handlers.NewHospitalAuthHandler(authStore, pendingHospitalStore, hospitalStore, appConfig.JWTSecret, smsCfg)
-	receptionistHandler := handlers.NewHospitalReceptionistHandler(authStore, appConfig.JWTSecret)
-	attendantAuthHandler := handlers.NewAttendantAuthHandler(authStore, appConfig.JWTSecret, smsCfg)
+	receptionistHandler := handlers.NewHospitalReceptionistHandler(authStore, appConfig.JWTSecret, resendMailer)
+	attendantAuthHandler := handlers.NewAttendantAuthHandler(authStore, appConfig.JWTSecret, smsCfg, eventBus)
 	driverAttendantHandler := handlers.NewDriverAttendantHandler(authStore)
-	hospitalDashboardHandler := handlers.NewHospitalDashboardHandler(rideStore, hospitalStore, adminStore, authStore, wsManager)
+	hospitalDashboardHandler := handlers.NewHospitalDashboardHandler(rideStore, hospitalStore, adminStore, authStore, wsManager, eventBus)
 	offerHandler := handlers.NewOfferHandler(offerStore, eventBus)
 	sharedHandler := handlers.NewSharedHandler(cloudshopeService, counterStore, adminStore, hospitalStore, hospitalSeeder)
+	sharedHandler.SetAppConfig(appConfig.WithdrawalFee, appConfig.DispatchOfferTimeoutSec)
 	walletHandler := handlers.NewWalletHandler(authStore, eventBus, walletStore, zwitchService)
-	feedbackHandler := handlers.NewFeedbackHandler(feedbackStore)
+	walletHandler.SetWithdrawalFee(appConfig.WithdrawalFee)
+	walletHandler.SetZwitchWebhookSecret(appConfig.ZwitchWebhookSecret)
+	walletHandler.SetBankVerificationBypass(appConfig.BankVerificationBypass)
+	if appConfig.BankVerificationBypass {
+		logger.Log.Warn().Msg("BANK_VERIFICATION_BYPASS is on: Zwitch bank verification and the first-payout gate are disabled")
+	}
+	// Settle stuck withdrawals: every 5m, resolve 'pending' rows older than 15m.
+	walletHandler.StartPendingSweeper(5*time.Minute, 15*time.Minute)
+	adminHandler.SetWalletStore(walletStore)
+	feedbackHandler := handlers.NewFeedbackHandler(feedbackStore, authStore)
 	referralHandler := handlers.NewReferralHandler(referralStore, referralService)
-
-	// V16: Audit persistence (Postgres, TTL 30d via periodic DELETE)
-	auditStore := admin.NewAuditStore(pool)
+	mdAmbulanceHandler := handlers.NewMDAmbulanceHandler(adminStore, authStore, eventBus)
 
 	// Subscribe EventBus Subscribers
 	websocket.NewWSNotifier(wsManager).SubscribeTo(eventBus)
-	eventbus.NewFCMNotifier(fcmClient, authStore).SubscribeTo(eventBus)
+	fcmNotifier := eventbus.NewFCMNotifier(fcmClient, authStore)
+	fcmNotifier.SetAdminStore(adminStore)
+	fcmNotifier.SubscribeTo(eventBus)
 	eventbus.NewMetricsCollector().SubscribeTo(eventBus)
 	eventbus.NewCacheInvalidator(counterStore).SubscribeTo(eventBus)
 	eventbus.NewAuditLogger(auditStore).SubscribeTo(eventBus)
+	safety.NewAlertRecorder(safetyAlertStore, func() {
+		wsManager.BroadcastToRole("admin", websocket.EventSafetyAlertUpdated, map[string]bool{"refresh": true})
+	}).SubscribeTo(eventBus)
 	eventbus.NewAnalyticsTracker().SubscribeTo(eventBus)
+
+	// Analytics shipper (Axiom today; BigQuery next) — enabled by a token.
+	// The Sink interface keeps provider swaps to one new file + config.
+	if appConfig.AxiomAPIToken != "" {
+		axiomSink := analytics.NewAxiomSink(appConfig.AxiomAPIToken, appConfig.AxiomDataset, appConfig.AxiomAPIBaseURL)
+		if err := axiomSink.EnsureDataset(context.Background()); err != nil {
+			log.Warn().Err(err).Msg("Axiom: ensure dataset failed (ingest will retry; metrics/logs will show errors until it exists)")
+		}
+		analyticsShipper := analytics.NewShipper(eventBus, axiomSink)
+		analyticsShipper.Start()
+		defer analyticsShipper.Stop()
+		log.Info().Str("dataset", appConfig.AxiomDataset).Msg("Analytics shipper started (axiom)")
+	} else {
+		log.Warn().Msg("AXIOM_API_TOKEN not set — analytics shipper disabled")
+	}
 
 	// Middlewares
 	var jwtOpts []jwt.ParserOption
@@ -189,11 +301,17 @@ func main() {
 	requireUser := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("user", next)) }
 	requireDriver := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("driver", next)) }
 	requireUnvrfDriver := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("unvrf_driver", next)) }
-	requireDriverOrUnvrf := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireAnyRole([]string{"driver", "unvrf_driver"}, next)) }
+	requireDriverOrUnvrf := func(next http.HandlerFunc) http.Handler {
+		return jwtAuth(middleware.RequireAnyRole([]string{"driver", "unvrf_driver"}, next))
+	}
 	requireAdmin := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("admin", next)) }
 	requireHospitalMD := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("hospital_md", next)) }
-	requireAnyHospital := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireAnyRole([]string{"hospital_md", "hospital_receptionist"}, next)) }
-	requireUserOrAttendant := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireAnyRole([]string{"user", "attendant"}, next)) }
+	requireAnyHospital := func(next http.HandlerFunc) http.Handler {
+		return jwtAuth(middleware.RequireAnyRole([]string{"hospital_md", "hospital_receptionist"}, next))
+	}
+	requireUserOrAttendant := func(next http.HandlerFunc) http.Handler {
+		return jwtAuth(middleware.RequireAnyRole([]string{"user", "attendant"}, next))
+	}
 	requireAttendant := func(next http.HandlerFunc) http.Handler { return jwtAuth(middleware.RequireRole("attendant", next)) }
 	// A6: Admin sub-role enforcement (backward compat — empty role = full access)
 	adminAllowedRoles := []string{"super_admin", "admin", ""}
@@ -202,10 +320,28 @@ func main() {
 	}
 
 	// Rate limiters
-	otpIPLimiter := middleware.NewIPLimiter(3, 5)                     // V1: IP-based for OTP request
-	verifyMobileLimiter := middleware.NewMobileRateLimiter(3, 5)      // V1: mobile-based for OTP verify
-	adminLoginLimiter := middleware.NewIPLimiter(5, 10)               // V7: IP-based for admin login
-	globalRateLimiter := middleware.NewIPLimiter(100, 200)            // A5: Global per-IP limit for all authenticated routes
+	otpIPLimiter := middleware.NewIPLimiter(3, 5)                              // V1: IP-based for OTP request
+	verifyMobileLimiter := middleware.NewMobileRateLimiter(3, 5)               // V1: mobile-based for OTP verify
+	adminLoginLimiter := middleware.NewIPLimiter(5, 10)                        // V7: IP-based for admin login
+	refreshIPLimiter := middleware.NewIPLimiter(rate.Every(10*time.Second), 5) // Rate-limit refresh calls: burst 5, max 1 every 10s
+	// A5: Global per-IP limit for all authenticated routes. Load-test
+	// override via GLOBAL_RPS_LIMIT / GLOBAL_RPS_BURST (single-IP k6 would
+	// otherwise measure the limiter, not capacity). Production default 100/200.
+	globalRPS, globalBurst := 100, 200
+	if v := os.Getenv("GLOBAL_RPS_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			globalRPS = n
+		}
+	}
+	if v := os.Getenv("GLOBAL_RPS_BURST"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			globalBurst = n
+		}
+	}
+	globalRateLimiter := middleware.NewIPLimiter(rate.Limit(globalRPS), globalBurst)
+	if globalRPS != 100 || globalBurst != 200 {
+		log.Info().Int("rps", globalRPS).Int("burst", globalBurst).Msg("Global rate limiter override active")
+	}
 
 	mux := http.NewServeMux()
 
@@ -281,12 +417,12 @@ func main() {
 			"status":  overall,
 			"version": "v2-pg",
 			"checks": map[string]interface{}{
-				"postgres":           postgresOK,
-				"googleap":           googleOK,
-				"pool_total_conns":   stat.TotalConns(),
-				"pool_acquired_conns": stat.AcquiredConns(),
-				"pool_idle_conns":    stat.IdleConns(),
-				"pool_max_conns":     stat.MaxConns(),
+				"postgres":                postgresOK,
+				"googleap":                googleOK,
+				"pool_total_conns":        stat.TotalConns(),
+				"pool_acquired_conns":     stat.AcquiredConns(),
+				"pool_idle_conns":         stat.IdleConns(),
+				"pool_max_conns":          stat.MaxConns(),
 				"pool_constructing_conns": fmt.Sprintf("%d", stat.ConstructingConns()),
 			},
 		})
@@ -301,6 +437,7 @@ func main() {
 	mux.Handle("POST /api/v2/shared/call/mask", jwtAuth(http.HandlerFunc(sharedHandler.HandleCallMask)))
 	mux.Handle("POST /api/v2/shared/updates/ambulance_types/check", http.HandlerFunc(sharedHandler.HandleCheckAmbulanceUpdates))
 	mux.Handle("POST /api/v2/shared/ambulance/types/list", http.HandlerFunc(sharedHandler.HandleListAmbulanceTypes)) // Note: V1 POST without Auth for lists? Actually V1 doesn't have auth for /list.
+	mux.Handle("POST /api/v2/shared/config", http.HandlerFunc(sharedHandler.HandleGetAppConfig))
 	mux.Handle("POST /api/v2/shared/updates/hospitals/check", http.HandlerFunc(sharedHandler.HandleCheckHospitalUpdates))
 	mux.Handle("POST /api/v2/shared/hospitals/list", http.HandlerFunc(sharedHandler.HandleListHospitals))
 	mux.Handle("POST /api/v2/shared/feedback/submit", jwtAuth(http.HandlerFunc(feedbackHandler.HandleSubmitFeedback)))
@@ -318,6 +455,11 @@ func main() {
 	mux.Handle("POST /api/v2/driver/wallet/update", requireDriver(http.HandlerFunc(walletHandler.HandleUpdateWallet)))
 	mux.Handle("POST /api/v2/driver/wallet/withdraw", requireDriver(http.HandlerFunc(walletHandler.HandleWithdraw)))
 	mux.Handle("POST /api/v2/driver/wallet/transactions/list", requireDriver(http.HandlerFunc(walletHandler.HandleListTransactions)))
+	// Zwitch webhooks: canonical V2 path + the two legacy dashboard URLs
+	// (transfers.updated + verifications.bank_account.created). Provider-signed.
+	mux.HandleFunc("POST /api/v2/payout/webhook/zwitch", walletHandler.HandleZwitchWebhook)
+	mux.HandleFunc("POST /payment/driver/complete-pending-transaction", walletHandler.HandleZwitchWebhook)
+	mux.HandleFunc("POST /payment/driver/verify-account-details", walletHandler.HandleZwitchWebhook)
 	// Driver attendant (one per ambulance, driver creates)
 	mux.Handle("POST /api/v2/driver/attendant/create", requireDriver(http.HandlerFunc(driverAttendantHandler.HandleDriverCreateAttendant)))
 	mux.Handle("POST /api/v2/driver/attendant/list", requireDriver(http.HandlerFunc(driverAttendantHandler.HandleDriverListAttendants)))
@@ -333,6 +475,7 @@ func main() {
 	mux.Handle("POST /api/v2/rides/{id}/cancel", jwtAuth(http.HandlerFunc(rideHandler.HandleCancel)))
 	mux.Handle("POST /api/v2/rides/history", jwtAuth(http.HandlerFunc(rideHandler.HandleGetHistory)))
 	mux.Handle("POST /api/v2/rides/current", jwtAuth(http.HandlerFunc(rideHandler.HandleGetCurrentRide)))
+	mux.Handle("POST /api/v2/rides/recent-completed", jwtAuth(http.HandlerFunc(rideHandler.HandleGetRecentCompletedRide)))
 	mux.Handle("POST /api/v2/rides/driver/details", jwtAuth(http.HandlerFunc(rideHandler.HandleGetDriverDetails)))
 	mux.Handle("POST /api/v2/rides/user/details", jwtAuth(http.HandlerFunc(rideHandler.HandleGetUserDetails)))
 	mux.Handle("POST /api/v2/rides/feedback/list", requireDriver(http.HandlerFunc(feedbackHandler.HandleListFeedback)))
@@ -345,7 +488,7 @@ func main() {
 	mux.HandleFunc("POST /api/v2/auth/driver/request-otp", middleware.RateLimit(authHandler.HandleDriverRequestOTP, otpIPLimiter))
 	mux.HandleFunc("POST /api/v2/auth/driver/verify-otp", middleware.RateLimitMobile(authHandler.HandleDriverVerifyOTP, verifyMobileLimiter))
 	// V8: Token refresh, V4: Logout, V18: Sessions
-	mux.HandleFunc("POST /api/v2/auth/refresh", authHandler.HandleRefreshToken)
+	mux.HandleFunc("POST /api/v2/auth/refresh", middleware.RateLimit(authHandler.HandleRefreshToken, refreshIPLimiter))
 	mux.Handle("POST /api/v2/auth/logout", jwtAuth(http.HandlerFunc(authHandler.HandleLogout)))
 	mux.Handle("POST /api/v2/auth/sessions", jwtAuth(http.HandlerFunc(authHandler.HandleListSessions)))
 	mux.Handle("POST /api/v2/auth/sessions/revoke", jwtAuth(http.HandlerFunc(authHandler.HandleRevokeSession)))
@@ -361,13 +504,22 @@ func main() {
 	mux.Handle("POST /api/v2/driver/profile", requireDriverOrUnvrf(profileHandler.HandleGetDriverProfile))
 	mux.Handle("POST /api/v2/driver/fcm", requireDriverOrUnvrf(profileHandler.HandleUpdateDriverFCM))
 
-	// Verification Endpoints (Protected)
+	// Verification & Media Endpoints (Protected)
 	mux.Handle("POST /api/v2/driver/verification/check", jwtAuth(http.HandlerFunc(verificationHandler.HandleCheckVerification)))
 	mux.Handle("POST /api/v2/driver/verification/update", requireUnvrfDriver(verificationHandler.HandleUpdateVerification))
+	mux.HandleFunc("/api/v2/admin/migrate-images-to-gcs", verificationHandler.HandleMigrateImagesToGCS)
+	mux.HandleFunc("GET /api/v2/media/view", mediaHandler.HandleViewMedia)
 
 	// Admin Endpoints (Protected)
 	// V7: Rate limit admin login (username/password — IP-based)
 	mux.HandleFunc("POST /api/v2/admin/login", middleware.RateLimit(adminHandler.HandleAdminLogin, adminLoginLimiter))
+	// Admin registration / signup (rate-limited by IP)
+	mux.HandleFunc("POST /api/v2/admin/register", middleware.RateLimit(adminHandler.HandleAdminRegister, adminLoginLimiter))
+	mux.HandleFunc("POST /api/v2/admin/signup", middleware.RateLimit(adminHandler.HandleAdminRegister, adminLoginLimiter))
+	// Current admin profile
+	mux.Handle("GET /api/v2/admin/me", requireAdmin(http.HandlerFunc(adminHandler.HandleAdminMe)))
+	mux.Handle("POST /api/v2/admin/me", requireAdmin(http.HandlerFunc(adminHandler.HandleAdminMe)))
+	mux.Handle("GET /api/admin/auth/me", requireAdmin(http.HandlerFunc(adminHandler.HandleAdminMe)))
 	// Admin OTP login: request IP-limited, verify mobile-limited
 	mux.HandleFunc("POST /api/v2/admin/login/mobile", middleware.RateLimit(adminHandler.HandleAdminMobileRequestOTP, otpIPLimiter))
 	mux.HandleFunc("POST /api/v2/admin/login/mobile/verify", middleware.RateLimitMobile(adminHandler.HandleAdminMobileVerifyOTP, verifyMobileLimiter))
@@ -376,11 +528,23 @@ func main() {
 	mux.Handle("POST /api/v2/admin/ambulance_types", requireAdmin(http.HandlerFunc(adminHandler.HandleCreateAmbulanceType)))
 	mux.Handle("GET /api/v2/admin/ambulance_types", requireAdmin(http.HandlerFunc(adminHandler.HandleListAmbulanceTypes)))
 	mux.Handle("DELETE /api/v2/admin/ambulance_types/{id}", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteAmbulanceType)))
+	// V2 H3 region pricing
+	mux.Handle("GET /api/v2/admin/regions", requireAdmin(http.HandlerFunc(regionHandler.HandleListRegions)))
+	mux.Handle("POST /api/v2/admin/regions/search", requireAdmin(http.HandlerFunc(regionHandler.HandleSearchRegions)))
+	mux.Handle("POST /api/v2/admin/regions/fetch", requireAdmin(http.HandlerFunc(regionHandler.HandleFetchRegionFromOSM)))
+	mux.Handle("POST /api/v2/admin/regions/refresh", requireAdmin(http.HandlerFunc(regionHandler.HandleRefreshRegion)))
+	mux.Handle("DELETE /api/v2/admin/regions/{id}", requireAdmin(http.HandlerFunc(regionHandler.HandleDeleteRegion)))
+	mux.Handle("POST /api/v2/admin/regions/prices", requireAdmin(http.HandlerFunc(regionHandler.HandleUpsertRegionPrice)))
+	mux.Handle("GET /api/v2/admin/regions/price", requireAdmin(http.HandlerFunc(regionHandler.HandleGetRegionPrice)))
+	// Global surcharge settings (SOS % + night %)
+	mux.Handle("GET /api/v2/admin/pricing/settings", requireAdmin(http.HandlerFunc(regionHandler.HandleGetSurchargeSettings)))
+	mux.Handle("POST /api/v2/admin/pricing/settings", requireAdmin(http.HandlerFunc(regionHandler.HandleUpsertSurchargeSettings)))
 	// Admin: Verified Driver CRUD
 	mux.Handle("POST /api/v2/admin/drivers/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListDrivers)))
 	mux.Handle("POST /api/v2/admin/drivers/details", requireAdmin(http.HandlerFunc(adminHandler.HandleGetDriverDetails)))
 	mux.Handle("POST /api/v2/admin/drivers/add", requireAdmin(http.HandlerFunc(adminHandler.HandleAddDriver)))
 	mux.Handle("POST /api/v2/admin/drivers/update", requireAdmin(http.HandlerFunc(adminHandler.HandleUpdateDriver)))
+	mux.Handle("POST /api/v2/admin/drivers/wallet/adjust", requireAdmin(http.HandlerFunc(adminHandler.HandleAdjustDriverWallet)))
 	mux.Handle("POST /api/v2/admin/drivers/delete", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteDriver)))
 	// Admin: Unverified Driver Flow
 	mux.Handle("POST /api/v2/admin/drivers/unverified/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListUnverifiedDrivers)))
@@ -399,6 +563,15 @@ func main() {
 	// Admin: User Rides
 	mux.Handle("POST /api/v2/admin/rides/user/list", requireAdmin(http.HandlerFunc(adminHandler.HandleUserRideList)))
 	// Admin: Ride Listing
+	mux.Handle("POST /api/v2/admin/dashboard/stats", requireAdmin(http.HandlerFunc(adminStatsHandler.HandleDashboardStats)))
+	mux.Handle("GET /api/v2/admin/fleet", requireAdmin(http.HandlerFunc(adminStatsHandler.HandleFleetSnapshot)))
+	mux.Handle("GET /api/v2/admin/activity", requireAdmin(http.HandlerFunc(adminStatsHandler.HandleActivity)))
+	mux.Handle("GET /api/v2/admin/rides/{id}/live", requireAdmin(http.HandlerFunc(adminLiveRideHandler.HandleGet)))
+	mux.Handle("GET /api/v2/admin/safety/alerts", requireAdmin(http.HandlerFunc(adminSafetyHandler.HandleList)))
+	mux.Handle("POST /api/v2/admin/safety/alerts/acknowledge", requireAdmin(http.HandlerFunc(adminSafetyHandler.HandleAcknowledge)))
+	mux.Handle("POST /api/v2/admin/safety/alerts/resolve", requireAdmin(http.HandlerFunc(adminSafetyHandler.HandleResolve)))
+	mux.Handle("POST /api/v2/admin/analytics/summary", requireAdmin(http.HandlerFunc(adminStatsHandler.HandleAnalyticsSummary)))
+	mux.Handle("POST /api/v2/admin/rides/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListRides)))
 	mux.Handle("POST /api/v2/admin/rides/completed/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListCompletedRides)))
 	mux.Handle("POST /api/v2/admin/rides/ongoing/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListOngoingRides)))
 	// Admin: Ambulance Type Update
@@ -407,13 +580,13 @@ func main() {
 	mux.Handle("POST /api/v2/admin/hospitals/add", requireAdmin(http.HandlerFunc(adminHandler.HandleAddHospital)))
 	mux.Handle("POST /api/v2/admin/hospitals/update", requireAdmin(http.HandlerFunc(adminHandler.HandleUpdateHospital)))
 	mux.Handle("POST /api/v2/admin/hospitals/delete", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteHospital)))
-	mux.Handle("POST /api/v2/admin/hospitals/sync", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitals)))
-	// Admin: Hospital service areas (cities)
+	// Admin: Hospital service areas (cities) — per-area sync only (global sync removed to avoid timeout)
 	mux.Handle("POST /api/v2/admin/hospital/cities/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListHospitalCities)))
 	mux.Handle("POST /api/v2/admin/hospital/cities/add", requireAdmin(http.HandlerFunc(adminHandler.HandleAddHospitalCity)))
 	mux.Handle("POST /api/v2/admin/hospital/cities/update", requireAdmin(http.HandlerFunc(adminHandler.HandleUpdateHospitalCity)))
 	mux.Handle("POST /api/v2/admin/hospital/cities/delete", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteHospitalCity)))
-	mux.Handle("POST /api/v2/admin/hospital/cities/sync", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitals)))
+	mux.Handle("POST /api/v2/admin/hospital/city/sync", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitalCity)))
+	mux.Handle("POST /api/v2/admin/hospital/city/sync/status", requireAdmin(http.HandlerFunc(sharedHandler.HandleSyncHospitalCityStatus)))
 	// Hospital MD (public signup + OTP)
 	mux.HandleFunc("POST /api/v2/hospital/md/request-otp", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDRequestOTP, otpIPLimiter))
 	mux.HandleFunc("POST /api/v2/hospital/md/login/request-otp", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDLoginRequestOTP, otpIPLimiter))
@@ -422,6 +595,7 @@ func main() {
 	mux.HandleFunc("POST /api/v2/hospital/md/login/password", middleware.RateLimit(hospitalAuthHandler.HandleHospitalMDLoginPassword, adminLoginLimiter))
 	mux.Handle("POST /api/v2/hospital/md/setup-password", requireHospitalMD(http.HandlerFunc(hospitalAuthHandler.HandleHospitalMDSetupPassword)))
 	mux.Handle("POST /api/v2/hospital/auth/me", requireHospitalMD(http.HandlerFunc(hospitalAuthHandler.HandleHospitalMDMe)))
+	mux.HandleFunc("POST /api/v2/hospital/md/status", hospitalAuthHandler.HandleHospitalMDStatus)
 	// Attendant (public, inside driver app)
 	mux.HandleFunc("POST /api/v2/attendant/request-otp", middleware.RateLimit(attendantAuthHandler.HandleAttendantRequestOTP, otpIPLimiter))
 	mux.HandleFunc("POST /api/v2/attendant/verify-otp", middleware.RateLimitMobile(attendantAuthHandler.HandleAttendantVerifyOTP, verifyMobileLimiter))
@@ -435,20 +609,39 @@ func main() {
 	mux.Handle("POST /api/v2/admin/hospital/mds/ban", requireAdmin(http.HandlerFunc(adminHandler.HandleBanHospitalMD)))
 	mux.Handle("POST /api/v2/admin/hospital/mds/unban", requireAdmin(http.HandlerFunc(adminHandler.HandleUnbanHospitalMD)))
 	mux.Handle("POST /api/v2/admin/hospital/mds/delete", requireAdmin(http.HandlerFunc(adminHandler.HandleDeleteHospitalMD)))
-	// Hospital receptionist (MD creates in admin app, receptionist logs into website)
+	// Hospital staff roles (MD creates and manages custom roles)
+	mux.Handle("POST /api/v2/hospital/roles/list", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleListStaffRoles)))
+	mux.Handle("POST /api/v2/hospital/roles/create", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleCreateStaffRole)))
+	mux.Handle("POST /api/v2/hospital/roles/delete", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleDeleteStaffRole)))
+	// Hospital receptionist / staff (MD creates in admin app, receptionist/staff logs into website)
 	mux.Handle("POST /api/v2/hospital/receptionist/create", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleCreateReceptionist)))
 	mux.Handle("POST /api/v2/hospital/receptionists/list", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleListReceptionists)))
 	mux.Handle("POST /api/v2/hospital/receptionist/delete", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleDeleteReceptionist)))
+	mux.Handle("POST /api/v2/hospital/receptionist/resend-invite", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleResendInvite)))
+	mux.Handle("POST /api/v2/hospital/receptionist/change-password", jwtAuth(http.HandlerFunc(receptionistHandler.HandleChangePassword)))
+	mux.Handle("POST /api/v2/hospital/receptionist/create-first-password", jwtAuth(http.HandlerFunc(receptionistHandler.HandleChangePassword)))
 	mux.HandleFunc("POST /api/v2/hospital/receptionist/login", middleware.RateLimit(receptionistHandler.HandleReceptionistLogin, adminLoginLimiter))
 	mux.Handle("POST /api/v2/hospital/receptionist/me", requireAnyHospital(http.HandlerFunc(receptionistHandler.HandleReceptionistMe)))
+	// Staff aliases
+	mux.Handle("POST /api/v2/hospital/staff/create", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleCreateReceptionist)))
+	mux.Handle("POST /api/v2/hospital/staff/list", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleListReceptionists)))
+	mux.Handle("POST /api/v2/hospital/staff/delete", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleDeleteReceptionist)))
+	mux.Handle("POST /api/v2/hospital/staff/resend-invite", requireHospitalMD(http.HandlerFunc(receptionistHandler.HandleResendInvite)))
 	// Hospital dashboard (for receptionist/MD)
 	mux.Handle("POST /api/v2/hospital/dashboard/stats", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalStats)))
 	mux.Handle("POST /api/v2/hospital/rides/incoming/list", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalIncomingRides)))
 	mux.Handle("POST /api/v2/hospital/rides/history", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalHistory)))
 	mux.Handle("POST /api/v2/hospital/rides/detail", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalRideDetail)))
+	mux.Handle("POST /api/v2/hospital/rides/acknowledge", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleAcknowledgeRide)))
+	mux.Handle("POST /api/v2/hospital/rides/decline", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleDeclineRide)))
 	mux.Handle("POST /api/v2/hospital/profile", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalProfile)))
 	mux.Handle("POST /api/v2/hospital/profile/update", requireHospitalMD(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateHospitalProfile)))
 	mux.Handle("POST /api/v2/hospital/analytics", requireAnyHospital(http.HandlerFunc(hospitalDashboardHandler.HandleHospitalAnalytics)))
+	// MD ambulances: Add Ambulance module (MD-scoped by hospital_id).
+	mux.Handle("POST /api/v2/hospital/ambulances/create", requireHospitalMD(http.HandlerFunc(mdAmbulanceHandler.HandleCreateAmbulance)))
+	mux.Handle("POST /api/v2/hospital/ambulances/list", requireHospitalMD(http.HandlerFunc(mdAmbulanceHandler.HandleListAmbulances)))
+	mux.Handle("POST /api/v2/hospital/ambulances/numbers/add", requireHospitalMD(http.HandlerFunc(mdAmbulanceHandler.HandleAddNumber)))
+	mux.Handle("POST /api/v2/hospital/ambulances/numbers/active", requireHospitalMD(http.HandlerFunc(mdAmbulanceHandler.HandleSetNumberActive)))
 	// In-ride patient condition update (ALS/BLS/Emergency/SOS) — user or attendant
 	mux.Handle("POST /api/v2/rides/condition", requireUserOrAttendant(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateRideCondition)))
 	mux.Handle("POST /api/v2/rides/{id}/condition", requireUserOrAttendant(http.HandlerFunc(hospitalDashboardHandler.HandleUpdateRideCondition)))
@@ -461,6 +654,29 @@ func main() {
 	// Admin: Referral Config
 	mux.Handle("GET /api/v2/admin/referral/config", requireAdmin(http.HandlerFunc(referralHandler.HandleGetConfig)))
 	mux.Handle("POST /api/v2/admin/referral/config", requireAdmin(http.HandlerFunc(referralHandler.HandleSaveConfig)))
+
+	// Admin: Staff & Roles (Co-Admin Management)
+	mux.Handle("GET /api/v2/admin/staff", requireAdmin(http.HandlerFunc(adminHandler.HandleListStaff)))
+	mux.Handle("POST /api/v2/admin/staff/list", requireAdmin(http.HandlerFunc(adminHandler.HandleListStaff)))
+	mux.Handle("POST /api/v2/admin/staff/create", requireAdminRole(adminAllowedRoles, adminHandler.HandleCreateStaff))
+	mux.Handle("POST /api/v2/admin/staff/update", requireAdminRole(adminAllowedRoles, adminHandler.HandleUpdateStaff))
+	mux.Handle("POST /api/v2/admin/staff/toggle", requireAdminRole(adminAllowedRoles, adminHandler.HandleToggleStaff))
+	mux.Handle("POST /api/v2/admin/staff/delete", requireAdminRole(adminAllowedRoles, adminHandler.HandleDeleteStaff))
+	// Legacy python compatibility
+	mux.Handle("GET /api/admin/co_admins", requireAdmin(http.HandlerFunc(adminHandler.HandleListStaff)))
+	mux.Handle("POST /api/admin/co_admins", requireAdminRole(adminAllowedRoles, adminHandler.HandleCreateStaff))
+	mux.Handle("POST /api/v2/admin/co_admins", requireAdminRole(adminAllowedRoles, adminHandler.HandleCreateStaff))
+
+	// Admin: Financial Ledger & Payments
+	mux.Handle("POST /api/v2/admin/finance/summary", requireAdmin(http.HandlerFunc(adminFinanceHandler.HandleFinanceSummary)))
+	mux.Handle("POST /api/v2/admin/ledger/transactions", requireAdmin(http.HandlerFunc(adminFinanceHandler.HandleListLedgerTransactions)))
+	mux.Handle("POST /api/v2/admin/payments/list", requireAdmin(http.HandlerFunc(adminFinanceHandler.HandleListAdminPayments)))
+
+	// Admin: Audit Log Read & Query Interface
+	mux.Handle("POST /api/v2/admin/audit-logs/list", requireAdmin(http.HandlerFunc(adminAuditHandler.HandleListAuditLogs)))
+	mux.Handle("POST /api/v2/admin/audit/summary", requireAdmin(http.HandlerFunc(adminAuditHandler.HandleAuditSummary)))
+	mux.Handle("GET /api/v2/admin/audit-logs/list", requireAdmin(http.HandlerFunc(adminAuditHandler.HandleLegacyAuditLogs)))
+	mux.Handle("GET /admin/audit-logs/list", requireAdmin(http.HandlerFunc(adminAuditHandler.HandleLegacyAuditLogs)))
 
 	// Housekeeping: audit_log TTL 30d + auth_otp 5m cleanup (replaces Mongo TTL indexes)
 	// OTP rows expire after 5m — ticker must match (was 1h => 12x bloat of expired rows)
@@ -478,6 +694,9 @@ func main() {
 			if _, err := authStore.CleanupExpiredRefreshTokens(ctx); err != nil {
 				log.Error().Err(err).Msg("refresh_tokens cleanup failed")
 			}
+			if _, err := walletStore.CleanupOldEvents(ctx); err != nil {
+				log.Error().Err(err).Msg("processed_events cleanup failed")
+			}
 			cancel()
 		}
 	}()
@@ -485,7 +704,7 @@ func main() {
 	// Apply API key auth + global rate limiter to all routes except /metrics, /health, and /ws
 	protected := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if path == "/metrics" || path == "/api/v1/health" || path == "/ws" || path == "/api/v2/payment/webhook/razorpay" {
+		if path == "/metrics" || path == "/api/v1/health" || path == "/ws" || path == "/api/v2/payment/webhook/razorpay" || path == "/api/v2/payout/webhook/zwitch" || path == "/payment/driver/complete-pending-transaction" || path == "/payment/driver/verify-account-details" {
 			mux.ServeHTTP(w, r)
 			return
 		}

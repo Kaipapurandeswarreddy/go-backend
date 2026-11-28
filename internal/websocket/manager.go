@@ -7,11 +7,14 @@ import (
 	"sync"
 	"time"
 
+	"ambigo-backend/internal/admin"
 	"ambigo-backend/internal/auth"
 	"ambigo-backend/internal/eventbus"
 	"ambigo-backend/internal/location"
 	"ambigo-backend/internal/logger"
 	"ambigo-backend/internal/metrics"
+	"ambigo-backend/internal/ride"
+	"ambigo-backend/internal/safety"
 
 	"github.com/gorilla/websocket"
 )
@@ -45,7 +48,8 @@ type Manager struct {
 	rideWatchers map[string]map[*Client]bool
 
 	// Active ride lookup lets driver location updates reach the watching user.
-	activeDriverRide map[string]string
+	activeDriverRide   map[string]string
+	activeDriverStatus map[string]ride.RideStatus
 
 	// Inbound messages from the clients.
 	broadcast chan []byte
@@ -79,22 +83,132 @@ type Manager struct {
 
 	// EventBus for publishing driver location updates
 	EventBus *eventbus.InMemoryBus
+
+	// RideStore validates stopped-vehicle eligibility (IN_PROGRESS + normal).
+	RideStore *ride.Store
+
+	// AdminStore resolves ambulance type names for auto/bike/cab exclusion.
+	AdminStore *admin.Store
+
+	// AmbTypeNames caches amb_type_id -> display name (same map as dispatcher matcher).
+	AmbTypeNames map[string]string
+
+	// Safety tracks per-driver stopped state for the 3/5-minute stages.
+	Safety      *safety.Tracker
+	SafetyStore *safety.StateStore
+
+	// ETAEngine computes canonical server-side ETAs for active rides.
+	ETAEngine interface {
+		OnDriverLocation(rideID, driverID string, lat, lng float64, status ride.RideStatus) *eventbus.RideETAUpdatePayload
+		ClearRide(rideID string)
+		GetLatestETA(rideID string) *eventbus.RideETAUpdatePayload
+	}
+
+	// locThrottle caps location fan-out: max 1 bus event per driver per
+	// interval (giants: ~1 per 3s). Extra pings still update the store.
+	locThrottleMu sync.Mutex
+	locThrottle   map[string]time.Time
+
+	// rideRecovery throttles DB rehydration of a driver's active ride when the
+	// in-memory map was lost (restart) — see recoverActiveRide.
+	rideRecoveryMu sync.Mutex
+	rideRecovery   map[string]time.Time
+}
+
+// LocationPublishInterval is the minimum gap between location bus events for
+// one driver. Stale points are dropped, latest wins — same rule as Uber RAMEN.
+const LocationPublishInterval = 3 * time.Second
+
+// allowLocPublish reports whether a location event for driverID may be
+// published now, and records the attempt.
+func (m *Manager) allowLocPublish(driverID string) bool {
+	now := time.Now()
+	m.locThrottleMu.Lock()
+	defer m.locThrottleMu.Unlock()
+	if m.locThrottle == nil {
+		m.locThrottle = make(map[string]time.Time)
+	}
+	if last, ok := m.locThrottle[driverID]; ok && now.Sub(last) < LocationPublishInterval {
+		return false
+	}
+	m.locThrottle[driverID] = now
+	// Opportunistic cleanup so the map can't grow with logged-out drivers.
+	if len(m.locThrottle) > 10000 {
+		for id, ts := range m.locThrottle {
+			if now.Sub(ts) > time.Hour {
+				delete(m.locThrottle, id)
+			}
+		}
+	}
+	return true
+}
+
+// removeClientLocked evicts one connection from all maps, closes its Send
+// channel and socket. Caller must hold m.mu.
+func (m *Manager) removeClientLocked(client *Client) {
+	if clientsForID, ok := m.clients[client.Role][client.ID]; ok {
+		if _, exists := clientsForID[client]; exists {
+			delete(clientsForID, client)
+			close(client.Send)
+			metrics.ActiveConnections.Dec()
+		}
+		if len(clientsForID) == 0 {
+			delete(m.clients[client.Role], client.ID)
+		}
+	}
+	for rideID, watchers := range m.rideWatchers {
+		delete(watchers, client)
+		if len(watchers) == 0 {
+			delete(m.rideWatchers, rideID)
+		}
+	}
+	client.Conn.Close()
 }
 
 func NewManager(locStore *location.MemoryStore, authStore *auth.Store, eventBus *eventbus.InMemoryBus) *Manager {
 	return &Manager{
-		broadcast:        make(chan []byte),
-		register:         make(chan *Client),
-		unregister:       make(chan *Client),
-		kick:             make(chan KickRequest),
-		sessionUpdates:   make(chan SessionUpdate),
-		clients:          make(map[string]map[string]map[*Client]bool),
-		rideWatchers:     make(map[string]map[*Client]bool),
-		activeDriverRide: make(map[string]string),
-		currentSessions:  make(map[string]string),
-		LocStore:         locStore,
-		AuthStore:        authStore,
-		EventBus:         eventBus,
+		broadcast:          make(chan []byte),
+		register:           make(chan *Client),
+		unregister:         make(chan *Client),
+		kick:               make(chan KickRequest),
+		sessionUpdates:     make(chan SessionUpdate),
+		clients:            make(map[string]map[string]map[*Client]bool),
+		rideWatchers:       make(map[string]map[*Client]bool),
+		activeDriverRide:   make(map[string]string),
+		activeDriverStatus: make(map[string]ride.RideStatus),
+		currentSessions:    make(map[string]string),
+		LocStore:           locStore,
+		AuthStore:          authStore,
+		EventBus:           eventBus,
+		Safety:             safety.NewTracker(),
+	}
+}
+
+// SetSafetyDeps wires stopped-vehicle dependencies (called from main after stores exist).
+func (m *Manager) SetSafetyDeps(rideStore *ride.Store, adminStore *admin.Store, ambTypeNames map[string]string, stateStore *safety.StateStore) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.RideStore = rideStore
+	m.AdminStore = adminStore
+	m.AmbTypeNames = ambTypeNames
+	m.SafetyStore = stateStore
+	if m.Safety == nil {
+		m.Safety = safety.NewTracker()
+	}
+}
+
+func (m *Manager) SeedActiveRides(active []ride.ActiveDriverRide) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, item := range active {
+		m.activeDriverRide[item.DriverID] = item.RideID
+		m.activeDriverStatus[item.DriverID] = item.Status
+	}
+}
+
+func (m *Manager) SeedSafetyStates(states []safety.VehicleState) {
+	if m.Safety != nil {
+		m.Safety.Restore(states)
 	}
 }
 
@@ -110,7 +224,7 @@ func (m *Manager) Run() {
 			// Session gate: reject stale-session connections for single-session
 			// roles before they can be registered. Only applies when the client
 			// actually sent a session_id (legacy clients are not gated).
-			if (client.Role == "driver" || client.Role == "unvrf_driver") && client.SessionID != "" {
+			if (client.Role == "driver" || client.Role == "unvrf_driver" || client.Role == "user" || client.Role == "attendant") && client.SessionID != "" {
 				if cur, ok := m.currentSessions[client.Role+":"+client.ID]; ok && cur != "" && cur != client.SessionID {
 					m.mu.Unlock()
 					m.rejectClient(client)
@@ -121,6 +235,36 @@ func (m *Manager) Run() {
 			if m.clients[client.Role] == nil {
 				m.clients[client.Role] = make(map[string]map[*Client]bool)
 			}
+			if m.clients[client.Role][client.ID] == nil {
+				m.clients[client.Role][client.ID] = make(map[*Client]bool)
+			}
+			// Same-session reconnect: allow up to 4 concurrent sockets per session
+			// (e.g. Flutter UI isolate + background location service isolate + ride watcher).
+			// If 4 or more already exist, evict the oldest non-watcher duplicate.
+			sessionClients := make([]*Client, 0)
+			for oldClient := range m.clients[client.Role][client.ID] {
+				if oldClient.SessionID == client.SessionID {
+					sessionClients = append(sessionClients, oldClient)
+				}
+			}
+			if len(sessionClients) >= 4 {
+				var targetToEvict *Client = sessionClients[0]
+				for _, sc := range sessionClients {
+					isWatcher := false
+					for _, watchers := range m.rideWatchers {
+						if watchers[sc] {
+							isWatcher = true
+							break
+						}
+					}
+					if !isWatcher {
+						targetToEvict = sc
+						break
+					}
+				}
+				m.removeClientLocked(targetToEvict)
+			}
+			// Eviction above may have deleted the now-empty inner map.
 			if m.clients[client.Role][client.ID] == nil {
 				m.clients[client.Role][client.ID] = make(map[*Client]bool)
 			}
@@ -162,19 +306,8 @@ func (m *Manager) Run() {
 			m.mu.Lock()
 			if clientsForID, ok := m.clients[client.Role][client.ID]; ok {
 				if _, exists := clientsForID[client]; exists {
-					delete(clientsForID, client)
-					close(client.Send)
-					metrics.ActiveConnections.Dec()
+					m.removeClientLocked(client)
 					logger.Log.Info().Str("role", client.Role).Str("id", client.ID).Msg("WebSocket unregistered")
-				}
-				if len(clientsForID) == 0 {
-					delete(m.clients[client.Role], client.ID)
-				}
-			}
-			for rideID, watchers := range m.rideWatchers {
-				delete(watchers, client)
-				if len(watchers) == 0 {
-					delete(m.rideWatchers, rideID)
 				}
 			}
 			m.mu.Unlock()
@@ -327,26 +460,116 @@ func (m *Manager) SendToRideWatchers(rideID string, msgType string, payload inte
 
 func (m *Manager) SetActiveRide(driverID, rideID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.activeDriverRide[driverID] = rideID
+	m.activeDriverStatus[driverID] = ride.StatusAssigned
+	m.mu.Unlock()
 	if m.LocStore != nil {
-		m.LocStore.SetDriverStatus(driverID, "BUSY")
+		_ = m.LocStore.SetDriverStatus(driverID, "BUSY")
+		_ = m.LocStore.SetDriverRide(driverID, rideID)
+	}
+	m.resetSafetyState(driverID)
+}
+
+func (m *Manager) SetRideStatus(driverID, rideID string, status ride.RideStatus) {
+	if driverID == "" || rideID == "" {
+		return
+	}
+	m.mu.Lock()
+	if m.activeDriverRide[driverID] != rideID {
+		m.mu.Unlock()
+		return
+	}
+	previous := m.activeDriverStatus[driverID]
+	m.activeDriverStatus[driverID] = status
+	m.mu.Unlock()
+	if status == ride.StatusInProgress && previous != ride.StatusInProgress {
+		m.resetSafetyState(driverID)
 	}
 }
 
 func (m *Manager) ClearActiveRide(driverID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	rideID := m.activeDriverRide[driverID]
 	delete(m.activeDriverRide, driverID)
+	delete(m.activeDriverStatus, driverID)
+	m.mu.Unlock()
 	if m.LocStore != nil {
-		m.LocStore.SetDriverStatus(driverID, "AVAILABLE")
+		_ = m.LocStore.SetDriverStatus(driverID, "AVAILABLE")
+		_ = m.LocStore.SetDriverRide(driverID, "")
+	}
+	m.resetSafetyState(driverID)
+	if m.ETAEngine != nil && rideID != "" {
+		m.ETAEngine.ClearRide(rideID)
+	}
+}
+
+func (m *Manager) resetSafetyState(driverID string) {
+	if m.Safety != nil {
+		m.Safety.ResetState(driverID)
+	}
+	m.deleteSafetyState(driverID)
+}
+
+func (m *Manager) deleteSafetyState(driverID string) {
+	if m.SafetyStore == nil || driverID == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := m.SafetyStore.DeleteByDriver(ctx, driverID); err != nil {
+			logger.Log.Error().Err(err).Str("driver_id", driverID).Msg("Failed to clear stopped-vehicle state")
+		}
+	}()
+}
+
+func (m *Manager) persistSafetyState(state safety.VehicleState) {
+	if m.SafetyStore == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := m.SafetyStore.Upsert(ctx, state); err != nil {
+			logger.Log.Error().Err(err).Str("ride_id", state.RideID).Msg("Failed to persist stopped-vehicle state")
+		}
+	}()
+}
+
+// BroadcastToRole sends a message to every connected client with the given
+// role (e.g. all "admin" app connections). Used for stopped-vehicle
+// escalation where no single admin ID is the target.
+func (m *Manager) BroadcastToRole(role, msgType string, payload interface{}) {
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		logger.Log.Error().Err(err).Str("role", role).Msg("failed to marshal broadcast payload")
+		return
+	}
+	finalMsg, err := json.Marshal(BaseMessage{Type: msgType, Payload: rawPayload})
+	if err != nil {
+		return
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, clientsForID := range m.clients[role] {
+		for client := range clientsForID {
+			select {
+			case client.Send <- finalMsg:
+			default:
+				metrics.WSMessagesDropped.WithLabelValues(client.Role, msgType, "send_buffer_full").Inc()
+			}
+		}
 	}
 }
 
 // HandleIncomingMessage parses messages sent from a client to the server
 func (m *Manager) HandleIncomingMessage(client *Client, message []byte) {
-	// Support raw text ping from frontend without JSON parsing errors
-	if string(message) == "ping" {
+	// Support raw text ping from frontend without JSON parsing errors.
+	// Text pings MUST refresh the read deadline: gorilla only extends it on
+	// pong control frames, so without this every healthy app connection was
+	// killed at ~60s, causing endless reconnect churn and duplicate watchers.
+	if string(message) == "ping" || string(message) == "PING" {
+		_ = client.Conn.SetReadDeadline(time.Now().Add(pongWait))
 		return
 	}
 
@@ -373,6 +596,20 @@ func (m *Manager) HandleIncomingMessage(client *Client, message []byte) {
 		}
 		m.rideWatchers[payload.RideID][client] = true
 		m.mu.Unlock()
+
+		// Instant ETA Push: seed this watcher with the latest known ETA immediately
+		if m.ETAEngine != nil {
+			if etaPayload := m.ETAEngine.GetLatestETA(payload.RideID); etaPayload != nil {
+				if payloadBytes, err := json.Marshal(etaPayload); err == nil {
+					if msgBytes, err := json.Marshal(BaseMessage{Type: EventRideETAUpdate, Payload: payloadBytes}); err == nil {
+						select {
+						case client.Send <- msgBytes:
+						default:
+						}
+					}
+				}
+			}
+		}
 	case EventRideDeclined:
 		var payload struct {
 			RideID string `json:"ride_id"`
@@ -385,7 +622,7 @@ func (m *Manager) HandleIncomingMessage(client *Client, message []byte) {
 			m.DeclineHandler.HandleDriverDecline(context.Background(), payload.RideID, client.ID)
 		}
 	case "PING":
-		// Ignore ping messages
+		// Ignore ping messages (deadline already refreshed above)
 	default:
 		logger.Log.Warn().Str("type", baseMsg.Type).Str("role", client.Role).Str("id", client.ID).Msg("Unknown event type")
 	}

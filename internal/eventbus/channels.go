@@ -1,9 +1,12 @@
 package eventbus
 
+import "strings"
+
 // Channel constants for EventBus pub/sub
 const (
 	ChannelRideRequested        = "ride:requested"
 	ChannelRideDriverOffered    = "ride:driver_offered"
+	ChannelRideWithdrawn        = "ride:withdrawn"
 	ChannelRideAccepted         = "ride:accepted"
 	ChannelRideArrived          = "ride:arrived"
 	ChannelRideStarted          = "ride:started"
@@ -27,9 +30,71 @@ const (
 	ChannelAdminHospitalDeleted = "admin:hospital_deleted"
 	ChannelAdminOfferCreated    = "admin:offer_created"
 	ChannelAdminOfferDeleted    = "admin:offer_deleted"
-	ChannelAdminDriverRejected = "admin:driver_rejected"
-	ChannelReferralCredited    = "referral:credited"
+	ChannelAdminDriverRejected  = "admin:driver_rejected"
+	ChannelAdminStaffCreated    = "admin:staff_created"
+	ChannelAdminStaffUpdated    = "admin:staff_updated"
+	ChannelAdminStaffToggled    = "admin:staff_toggled"
+	ChannelAdminStaffDeleted    = "admin:staff_deleted"
+	ChannelReferralCredited     = "referral:credited"
+	ChannelSafetyStoppedWarn    = "safety:stopped_warning"
+	ChannelSafetyStoppedAlarm   = "safety:stopped_emergency"
+	// ChannelRideDestinationChanged is published when a hospital desk
+	// declines a mid-ride patient and the ride is rerouted to the nearest
+	// other hospital. The user must learn the new destination even with
+	// the app in background (FCM) — no re-fetch required (full payload).
+	ChannelRideDestinationChanged = "ride:destination_changed"
+	// ChannelRideConditionUpdated is published when a patient condition level
+	// is updated during an active ride (stable/serious/critical/worsening) by
+	// the user or an assigned attendant. The SOS/condition queue and history
+	// depend on this event (audit + analytics).
+	ChannelRideConditionUpdated = "ride:condition_updated"
+	// ChannelRideETAUpdate is published when canonical server-side ETA is computed
+	// for an active ride.
+	ChannelRideETAUpdate = "ride:eta_update"
 )
+
+// RideETAUpdatePayload carries the canonical server-side ETA broadcast to watchers.
+type RideETAUpdatePayload struct {
+	RideID          string  `json:"ride_id"`
+	DriverID        string  `json:"driver_id,omitempty"`
+	Stage           string  `json:"stage"` // "en_route_pickup" | "at_pickup" | "en_route_hospital"
+	RemainingSecs   int     `json:"remaining_seconds"`
+	RemainingKm     float64 `json:"remaining_km"`
+	HospitalETASecs int     `json:"hospital_eta_seconds,omitempty"`
+	HospitalETAKm   float64 `json:"hospital_eta_km,omitempty"`
+	IsTrafficAware  bool    `json:"is_traffic_aware"`
+	RequestID       string  `json:"request_id,omitempty"`
+}
+
+// RideDestinationChangedPayload carries the complete new destination so the
+// user app can update its screen without an extra detail fetch.
+type RideDestinationChangedPayload struct {
+	RideID       string  `json:"ride_id"`
+	UserID       string  `json:"user_id"`
+	DriverID     string  `json:"driver_id,omitempty"`
+	HospitalID   string  `json:"hospital_id"`
+	HospitalName string  `json:"hospital_name"`
+	DropLat      float64 `json:"drop_lat"`
+	DropLng      float64 `json:"drop_lng"`
+	DropAddress  string  `json:"drop_address"`
+	FromHospital string  `json:"from_hospital_id,omitempty"`
+	Status       string  `json:"status,omitempty"`
+	RequestID    string  `json:"request_id,omitempty"`
+}
+
+// RideConditionUpdatedPayload is published when a patient condition level is
+// updated during an active ride by the user or an assigned attendant.
+type RideConditionUpdatedPayload struct {
+	RideID     string `json:"ride_id"`
+	UserID     string `json:"user_id,omitempty"`
+	DriverID   string `json:"driver_id,omitempty"`
+	HospitalID string `json:"hospital_id,omitempty"`
+	Level      string `json:"level"` // stable | serious | critical | worsening
+	Severity   int    `json:"severity,omitempty"`
+	Note       string `json:"note,omitempty"`
+	Source     string `json:"source"` // user | attendant
+	RequestID  string `json:"request_id,omitempty"`
+}
 
 // RideRequestedPayload is published when a user requests a ride
 type RideRequestedPayload struct {
@@ -53,23 +118,35 @@ type RideRequestedPayload struct {
 
 // RideDriverOfferedPayload is published when a ride is offered to a specific driver
 type RideDriverOfferedPayload struct {
-	RideID           string  `json:"ride_id"`
-	DriverID         string  `json:"driver_id"`
-	UserID           string  `json:"user_id"`
-	PickupLat        float64 `json:"pickup_lat"`
-	PickupLng        float64 `json:"pickup_lng"`
-	PickupAddress    string  `json:"pickup_address"`
-	DropoffLat       float64 `json:"dropoff_lat"`
-	DropoffLng       float64 `json:"dropoff_lng"`
-	DropAddress      string  `json:"drop_address"`
-	ETASeconds       int     `json:"eta_seconds"`
-	PickupDistanceKm float64 `json:"pickup_distance_km"`
-	TripDistanceKm   float64 `json:"trip_distance_km"`
-	Fare             float64 `json:"fare"`
-	DriverShare      float64 `json:"driver_share"`
-	PaymentMode      string  `json:"payment_mode"`
-	IsSOS            bool    `json:"is_sos"`
-	RequestID        string  `json:"request_id,omitempty"`
+	RideID              string  `json:"ride_id"`
+	DriverID            string  `json:"driver_id"`
+	UserID              string  `json:"user_id"`
+	PickupLat           float64 `json:"pickup_lat"`
+	PickupLng           float64 `json:"pickup_lng"`
+	PickupAddress       string  `json:"pickup_address"`
+	DropoffLat          float64 `json:"dropoff_lat"`
+	DropoffLng          float64 `json:"dropoff_lng"`
+	DropAddress         string  `json:"drop_address"`
+	ETASeconds          int     `json:"eta_seconds"`
+	PickupDistanceKm    float64 `json:"pickup_distance_km"`
+	TripDistanceKm      float64 `json:"trip_distance_km"`
+	TripDurationSeconds int     `json:"trip_duration_seconds,omitempty"`
+	Fare                float64 `json:"fare"`
+	DriverShare         float64 `json:"driver_share"`
+	PaymentMode         string  `json:"payment_mode"`
+	IsSOS               bool    `json:"is_sos"`
+	AmbTypeID           string  `json:"amb_type_id,omitempty"`
+	OfferedAt           string  `json:"offered_at,omitempty"`
+	OfferExpiresIn      int     `json:"offer_expires_in,omitempty"`
+	RequestID           string  `json:"request_id,omitempty"`
+}
+
+// RideWithdrawnPayload is published to losing drivers when a broadcast
+// offer is won by someone else — their offer card must disappear.
+type RideWithdrawnPayload struct {
+	RideID    string `json:"ride_id"`
+	DriverID  string `json:"driver_id"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // RideAcceptedPayload is published when a driver accepts a ride
@@ -95,20 +172,26 @@ type RideCompletedPayload struct {
 	RideID      string  `json:"ride_id"`
 	DriverID    string  `json:"driver_id"`
 	UserID      string  `json:"user_id"`
+	PaymentID   string  `json:"payment_id,omitempty"`
 	PaymentMode string  `json:"payment_mode"`
 	FinalAmount float64 `json:"final_amount"`
 	DriverShare float64 `json:"driver_share"`
 	DropAddress string  `json:"drop_address"`
 	RequestID   string  `json:"request_id,omitempty"`
+	// Fare-change transparency ("your price rose by X km").
+	EstimatedAmount float64 `json:"estimated_amount,omitempty"`
+	ExtraKm         float64 `json:"extra_km,omitempty"`
+	FareReason      string  `json:"fare_reason,omitempty"`
+	FareNote        string  `json:"fare_note,omitempty"`
 }
 
 // RideCancelledPayload is published when a ride is cancelled
 type RideCancelledPayload struct {
-	RideID        string   `json:"ride_id"`
-	Reason        string   `json:"reason"`
-	UserID        string   `json:"user_id,omitempty"`
-	DriverID      string   `json:"driver_id,omitempty"`
-	RequestID     string   `json:"request_id,omitempty"`
+	RideID         string   `json:"ride_id"`
+	Reason         string   `json:"reason"`
+	UserID         string   `json:"user_id,omitempty"`
+	DriverID       string   `json:"driver_id,omitempty"`
+	RequestID      string   `json:"request_id,omitempty"`
 	AvailableTypes []string `json:"available_types,omitempty"`
 }
 
@@ -196,11 +279,18 @@ type WalletWithdrawalPayload struct {
 
 // DriverLocationUpdatePayload is published when a driver sends a GPS ping
 type DriverLocationUpdatePayload struct {
-	DriverID  string  `json:"driver_id"`
-	Lat       float64 `json:"lat"`
-	Lng       float64 `json:"lng"`
-	RideID    string  `json:"ride_id,omitempty"`
-	RequestID string  `json:"request_id,omitempty"`
+	DriverID       string  `json:"driver_id"`
+	DriverName     string  `json:"driver_name,omitempty"`
+	Lat            float64 `json:"lat"`
+	Lng            float64 `json:"lng"`
+	RideID         string  `json:"ride_id,omitempty"`
+	Status         string  `json:"status"`
+	VehicleType    string  `json:"vehicle_type,omitempty"`
+	UpdatedAt      string  `json:"updated_at"`
+	StoppedSince   string  `json:"stopped_since,omitempty"`
+	StoppedSeconds int64   `json:"stopped_seconds,omitempty"`
+	StoppedStage   string  `json:"stopped_stage,omitempty"`
+	RequestID      string  `json:"request_id,omitempty"`
 }
 
 // AdminAmbTypePayload is published for ambulance type CRUD events
@@ -230,6 +320,17 @@ type AdminDriverRejectedPayload struct {
 	RequestID string `json:"request_id,omitempty"`
 }
 
+// AdminStaffPayload is published for staff/admin CRUD events
+type AdminStaffPayload struct {
+	AdminID   string `json:"admin_id"`
+	Username  string `json:"username"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	Action    string `json:"action"` // created, updated, toggled, deleted
+	ActorID   string `json:"actor_id,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
 // ReferralCreditedPayload is published when a referral reward is credited
 type ReferralCreditedPayload struct {
 	RecordID      string  `json:"record_id"`
@@ -238,4 +339,89 @@ type ReferralCreditedPayload struct {
 	Amount        float64 `json:"amount"`
 	Reason        string  `json:"reason"` // "signup_referral", "ride_threshold_met", "welcome_bonus"
 	RequestID     string  `json:"request_id,omitempty"`
+}
+
+// SafetyStoppedWarningPayload is published when an IN_PROGRESS ride
+// (excluding auto/bike/cab, SOS included) stays within the move threshold
+// for 3 minutes. Stage 1: nudge the driver only.
+type SafetyStoppedWarningPayload struct {
+	RideID         string  `json:"ride_id"`
+	DriverID       string  `json:"driver_id"`
+	UserID         string  `json:"user_id,omitempty"`
+	Lat            float64 `json:"lat"`
+	Lng            float64 `json:"lng"`
+	StoppedMinutes int     `json:"stopped_minutes"`
+	AmbType        string  `json:"amb_type,omitempty"`
+	AmbTypeName    string  `json:"amb_type_name,omitempty"`
+	DriverName     string  `json:"driver_name,omitempty"`
+	DriverMobile   string  `json:"driver_mobile,omitempty"`
+	RideRef        string  `json:"ride_ref,omitempty"`
+	RequestID      string  `json:"request_id,omitempty"`
+}
+
+// SafetyStoppedEmergencyPayload is published when the same stop reaches
+// 5 minutes total. Stage 2: emergency flag is escalated (no-op if already
+// SOS) and admins are notified with actionable contact details.
+type SafetyStoppedEmergencyPayload struct {
+	RideID         string  `json:"ride_id"`
+	DriverID       string  `json:"driver_id"`
+	UserID         string  `json:"user_id,omitempty"`
+	Lat            float64 `json:"lat"`
+	Lng            float64 `json:"lng"`
+	StoppedMinutes int     `json:"stopped_minutes"`
+	AmbType        string  `json:"amb_type,omitempty"`
+	AmbTypeName    string  `json:"amb_type_name,omitempty"`
+	DriverName     string  `json:"driver_name,omitempty"`
+	DriverMobile   string  `json:"driver_mobile,omitempty"`
+	RideRef        string  `json:"ride_ref,omitempty"`
+	RequestID      string  `json:"request_id,omitempty"`
+}
+
+// ShortRideRef returns the last 6 alphanumeric chars of a ride UUID,
+// uppercase, for human reference ("quote trip 3F2A29 on a call").
+func ShortRideRef(rideID string) string {
+	var b strings.Builder
+	for _, r := range rideID {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	s := strings.ToUpper(b.String())
+	if len(s) <= 6 {
+		return s
+	}
+	return s[len(s)-6:]
+}
+
+// CanonicalEventName converts a channel name to its underscore event name
+// ("ride:driver_offered" -> "ride_driver_offered"). Single source of truth
+// for the envelope's _event field so every sink logs the same event name.
+func CanonicalEventName(channel string) string {
+	return strings.ReplaceAll(channel, ":", "_")
+}
+
+// AnalyticsChannels lists the channels whose events belong in the analytics
+// stream (Axiom today, BigQuery next). Excludes driver:location_updated by
+// policy (~1 ping per 3s per driver would flood the stream; location data
+// lives in the H3 store). Subscribers must not maintain their own list —
+// use this one so coverage cannot drift.
+func AnalyticsChannels() []string {
+	return []string{
+		ChannelRideRequested, ChannelRideDriverOffered, ChannelRideWithdrawn,
+		ChannelRideAccepted, ChannelRideArrived, ChannelRideStarted,
+		ChannelRideCompleted, ChannelRideCancelled,
+		ChannelRideDestinationChanged, ChannelRideConditionUpdated,
+		ChannelAuthOTPRequested, ChannelAuthUserRegistered, ChannelAuthUserLoggedIn,
+		ChannelAuthDriverCreated, ChannelAuthDriverLoggedIn, ChannelAuthDriverApproved,
+		ChannelAuthSessionReplaced, ChannelAuthLoggedOut,
+		ChannelPaymentCompleted, ChannelWalletWithdrawal,
+		ChannelAdminAmbTypeCreated, ChannelAdminAmbTypeDeleted,
+		ChannelAdminHospitalAdded, ChannelAdminHospitalUpdated, ChannelAdminHospitalDeleted,
+		ChannelAdminOfferCreated, ChannelAdminOfferDeleted,
+		ChannelAdminDriverRejected,
+		ChannelAdminStaffCreated, ChannelAdminStaffUpdated,
+		ChannelAdminStaffToggled, ChannelAdminStaffDeleted,
+		ChannelReferralCredited,
+		ChannelSafetyStoppedWarn, ChannelSafetyStoppedAlarm,
+	}
 }
