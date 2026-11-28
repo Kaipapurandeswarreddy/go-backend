@@ -28,6 +28,7 @@ func (n *WSNotifier) SubscribeTo(bus *eventbus.InMemoryBus) {
 	bus.Subscribe(eventbus.ChannelDriverLocationUpdate, n.handleDriverLocationUpdate)
 	bus.Subscribe(eventbus.ChannelRideETAUpdate, n.handleRideETAUpdate)
 	bus.Subscribe(eventbus.ChannelAuthSessionReplaced, n.handleSessionReplaced)
+	bus.Subscribe(eventbus.ChannelAuthLoggedOut, n.handleLoggedOut)
 	bus.Subscribe(eventbus.ChannelSafetyStoppedWarn, n.handleSafetyStoppedWarn)
 	bus.Subscribe(eventbus.ChannelSafetyStoppedAlarm, n.handleSafetyStoppedAlarm)
 	activityChannels := []string{
@@ -53,6 +54,16 @@ func (n *WSNotifier) handleSessionReplaced(payload []byte) {
 		return
 	}
 	n.wsManager.SetCurrentSession(p.Role, p.UserID, p.SessionID)
+	n.wsManager.KickSessions(p.Role, p.UserID)
+}
+
+func (n *WSNotifier) handleLoggedOut(payload []byte) {
+	var p eventbus.AuthLoggedOutPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Log.Error().Err(err).Str("channel", "auth:logged_out").Msg("Unmarshal error")
+		return
+	}
+	n.wsManager.SetCurrentSession(p.Role, p.UserID, "")
 	n.wsManager.KickSessions(p.Role, p.UserID)
 }
 

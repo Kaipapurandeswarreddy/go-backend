@@ -241,7 +241,7 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 	}
 
 	// Single-device: revoke previous sessions like driver (user strict single-device)
-	revokedCount, _ := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), user.ID, "session_replaced")
+	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), user.ID, "session_replaced")
 
 	// V8: Generate access token + refresh token
 	accessToken, err := auth.GenerateAccessToken(user.ID, "user", h.JWTSecret)
@@ -267,11 +267,12 @@ func (h *AuthHandler) HandleUserVerifyOTP(w http.ResponseWriter, r *http.Request
 	h.EventBus.PublishEvent(eventbus.ChannelAuthUserLoggedIn, eventbus.AuthUserLoggedInPayload{
 		UserID: user.ID, Mobile: payload.Mobile, RequestID: reqID,
 	})
-	if revokedCount > 0 {
-		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
-			UserID: user.ID, Role: "user", SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
-		})
-	}
+	// Always publish session_replaced on new login so WS manager records the
+	// authoritative session_id and kicks any old connections, even if refresh
+	// tokens were already cleaned up by a prior logout.
+	h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
+		UserID: user.ID, Role: "user", SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
+	})
 
 	response.Success(w, http.StatusOK, map[string]string{
 		"access_token":  accessToken,
@@ -445,7 +446,7 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Revoke all previous sessions so only this device stays logged in
-	revokedCount, err := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID, "session_replaced")
+	_, err = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), driverID, "session_replaced")
 	if err != nil {
 		logger.Log.Error().Err(err).Str("driver_id", driverID).Str("request_id", reqID).Msg("Failed to revoke old driver sessions")
 	}
@@ -478,13 +479,12 @@ func (h *AuthHandler) HandleDriverVerifyOTP(w http.ResponseWriter, r *http.Reque
 		DriverID: driverID, Mobile: payload.Mobile, Role: role, RequestID: reqID,
 	})
 
-	// A prior session was replaced by this login — notify all live connections
-	// instantly so the old device is kicked without waiting for token expiry.
-	if revokedCount > 0 {
-		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
-			UserID: driverID, Role: role, SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
-		})
-	}
+	// Always publish session_replaced on new login so WS manager records the
+	// authoritative session_id and kicks any old connections, even if refresh
+	// tokens were already cleaned up by a prior logout.
+	h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
+		UserID: driverID, Role: role, SessionID: sessionID, Mobile: payload.Mobile, RequestID: reqID,
+	})
 
 	response.Success(w, http.StatusOK, map[string]string{
 		"access_token":  accessToken,

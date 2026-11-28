@@ -238,16 +238,16 @@ func (m *Manager) Run() {
 			if m.clients[client.Role][client.ID] == nil {
 				m.clients[client.Role][client.ID] = make(map[*Client]bool)
 			}
-			// Same-session reconnect: allow up to 2 concurrent sockets per session
-			// (e.g. Flutter UI isolate + background location service isolate).
-			// If 2 or more already exist, evict the oldest non-watcher duplicate.
+			// Same-session reconnect: allow up to 4 concurrent sockets per session
+			// (e.g. Flutter UI isolate + background location service isolate + ride watcher).
+			// If 4 or more already exist, evict the oldest non-watcher duplicate.
 			sessionClients := make([]*Client, 0)
 			for oldClient := range m.clients[client.Role][client.ID] {
 				if oldClient.SessionID == client.SessionID {
 					sessionClients = append(sessionClients, oldClient)
 				}
 			}
-			if len(sessionClients) >= 2 {
+			if len(sessionClients) >= 4 {
 				var targetToEvict *Client = sessionClients[0]
 				for _, sc := range sessionClients {
 					isWatcher := false

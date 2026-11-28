@@ -102,7 +102,7 @@ func (h *AttendantAuthHandler) HandleAttendantVerifyOTP(w http.ResponseWriter, r
 		return
 	}
 	// Single session like driver
-	revokedCount, _ := h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), att.ID, "session_replaced")
+	_, _ = h.AuthStore.RevokeAllUserRefreshTokens(r.Context(), att.ID, "session_replaced")
 	accessToken, err := auth.GenerateAccessToken(att.ID, "attendant", h.JWTSecret)
 	if err != nil {
 		response.Error(w, "Failed to generate token", http.StatusInternalServerError)
@@ -117,11 +117,11 @@ func (h *AttendantAuthHandler) HandleAttendantVerifyOTP(w http.ResponseWriter, r
 	// Session-scoped push token for the single-session kill-switch.
 	_ = h.AuthStore.SetSessionFCMToken(r.Context(), att.ID, sessionID, req.FCMToken)
 	_ = h.AuthStore.UpdateAmbulanceAttendantJWT(r.Context(), att.ID, accessToken)
-	if revokedCount > 0 && h.EventBus != nil {
+	if h.EventBus != nil {
 		h.EventBus.PublishEvent(eventbus.ChannelAuthSessionReplaced, eventbus.AuthSessionReplacedPayload{
 			UserID: att.ID, Role: "attendant", SessionID: sessionID,
 		})
-		logger.Log.Info().Str("attendant_id", att.ID).Msg("Attendant session replaced")
+		logger.Log.Info().Str("attendant_id", att.ID).Msg("Attendant session recorded")
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
